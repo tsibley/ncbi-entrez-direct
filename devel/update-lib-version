@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e -o pipefail -o nounset
+cd "$(dirname $0)"/..
+
+export version="$(perl -nE 'say($1), exit if /\bversion = "(.+?)"/' edirect/edirect.pl)"
+perl -pi -e 's/(?<=VERSION = ").+?(?=")/$ENV{version}/' lib/Alien/NCBI/Entrez/Direct.pm
