@@ -1,0 +1,16 @@
+#!/bin/bash
+set -e -o pipefail -o nounset
+cd "$(dirname $0)"/..
+
+version=${1:-current}
+root=https://ftp.ncbi.nlm.nih.gov/entrez/entrezdirect/versions/$version
+
+echo "# Downloading edirect.tar.gz"
+curl -fsSL $root/edirect.tar.gz | tar xzvpf -
+
+for exe in rchive xtract; do
+    for platform in ARM CYGWIN_NT Darwin Linux; do
+        echo "# Downloading $exe.$platform.gz"
+        curl -fsSL $root/$exe.$platform.gz | gunzip -c > edirect/$exe.$platform
+    done
+done
