@@ -5,6 +5,7 @@ use CPAN::MyConfig;
 use CPAN;
 use CPAN::HandleConfig;
 use CPAN::Shell;
+use Module::Loaded;
 
 my $already_configured_cpan = 0;
 my $root;
@@ -18,6 +19,7 @@ BEGIN {
         }
         eval $code;
         if ($@) {
+            mark_as_unloaded($_[0]);
             if ($already_configured_cpan) {
                 print STDERR "Missing $_[0]; CPAN already initialized.\n";
             } else {
@@ -71,7 +73,7 @@ my @lwp_deps = qw(Encode::Locale File::Listing
                   HTTP:Cookies HTTP::Date HTTP::Message HTTP::Negotiate
                   IO::Socket::SSL LWP::MediaTypes LWP::Protocol::https
                   Net::HTTP URI WWW::RobotRules Mozilla::CA);
-for my $module (@lwp_deps, 'Time::HiRes') {
+for my $module (@lwp_deps, 'Time::HiRes', 'JSON::PP', 'MIME::Base64', 'XML::Simple') {
     if ( ! CheckAvailability($module) ) {
         CPAN::Shell->install($module);
     }

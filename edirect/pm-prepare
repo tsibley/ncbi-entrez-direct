@@ -55,7 +55,7 @@ then
   echo ""
   echo "  You may also need to run a command like:"
   echo ""
-  echo "    mkfs.ext4 -b 1024 -I 128 -i 4096 <device>"
+  echo "    sudo mkfs -t ext4 -b 1024 -I 128 -i 4096 /dev/<device-name>"
   echo ""
   echo "  to configure the file system for a large number of inodes."
   echo ""

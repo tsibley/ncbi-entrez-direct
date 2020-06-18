@@ -38,6 +38,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/fiam/gounidecode/unidecode"
+	"github.com/klauspost/cpuid"
+	"github.com/pbnjay/memory"
 	"github.com/surgebase/porter2"
 	"hash/crc32"
 	"html"
@@ -60,13 +62,13 @@ import (
 
 // RCHIVE VERSION AND HELP MESSAGE TEXT
 
-const rchiveVersion = "8.70"
+const rchiveVersion = "13.7"
 
 const rchiveHelp = `
 Processing Flags
 
   -strict     Remove HTML and MathML tags
-  -mixed      Allow PubMed mixed content
+  -mixed      Allow mixed content XML
 
 Data Source
 
@@ -89,11 +91,16 @@ Local Record Cache
 Local Record Index
 
   -e2index    Create Entrez index XML (in xtract)
-  -invert     Generate inverted index on specified field
+  -invert     Generate inverted index
+  -join       Collect subsets of inverted index files
+  -fuse       Combine subsets of inverted index files
   -merge      Combine inverted indices, divide by term prefix
   -promote    Create term lists and posting files
 
-  -query      Search on individual words or overlapping word pairs
+  -path       Path to postings directory
+
+  -query      Search on words or phrases in Boolean formulas
+  -exact      Strict search for article title round-tripping
 
   -count      Print terms and counts, merging wildcards
   -counts     Expand wildcards, print individual term counts
@@ -122,45 +129,135 @@ Human Subset Extraction
     run-ncbi-converter asn2all -i "$fl" -a t -b -c -O 9606 -f s > ${fl%.aso.gz}.xml
   done
 
-Populate PubMed Archive
+Populate PubMed Archive and Positional Term Index
 
-  export EDIRECT_PUBMED_MASTER=/Volumes/alexandria
+  export EDIRECT_PUBMED_MASTER=/Volumes/cachet
+  export EDIRECT_PUBMED_WORKING=/Volumes/scratch
 
-  for dir in Archive Pubmed Indexed Inverted Merged Postings
-  do
-    mkdir -p "$MASTER/$dir"
-  done
+  archive-pubmed
 
-  pm-prepare "$MASTER/Archive"
-
-  cd "$MASTER/Pubmed"
-
-  download-pubmed baseline updatefiles
-
-  pm-clean "$MASTER/Cleaned"
-
-  cd "$MASTER/Cleaned"
-
-  pm-stash "$MASTER/Archive"
-
-  pm-refresh "$MASTER/Archive"
+  index-pubmed
 
 Retrieve from PubMed Archive
 
-  cat subset.uid |
-  fetch-pubmed "$MASTER/Archive" > subset.xml
+  cat subset.uid | fetch-pubmed > subset.xml
+
+Entrez Indexing
+
+  cat carotene.xml | xtract -strict -e2index > carotene.e2x
+
+Index Inversion
+
+  cat carotene.e2x | rchive -invert > carotene.inv
+
+Merge Indices
+
+  rchive -merge "$MASTER/Merged" carotene.inv
+
+Create Postings
+
+  rchive -promote "$MASTER/Postings" NORM carotene.mrg
 
 Record Counts
 
-  rchive -count "$MASTER/Postings" "protease inhibit* AND catabolite repress*"
+  phrase-search -count "catabolite repress*"
 
 Wildcard Expansion
 
-  rchive -counts "$MASTER/Postings" "protease inhibit* AND catabolite repress*"
+  phrase-search -counts "catabolite repress*"
 
 Query Processing
 
-  rchive -query "$MASTER/Postings" "protease inhibit* AND catabolite repress*"
+  phrase-search -query "selective serotonin reuptake inhibitor [STEM]"
+
+  phrase-search -query "(literacy AND numeracy) NOT (adolescent OR child)"
+
+  phrase-search -query "vitamin c + + common cold"
+
+  phrase-search -query "vitamin c ~ ~ common cold"
+
+  phrase-search -exact "Genetic Control of Biochemical Reactions in Neurospora."
+
+Large-Scale Record Retrieval
+
+  esearch -db pubmed -query "DNA Repair [MESH]" |
+  efetch -format uid |
+  fetch-pubmed |
+  xtract -pattern PubmedArticle -num Author |
+  sort-uniq-count -n |
+  reorder-columns 2 1 |
+  head -n 25 |
+  tee /dev/tty |
+  xy-plot auth.png
+
+XML Data Transformation
+
+  seconds_start=$(date "+%s")
+  esearch -db pubmed -query "PNAS [JOUR]" -pub abstract |
+  efetch -format uid | stream-pubmed | gunzip -c |
+  xtract -stops -wrp Set,Rec -pattern PubmedArticle \
+    -wrp "Year" -year "PubDate/*" \
+    -wrp "Abst" -words Abstract/AbstractText |
+  xtract -wrp Set,Pub -pattern Rec \
+    -wrp "Year" -element Year \
+    -wrp "Num" -num Abst > countsByYear.xml
+  for yr in {1960..2020}
+  do
+    cat countsByYear.xml |
+    xtract -wrp Raw -pattern Pub -select Year -eq "$yr" |
+    xtract -pattern Raw -lbl "$yr" -avg Num
+  done |
+  tee /dev/tty |
+  xy-plot verbosity.png
+  rm countsByYear.xml
+  seconds_end=$(date "+%s")
+  seconds=$((seconds_end - seconds_start))
+  echo "$seconds seconds"
+
+Annotation Timeline
+
+  cat $EDIRECT_PUBMED_MASTER/Current/*.xml |
+  xtract -wrp Set,Rec -pattern PubmedArticle \
+    -if PubDate/Month -wrp YR -year "PubDate/*" -wrp MN -len PubDate/Month |
+  xtract -wrp Set,Rec -pattern Rec \
+    -pfx "<DT>" -sep "+-" -sfx "-</DT>" -element YR,MN |
+  xtract -pattern Rec -histogram DT |
+  reorder-columns 2 1 | tr '+' '\t' |
+  sed -e 's/-3-/1/g' -e 's/-2-/2/g' -e 's/-1-/3/g' -e 's/-[0-9]-/4/g' |
+  sort -k 1,1n -k 2,2n > rawMonthCounts.txt
+
+  result=$( cat rawMonthCounts.txt | cut -f 1 | uniq )
+  for i in {1..4}
+  do
+    current=$( cat rawMonthCounts.txt | grep "\t$i\t" | cut -f 1,3 )
+    result=$(join -a 1 -t $'\t' <(echo "$result") <(echo "$current"))
+  done
+  echo "$result" > plotme.txt
+
+Query Automation
+
+  ascend_mesh_tree() {
+    var="${1%\*}"
+    while :
+    do
+      phrase-search -count "$var* [TREE]"
+      case "$var" in
+        *.* ) var="${var%????}" ;;
+        *   ) break             ;;
+      esac
+    done
+  }
+
+  ascend_mesh_tree "C14.907.617.812"
+
+  6584       c14 907 617 812*
+  50722      c14 907 617*
+  1567114    c14 907*
+  2232414    c14*
+
+Medical Subject Heading Code Viewer
+
+  https://meshb.nlm.nih.gov/treeView
 
 DISABLE ANTI-VIRUS FILE SCANNING FOR LOCAL ARCHIVES OR DESIGNATE AS TRUSTED FILES
 
@@ -239,45 +336,18 @@ Damaged Embedded HTML Tag Search
 
   grep -v pubmed18n | grep AMPER | cut -f 1,6
 
-Entrez Indexing
-
-  cat carotene.xml | xtract -strict -e2index PubmedArticle \
-    MedlineCitation/PMID ArticleTitle,Abstract/AbstractText > carotene.e2x
-
-Index Inversion
-
-  rchive -invert NORM carotene.e2x > carotene.inv
-
-Merge Indices
-
-  rchive -merge "$MASTER/Merged" NORM carotene.inv
-
-Create Postings
-
-  rchive -promote "$MASTER/Postings" NORM carotene.mrg
-
 Reconstruct Term List Keys
 
-  for fld in PAIR NORM
-  do
-    rm -f "$MASTER/Postings/$fld/sections.txt"
-    find "$MASTER/Postings/$fld" -name "*.mst" |
-    sed -e 's,.*/\(.*\)\.mst,\1,' |
-    sort | uniq > "$MASTER/Postings/$fld/sections.txt"
-  done
+  rm -f "$MASTER/Postings/sections.txt"
+  find "$MASTER/Postings" -name "*.mst" |
+  sed -e 's,.*/\(.*\)\.mst,\1,' |
+  sort | uniq > "$MASTER/Postings/sections.txt"
 
 Generate Term List Paths
 
-  for fld in PAIR NORM
-  do
-    find "$MASTER/Postings/$fld" -name "*.trm" |
-    sed -e 's,\(.*/\)\(.*\.trm\),\1 \2,' |
-    sort -k 2 | uniq | tr -d ' '
-  done
-
-DISABLE ANTI-VIRUS FILE SCANNING FOR LOCAL ARCHIVES OR DESIGNATE AS TRUSTED FILES
-
-DISABLE SPOTLIGHT INDEXING FOR EXTERNAL DISKS CONTAINING LOCAL ARCHIVES
+  find "$MASTER/Postings" -name "*.trm" |
+  sed -e 's,\(.*/\)\(.*\.trm\),\1 \2,' |
+  sort -k 2 | uniq | tr -d ' '
 `
 
 const rchiveInternal = `
@@ -293,19 +363,46 @@ Performance Default Overrides
 
 Debugging
 
+  -debug    Display run-time parameter summary
+  -stats    Print performance tuning values
   -timer    Report processing duration and rate
+
+Entrez Invert Performance Measurement
+
+  InvertTrials() {
+    echo -e "<Trials>"
+    for tries in {1..5}
+    do
+      cat "$1" | rchive -debug -proc "$2" -invert
+    done
+    echo -e "</Trials>"
+  }
+
+  for proc in {1..8}
+  do
+    InvertTrials "carotene.e2x" "$proc" |
+    xtract -pattern Trials -lbl "$proc" -avg Rate -dev Rate
+  done
 
 Execution Profiling
 
-  ./rchive -profile -invert NORM carotene.e2x  > /dev/null
-  go tool pprof --pdf ./rchive ./cpu.pprof > ./callgraph.pdf
+  cat carotene.e2x | ./rchive -profile -invert > /dev/null
+  go tool pprof --pdf ./cpu.pprof > ./callgraph.pdf
 `
+
+// GLOBAL VARIABLES
 
 // DATA OBJECTS
 
 type Master struct {
 	TermOffset int32
 	PostOffset int32
+}
+
+type Arrays struct {
+	Data []int32
+	Ofst [][]int16
+	Dist int
 }
 
 // UTILITIES
@@ -503,6 +600,16 @@ func MakeArchiveTrie(str string, arry [132]rune) string {
 		return ""
 	}
 
+	if IsAllDigits(str) {
+
+		// pad numeric identifier to 8 characters with leading zeros
+		ln := len(str)
+		if ln < 8 {
+			zeros := "00000000"
+			str = zeros[ln:] + str
+		}
+	}
+
 	if IsAllDigitsOrPeriod(str) {
 
 		// limit trie to first 6 characters
@@ -625,42 +732,155 @@ func MakePostingsTrie(str string, arry [516]rune) string {
 
 // POSTINGS FILE UTILITIES
 
-// trieLen directory depth parameters are based on the observed size distribution of PubMed PAIR indices
+// trieLen directory depth parameters are based on the observed size distribution of PubMed indices
 var trieLen = map[string]int{
+	"19": 4,
+	"20": 4,
+	"a1": 3,
+	"ab": 3,
 	"ac": 4,
+	"ad": 3,
 	"af": 4,
+	"ag": 3,
+	"al": 3,
 	"an": 4,
+	"ap": 4,
+	"ar": 3,
+	"as": 4,
+	"b0": 3,
+	"ba": 4,
+	"be": 4,
+	"bi": 3,
+	"br": 3,
+	"c0": 3,
+	"c1": 3,
 	"ca": 4,
 	"ce": 4,
+	"ch": 4,
 	"cl": 4,
 	"co": 4,
+	"cr": 3,
+	"cy": 3,
+	"d0": 4,
+	"d1": 4,
+	"d2": 3,
+	"da": 4,
+	"de": 4,
 	"di": 4,
+	"do": 3,
+	"dr": 3,
+	"e0": 3,
+	"ef": 4,
+	"en": 3,
+	"ev": 3,
 	"ex": 4,
+	"fa": 3,
+	"fi": 3,
+	"fo": 4,
+	"fr": 4,
+	"fu": 4,
+	"g0": 3,
 	"ge": 4,
 	"gr": 4,
 	"he": 4,
 	"hi": 4,
+	"im": 3,
 	"in": 4,
+	"la": 3,
+	"le": 3,
+	"li": 3,
+	"lo": 3,
+	"ma": 3,
 	"me": 4,
+	"mi": 3,
 	"mo": 4,
+	"mu": 3,
+	"mz": 3,
+	"n0": 3,
+	"ne": 3,
 	"no": 4,
+	"ob": 3,
+	"on": 3,
+	"oz": 3,
 	"pa": 4,
 	"pe": 4,
+	"ph": 3,
 	"pl": 4,
 	"po": 4,
 	"pr": 4,
+	"ra": 3,
 	"re": 4,
+	"ri": 3,
+	"rz": 3,
+	"se": 3,
 	"si": 4,
 	"sp": 4,
 	"st": 4,
 	"su": 4,
+	"sy": 4,
+	"te": 3,
+	"th": 3,
+	"ti": 3,
 	"tr": 4,
 	"tw": 4,
 	"un": 3,
 	"va": 3,
 	"ve": 3,
 	"vi": 3,
+	"we": 3,
 	"wh": 3,
+}
+
+var mergLen = map[string]int{
+	"ana": 4,
+	"app": 4,
+	"ass": 4,
+	"can": 4,
+	"cas": 4,
+	"cha": 4,
+	"cli": 4,
+	"com": 4,
+	"con": 4,
+	"d00": 4,
+	"d01": 4,
+	"d02": 4,
+	"d12": 4,
+	"dam": 4,
+	"dat": 4,
+	"dec": 4,
+	"ded": 4,
+	"del": 4,
+	"dem": 4,
+	"dep": 4,
+	"des": 4,
+	"det": 4,
+	"dif": 4,
+	"dis": 4,
+	"eff": 4,
+	"exp": 4,
+	"for": 4,
+	"gen": 4,
+	"gro": 4,
+	"hea": 4,
+	"hig": 4,
+	"inc": 4,
+	"ind": 4,
+	"int": 4,
+	"inv": 4,
+	"met": 4,
+	"mod": 4,
+	"pat": 4,
+	"per": 4,
+	"pre": 4,
+	"pro": 4,
+	"rel": 4,
+	"rep": 4,
+	"res": 4,
+	"sig": 4,
+	"sta": 4,
+	"str": 4,
+	"stu": 4,
+	"tre": 4,
 }
 
 func PostingDir(term string) string {
@@ -703,7 +923,7 @@ func IdentifierKey(term string) string {
 	return key
 }
 
-func PostingPath(prom, term string, arry [516]rune) (string, string) {
+func PostingPath(prom, field, term string, arry [516]rune) (string, string) {
 
 	// use first few characters of identifier for directory
 	dir := IdentifierKey(term)
@@ -713,7 +933,7 @@ func PostingPath(prom, term string, arry [516]rune) (string, string) {
 		return "", ""
 	}
 
-	dpath := path.Join(prom, trie)
+	dpath := path.Join(prom, field, trie)
 
 	return dpath, dir
 }
@@ -745,9 +965,9 @@ func CommonOpenFile(dpath, fname string) (*os.File, int64) {
 	return inFile, size
 }
 
-func ReadMasterIndex(dpath, key string) []Master {
+func ReadMasterIndex(dpath, key, field string) []Master {
 
-	inFile, size := CommonOpenFile(dpath, key+".mst")
+	inFile, size := CommonOpenFile(dpath, key+"."+field+".mst")
 	if inFile == nil {
 		return nil
 	}
@@ -768,9 +988,9 @@ func ReadMasterIndex(dpath, key string) []Master {
 	return data
 }
 
-func ReadTermList(dpath, key string) []byte {
+func ReadTermList(dpath, key, field string) []byte {
 
-	inFile, size := CommonOpenFile(dpath, key+".trm")
+	inFile, size := CommonOpenFile(dpath, key+"."+field+".trm")
 	if inFile == nil {
 		return nil
 	}
@@ -791,9 +1011,9 @@ func ReadTermList(dpath, key string) []byte {
 	return data
 }
 
-func ReadPostingData(dpath, key string, offset int32, size int32) []int32 {
+func ReadPostingData(dpath, key, field string, offset int32, size int32) []int32 {
 
-	inFile, _ := CommonOpenFile(dpath, key+".pst")
+	inFile, _ := CommonOpenFile(dpath, key+"."+field+".pst")
 	if inFile == nil {
 		return nil
 	}
@@ -820,9 +1040,9 @@ func ReadPostingData(dpath, key string, offset int32, size int32) []int32 {
 	return data
 }
 
-func ReadPositionIndex(dpath, key string, offset int32, size int32) []int32 {
+func ReadPositionIndex(dpath, key, field string, offset int32, size int32) []int32 {
 
-	inFile, _ := CommonOpenFile(dpath, key+".uqi")
+	inFile, _ := CommonOpenFile(dpath, key+"."+field+".uqi")
 	if inFile == nil {
 		return nil
 	}
@@ -849,9 +1069,9 @@ func ReadPositionIndex(dpath, key string, offset int32, size int32) []int32 {
 	return data
 }
 
-func ReadOffsetData(dpath, key string, offset int32, size int32) []int16 {
+func ReadOffsetData(dpath, key, field string, offset int32, size int32) []int16 {
 
-	inFile, _ := CommonOpenFile(dpath, key+".ofs")
+	inFile, _ := CommonOpenFile(dpath, key+"."+field+".ofs")
 	if inFile == nil {
 		return nil
 	}
@@ -878,191 +1098,126 @@ func ReadOffsetData(dpath, key string, offset int32, size int32) []int16 {
 	return data
 }
 
-func GetPostingIDs(prom, term string) []int32 {
+func ReadMasterIndexFuture(dpath, key, field string) <-chan []Master {
 
-	var arry [516]rune
-	dpath, key := PostingPath(prom, term, arry)
-	if dpath == "" {
-		return nil
+	out := make(chan []Master, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create master index channel\n")
+		os.Exit(1)
 	}
 
-	indx := ReadMasterIndex(dpath, key)
-	if indx == nil || len(indx) < 1 {
-		return nil
+	// masterIndexFuture asynchronously gets the master file and sends results through channel
+	masterIndexFuture := func(dpath, key, field string, out chan<- []Master) {
+
+		data := ReadMasterIndex(dpath, key, field)
+
+		out <- data
+
+		close(out)
 	}
 
-	trms := ReadTermList(dpath, key)
-	if trms == nil || len(trms) < 1 {
-		return nil
-	}
+	// launch single future goroutine
+	go masterIndexFuture(dpath, key, field, out)
 
-	strs := make([]string, len(indx)-1)
-	if strs == nil || len(strs) < 1 {
-		return nil
-	}
-
-	// populate array of strings from term list
-	for i, j := 0, 1; i < len(indx)-1; i++ {
-		from := indx[i].TermOffset
-		to := indx[j].TermOffset - 1
-		j++
-		strs[i] = string(trms[from:to])
-	}
-
-	// change protecting underscore to space
-	term = strings.Replace(term, "_", " ", -1)
-
-	// if term ends with dollar sign, use porter2 stemming, then add asterisk
-	if strings.HasSuffix(term, "$") {
-		tlen := len(term)
-		if tlen > 1 {
-			term = term[:tlen-1]
-			term = porter2.Stem(term)
-			term += "*"
-		}
-	}
-
-	isWildCard := false
-	if strings.HasSuffix(term, "*") {
-		tlen := len(term)
-		if tlen > 1 {
-			isWildCard = true
-			term = term[:tlen-1]
-		}
-		if tlen < 4 {
-			fmt.Fprintf(os.Stderr, "Wildcard term '%s' must be at least 4 characters long - ignoring this word\n", term)
-			return nil
-		}
-	}
-
-	// binary search in term list
-	num := len(strs)
-	L, R := 0, num-1
-	for L < R {
-		mid := (L + R) / 2
-		if strs[mid] < term {
-			L = mid + 1
-		} else {
-			R = mid
-		}
-	}
-
-	// wild card search scans term lists, fuses adjacent postings lists
-	if isWildCard {
-		if R < num && strings.HasPrefix(strs[R], term) {
-			offset := indx[R].PostOffset
-			for R < num && strings.HasPrefix(strs[R], term) {
-				R++
-			}
-			size := indx[R].PostOffset - offset
-
-			// read relevant postings list section
-			data := ReadPostingData(dpath, key, offset, size)
-			if data == nil || len(data) < 1 {
-				return nil
-			}
-
-			merged := make(map[int32]bool)
-
-			// combine all postings in term range
-			for _, val := range data {
-				merged[val] = true
-			}
-
-			fused := make([]int32, len(merged))
-
-			// convert map to slice
-			i := 0
-			for num := range merged {
-				fused[i] = num
-				i++
-			}
-
-			sort.Slice(fused, func(i, j int) bool { return fused[i] < fused[j] })
-
-			return fused
-		}
-
-		return nil
-	}
-
-	// regular search requires exact match from binary search
-	if R < num && strs[R] == term {
-
-		offset := indx[R].PostOffset
-		size := indx[R+1].PostOffset - offset
-
-		// read relevant postings list section
-		data := ReadPostingData(dpath, key, offset, size)
-		if data == nil || len(data) < 1 {
-			return nil
-		}
-		return data
-	}
-
-	return nil
+	return out
 }
 
-func GetPostingIDsEx(prom, term string) ([]int32, [][]int16) {
+func ReadTermListFuture(dpath, key, field string) <-chan []byte {
 
-	var arry [516]rune
-	dpath, key := PostingPath(prom, term, arry)
+	out := make(chan []byte, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create term list channel\n")
+		os.Exit(1)
+	}
+
+	// termListFuture asynchronously gets posting IDs and sends results through channel
+	termListFuture := func(dpath, key, field string, out chan<- []byte) {
+
+		data := ReadTermList(dpath, key, field)
+
+		out <- data
+
+		close(out)
+	}
+
+	// launch single future goroutine
+	go termListFuture(dpath, key, field, out)
+
+	return out
+}
+
+func GetPostingIDs(prom, term, field string, simple bool) ([]int32, [][]int16) {
+
+	var (
+		arry [516]rune
+	)
+
+	dpath, key := PostingPath(prom, field, term, arry)
 	if dpath == "" {
 		return nil, nil
 	}
 
-	indx := ReadMasterIndex(dpath, key)
+	// schedule asynchronous fetching
+	mi := ReadMasterIndexFuture(dpath, key, field)
+
+	tl := ReadTermListFuture(dpath, key, field)
+
+	// fetch master index and term list
+	indx := <-mi
+
+	trms := <-tl
+
 	if indx == nil || len(indx) < 1 {
 		return nil, nil
 	}
 
-	trms := ReadTermList(dpath, key)
 	if trms == nil || len(trms) < 1 {
 		return nil, nil
 	}
 
-	strs := make([]string, len(indx)-1)
+	// master index is padded with phantom term and postings position
+	numTerms := len(indx) - 1
+
+	strs := make([]string, numTerms)
 	if strs == nil || len(strs) < 1 {
 		return nil, nil
 	}
 
+	retlength := int32(len("\n"))
+
 	// populate array of strings from term list
-	for i, j := 0, 1; i < len(indx)-1; i++ {
+	for i, j := 0, 1; i < numTerms; i++ {
 		from := indx[i].TermOffset
-		to := indx[j].TermOffset - 1
+		to := indx[j].TermOffset - retlength
 		j++
-		strs[i] = string(trms[from:to])
+		txt := string(trms[from:to])
+		strs[i] = txt
 	}
 
 	// change protecting underscore to space
 	term = strings.Replace(term, "_", " ", -1)
 
 	// if term ends with dollar sign, use porter2 stemming, then add asterisk
-	if strings.HasSuffix(term, "$") {
-		tlen := len(term)
-		if tlen > 1 {
-			term = term[:tlen-1]
-			term = porter2.Stem(term)
-			term += "*"
-		}
+	if strings.HasSuffix(term, "$") && term != "$" {
+		term = strings.TrimSuffix(term, "$")
+		term = porter2.Stem(term)
+		term += "*"
 	}
 
 	isWildCard := false
-	if strings.HasSuffix(term, "*") {
+	if strings.HasSuffix(term, "*") && term != "*" {
 		tlen := len(term)
-		if tlen > 1 {
-			isWildCard = true
-			term = term[:tlen-1]
-		}
-		if tlen < 4 {
-			fmt.Fprintf(os.Stderr, "Wildcard term '%s' must be at least 4 characters long - ignoring this word\n", term)
+		isWildCard = true
+		term = strings.TrimSuffix(term, "*")
+		pdlen := len(PostingDir(term))
+		if tlen < pdlen {
+			fmt.Fprintf(os.Stderr, "Wildcard term '%s' must be at least %d characters long - ignoring this word\n", term, pdlen)
 			return nil, nil
 		}
 	}
 
 	// binary search in term list
-	num := len(strs)
-	L, R := 0, num-1
+	L, R := 0, numTerms-1
 	for L < R {
 		mid := (L + R) / 2
 		if strs[mid] < term {
@@ -1074,21 +1229,44 @@ func GetPostingIDsEx(prom, term string) ([]int32, [][]int16) {
 
 	// wild card search scans term lists, fuses adjacent postings lists
 	if isWildCard {
-		if R < num && strings.HasPrefix(strs[R], term) {
+		if R < numTerms && strings.HasPrefix(strs[R], term) {
 			offset := indx[R].PostOffset
-			for R < num && strings.HasPrefix(strs[R], term) {
+			for R < numTerms && strings.HasPrefix(strs[R], term) {
 				R++
 			}
 			size := indx[R].PostOffset - offset
 
 			// read relevant postings list section
-			data := ReadPostingData(dpath, key, offset, size)
-			if data == nil {
+			data := ReadPostingData(dpath, key, field, offset, size)
+			if data == nil || len(data) < 1 {
 				return nil, nil
 			}
 
+			if simple {
+
+				merged := make(map[int32]bool)
+
+				// combine all postings in term range
+				for _, val := range data {
+					merged[val] = true
+				}
+
+				fused := make([]int32, len(merged))
+
+				// convert map to slice
+				i := 0
+				for num := range merged {
+					fused[i] = num
+					i++
+				}
+
+				sort.Slice(fused, func(i, j int) bool { return fused[i] < fused[j] })
+
+				return fused, nil
+			}
+
 			// read relevant word position section, includes phantom offset at end
-			uqis := ReadPositionIndex(dpath, key, offset, size+4)
+			uqis := ReadPositionIndex(dpath, key, field, offset, size+4)
 			if uqis == nil {
 				return nil, nil
 			}
@@ -1101,7 +1279,7 @@ func GetPostingIDsEx(prom, term string) ([]int32, [][]int16) {
 			to := uqis[ulen-1]
 
 			// read offset section
-			ofst := ReadOffsetData(dpath, key, from, to-from)
+			ofst := ReadOffsetData(dpath, key, field, from, to-from)
 			if ofst == nil {
 				return nil, nil
 			}
@@ -1163,19 +1341,23 @@ func GetPostingIDsEx(prom, term string) ([]int32, [][]int16) {
 	}
 
 	// regular search requires exact match from binary search
-	if R < num && strs[R] == term {
+	if R < numTerms && strs[R] == term {
 
 		offset := indx[R].PostOffset
 		size := indx[R+1].PostOffset - offset
 
 		// read relevant postings list section
-		data := ReadPostingData(dpath, key, offset, size)
+		data := ReadPostingData(dpath, key, field, offset, size)
 		if data == nil || len(data) < 1 {
 			return nil, nil
 		}
 
+		if simple {
+			return data, nil
+		}
+
 		// read relevant word position section, includes phantom offset at end
-		uqis := ReadPositionIndex(dpath, key, offset, size+4)
+		uqis := ReadPositionIndex(dpath, key, field, offset, size+4)
 		if uqis == nil {
 			return nil, nil
 		}
@@ -1188,13 +1370,13 @@ func GetPostingIDsEx(prom, term string) ([]int32, [][]int16) {
 		to := uqis[ulen-1]
 
 		// read offset section
-		ofst := ReadOffsetData(dpath, key, from, to-from)
+		ofst := ReadOffsetData(dpath, key, field, from, to-from)
 		if ofst == nil {
 			return nil, nil
 		}
 
 		// make array of int16 arrays, populate for each UID
-		arrs := make([][]int16, ulen-1)
+		arrs := make([][]int16, ulen)
 		if arrs == nil || len(arrs) < 1 {
 			return nil, nil
 		}
@@ -1213,45 +1395,70 @@ func GetPostingIDsEx(prom, term string) ([]int32, [][]int16) {
 	return nil, nil
 }
 
-func PrintTermCounts(base, term string) int {
+func PrintTermCount(base, term, field string) int {
 
-	if len(term) < 4 {
-		fmt.Fprintf(os.Stderr, "\nERROR: Term count argument must be at least 4 characters\n")
+	data, _ := GetPostingIDs(base, term, field, true)
+	size := len(data)
+	fmt.Fprintf(os.Stdout, "%d\t%s\n", size, term)
+
+	return size
+}
+
+func PrintTermCounts(base, term, field string) int {
+
+	pdlen := len(PostingDir(term))
+
+	if len(term) < pdlen {
+		fmt.Fprintf(os.Stderr, "\nERROR: Term count argument must be at least %d characters\n", pdlen)
 		os.Exit(1)
 	}
 
-	if strings.Contains(term[:4], "*") {
-		fmt.Fprintf(os.Stderr, "\nERROR: Wildcard asterisk must not be in first 4 characters\n")
+	if strings.Contains(term[:pdlen], "*") {
+		fmt.Fprintf(os.Stderr, "\nERROR: Wildcard asterisk must not be in first %d characters\n", pdlen)
 		os.Exit(1)
 	}
 
 	var arry [516]rune
-	dpath, key := PostingPath(base, term, arry)
+	dpath, key := PostingPath(base, field, term, arry)
 	if dpath == "" {
 		return 0
 	}
 
-	indx := ReadMasterIndex(dpath, key)
-	if indx == nil {
+	// schedule asynchronous fetching
+	mi := ReadMasterIndexFuture(dpath, key, field)
+
+	tl := ReadTermListFuture(dpath, key, field)
+
+	// fetch master index and term list
+	indx := <-mi
+
+	trms := <-tl
+
+	if indx == nil || len(indx) < 1 {
 		return 0
 	}
 
-	trms := ReadTermList(dpath, key)
-	if trms == nil {
+	if trms == nil || len(trms) < 1 {
 		return 0
 	}
 
-	strs := make([]string, len(indx)-1)
-	if strs == nil {
+	// master index is padded with phantom term and postings position
+	numTerms := len(indx) - 1
+
+	strs := make([]string, numTerms)
+	if strs == nil || len(strs) < 1 {
 		return 0
 	}
+
+	retlength := int32(len("\n"))
 
 	// populate array of strings from term list
-	for i, j := 0, 1; i < len(indx)-1; i++ {
+	for i, j := 0, 1; i < numTerms; i++ {
 		from := indx[i].TermOffset
-		to := indx[j].TermOffset - 1
+		to := indx[j].TermOffset - retlength
 		j++
-		strs[i] = string(trms[from:to])
+		txt := string(trms[from:to])
+		strs[i] = txt
 	}
 
 	// change protecting underscore to space
@@ -1284,122 +1491,33 @@ func PrintTermCounts(base, term string) int {
 	return count
 }
 
-// BOOLEAN OPERATIONS FOR POSTINGS LISTS
+func PrintTermPositions(base, term, field string) int {
 
-func ExtendPhraseIDs(N []int32, np [][]int16, M []int32, mp [][]int16, delta int) ([]int32, [][]int16) {
+	data, ofst := GetPostingIDs(base, term, field, false)
+	size := len(data)
+	fmt.Fprintf(os.Stdout, "\n%d\t%s\n\n", size, term)
 
-	if N == nil || len(N) < 1 || np == nil || len(np) < 1 {
-		return M, mp
-	}
-	if M == nil || len(M) < 1 || mp == nil || len(mp) < 1 {
-		return N, np
-	}
-
-	n, m := len(N), len(M)
-
-	sz := n
-	if sz > m {
-		sz = m
-	}
-
-	if sz < 1 {
-		return N, np
-	}
-
-	res := make([]int32, sz)
-	ofs := make([][]int16, sz)
-
-	if res == nil || len(res) < 1 || ofs == nil || len(ofs) < 1 {
-		return nil, nil
-	}
-
-	// if IDs are equal, return set of adjacent positions
-	getAdjacentPositions := func(pn, pm []int16, dlt int16) []int16 {
-
-		var arry []int16
-
-		ln, lm := len(pn), len(pm)
-
-		q, r := 0, 0
-
-		vn, vm := pn[q], pm[r]
-		vnd := vn + dlt
-
-		for {
-			if vnd > vm {
-				r++
-				if r == lm {
-					break
-				}
-				vm = pm[r]
-			} else if vnd < vm {
-				q++
-				if q == ln {
-					break
-				}
-				vn = pn[q]
-				vnd = vn + dlt
-			} else {
-				// store first position of growing phrase
-				arry = append(arry, vn)
-				q++
-				r++
-				if q == ln || r == lm {
-					break
-				}
-				vn = pn[q]
-				vm = pm[r]
-				vnd = vn + dlt
-			}
+	for i := 0; i < len(data); i++ {
+		fmt.Fprintf(os.Stdout, "%12d\t", data[i])
+		pos := ofst[i]
+		sep := ""
+		for j := 0; j < len(pos); j++ {
+			fmt.Fprintf(os.Stdout, "%s%d", sep, pos[j])
+			sep = ","
 		}
-
-		return arry
+		fmt.Fprintf(os.Stdout, "\n")
 	}
 
-	i, j, k := 0, 0, 0
-
-	// use local variables for speed
-	en, em := N[i], M[j]
-
-	for {
-		// do inequality tests first
-		if en < em {
-			i++
-			if i == n {
-				break
-			}
-			en = N[i]
-		} else if en > em {
-			j++
-			if j == m {
-				break
-			}
-			em = M[j]
-		} else {
-			adj := getAdjacentPositions(np[i], mp[j], int16(delta))
-			if adj != nil && len(adj) > 0 {
-				res[k] = en
-				ofs[k] = adj
-				k++
-			}
-			i++
-			j++
-			if i == n || j == m {
-				break
-			}
-			en = N[i]
-			em = M[j]
-		}
-	}
-
-	// truncate output arrays to actual size of intersection
-	res = res[:k]
-	ofs = ofs[:k]
-
-	return res, ofs
+	return size
 }
 
-func ProximityIDs(N []int32, np [][]int16, M []int32, mp [][]int16, delta int) ([]int32, [][]int16) {
+// BOOLEAN OPERATIONS FOR POSTINGS LISTS
+
+func ExtendPositionalIDs(N []int32, np [][]int16, M []int32, mp [][]int16, delta int, proc func(pn, pm []int16, dlt int16) []int16) ([]int32, [][]int16) {
+
+	if proc == nil {
+		return nil, nil
+	}
 
 	if N == nil || len(N) < 1 || np == nil || len(np) < 1 {
 		return M, mp
@@ -1409,6 +1527,8 @@ func ProximityIDs(N []int32, np [][]int16, M []int32, mp [][]int16, delta int) (
 	}
 
 	n, m := len(N), len(M)
+
+	// order matters when extending phrase or testing proximity, do not swap lists based on size
 
 	sz := n
 	if sz > m {
@@ -1424,43 +1544,6 @@ func ProximityIDs(N []int32, np [][]int16, M []int32, mp [][]int16, delta int) (
 
 	if res == nil || len(res) < 1 || ofs == nil || len(ofs) < 1 {
 		return nil, nil
-	}
-
-	// if IDs are equal, return set of adjacent positions
-	getAdjacentPositions := func(pn, pm []int16, dlt int16) []int16 {
-
-		var arry []int16
-
-		ln, lm := len(pn), len(pm)
-
-		q, r := 0, 0
-
-		vn, vm := pn[q], pm[r]
-		vnd := vn + dlt
-
-		for {
-			if vnd < vm {
-				q++
-				if q == ln {
-					break
-				}
-				vn = pn[q]
-				vnd = vn + dlt
-			} else {
-				// store position of downstream phrase
-				arry = append(arry, vm)
-				q++
-				r++
-				if q == ln || r == lm {
-					break
-				}
-				vn = pn[q]
-				vm = pm[r]
-				vnd = vn + dlt
-			}
-		}
-
-		return arry
 	}
 
 	i, j, k := 0, 0, 0
@@ -1483,7 +1566,8 @@ func ProximityIDs(N []int32, np [][]int16, M []int32, mp [][]int16, delta int) (
 			}
 			em = M[j]
 		} else {
-			adj := getAdjacentPositions(np[i], mp[j], int16(delta))
+			// specific callbacks test position arrays to match terms by adjacency or phrases by proximity
+			adj := proc(np[i], mp[j], int16(delta))
 			if adj != nil && len(adj) > 0 {
 				res[k] = en
 				ofs[k] = adj
@@ -1569,7 +1653,7 @@ func IntersectIDs(N, M []int32) []int32 {
 	return res
 }
 
-// if m * log(n) < m + n, binary search has fewer comparisons, but cache makes linear algorithm faster
+// if m * log(n) < m + n, binary search has fewer comparisons, but processor memory caches make linear algorithm faster
 /*
 func IntersectBinary(N, M []int32) []int32 {
 
@@ -1689,416 +1773,1261 @@ func ExcludeIDs(N, M []int32) []int32 {
 		return N
 	}
 
-	combo := make(map[int32]bool)
+	n, m := len(N), len(M)
 
-	for _, uid := range N {
-		combo[uid] = true
+	if m < 1 {
+		return N
 	}
 
-	// delete postings that appear in both lists
-	for _, uid := range M {
-		if combo[uid] {
-			delete(combo, uid)
+	res := make([]int32, n)
+
+	i, j, k := 0, 0, 0
+
+	// use local variables for speed
+	en, em := N[i], M[j]
+
+	for {
+		// do inequality tests first
+		if en < em {
+			// item is not excluded
+			res[k] = en
+			k++
+			i++
+			if i == n {
+				break
+			}
+			en = N[i]
+		} else if en > em {
+			// advance second list pointer
+			j++
+			if j == m {
+				break
+			}
+			em = M[j]
+		} else {
+			// exclude
+			i++
+			j++
+			if i == n || j == m {
+				break
+			}
+			en = N[i]
+			em = M[j]
 		}
 	}
 
-	fused := make([]int32, len(combo))
+	// truncate output array to actual size of result
+	res = res[:k]
 
-	// convert map to slice
-	i := 0
-	for num := range combo {
-		fused[i] = num
-		i++
-	}
-
-	// need to sort results
-	sort.Slice(fused, func(i, j int) bool { return fused[i] < fused[j] })
-
-	return fused
+	return res
 }
 
-// SEARCH TERM LISTS FOR PHRASES OR NORMALIZED TERMS, OR MATCH BY PATTERN
+// QUERY EVALUATION FUNCTION
 
-type Arrays struct {
-	Data []int32
-	Ofst [][]int16
-	Dist int
-}
+func PostingIDsFuture(base, term, field string, dist int) <-chan Arrays {
 
-func ProcessQuery(base, phrase string) int {
-
-	if phrase == "" {
-		return 0
+	out := make(chan Arrays, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create postings channel\n")
+		os.Exit(1)
 	}
 
-	phrase = PrepareQuery(phrase)
+	// postingFuture asynchronously gets posting IDs and sends results through channel
+	postingFuture := func(base, term, field string, dist int, out chan<- Arrays) {
 
-	clauses := PartitionQuery(phrase)
+		data, ofst := GetPostingIDs(base, term, field, false)
 
-	clauses = MarkClauses(clauses)
+		out <- Arrays{Data: data, Ofst: ofst, Dist: dist}
 
-	if clauses == nil {
+		close(out)
+	}
+
+	// launch single future goroutine
+	go postingFuture(base, term, field, dist, out)
+
+	return out
+}
+
+func EvaluateQuery(base string, clauses []string) int {
+
+	if clauses == nil || clauses[0] == "" {
 		return 0
 	}
 
 	count := 0
 
-	// check each phrase against record
-	testPhrase := func(tokens []string) []int32 {
+	// flag set if no tildes, indicates no proximity tests in query
+	noProx := true
+	for _, tkn := range clauses {
+		if strings.HasPrefix(tkn, "~") {
+			noProx = false
+		}
+	}
 
-		eval := func(str string) ([]int32, [][]int16, int) {
+	phrasePositions := func(pn, pm []int16, dlt int16) []int16 {
 
-			words := strings.Fields(str)
+		var arry []int16
 
-			if words == nil || len(words) < 1 {
+		ln, lm := len(pn), len(pm)
+
+		q, r := 0, 0
+
+		vn, vm := pn[q], pm[r]
+		vnd := vn + dlt
+
+		for {
+			if vnd > vm {
+				r++
+				if r == lm {
+					break
+				}
+				vm = pm[r]
+			} else if vnd < vm {
+				q++
+				if q == ln {
+					break
+				}
+				vn = pn[q]
+				vnd = vn + dlt
+			} else {
+				// store position of first word in current growing phrase
+				arry = append(arry, vn)
+				q++
+				r++
+				if q == ln || r == lm {
+					break
+				}
+				vn = pn[q]
+				vm = pm[r]
+				vnd = vn + dlt
+			}
+		}
+
+		return arry
+	}
+
+	proximityPositions := func(pn, pm []int16, dlt int16) []int16 {
+
+		var arry []int16
+
+		ln, lm := len(pn), len(pm)
+
+		q, r := 0, 0
+
+		vn, vm := pn[q], pm[r]
+		vnd := vn + dlt
+
+		for {
+			if vnd < vm {
+				q++
+				if q == ln {
+					break
+				}
+				vn = pn[q]
+				vnd = vn + dlt
+			} else if vn < vm {
+				// store position of first word in downstream phrase that passes proximity test
+				arry = append(arry, vm)
+				q++
+				r++
+				if q == ln || r == lm {
+					break
+				}
+				vn = pn[q]
+				vm = pm[r]
+				vnd = vn + dlt
+			} else {
+				r++
+				if r == lm {
+					break
+				}
+				vm = pm[r]
+			}
+		}
+
+		return arry
+	}
+
+	eval := func(str string) ([]int32, [][]int16, int) {
+
+		// extract optional [FIELD] qualifier
+		field := "NORM"
+
+		slen := len(str)
+
+		for _, key := range IdxFields {
+			if strings.HasSuffix(str, " ["+key+"]") {
+				klen := len(key) + 3
+				str = str[:slen-klen]
+				field = key
+				switch key {
+				case "CHEM", "CODE", "CONV", "DISZ", "GENE", "PATH", "THME", "TREE":
+					str = strings.Replace(str, " ", "_", -1)
+				case "PIPE":
+					// esearch -db pubmed -query "complement system proteins [MESH]" -pub clinical |
+					// efetch -format uid | phrase-search -query "[PIPE] AND L [THME]"
+					var data []int32
+					// read UIDs from stdin
+					uidq := CreateUIDReader(os.Stdin)
+					for ext := range uidq {
+
+						val, err := strconv.Atoi(ext.Text)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "\nERROR: Unrecognized UID %s\n", ext.Text)
+							os.Exit(1)
+						}
+
+						data = append(data, int32(val))
+					}
+					// sort UIDs before returning
+					sort.Slice(data, func(i, j int) bool { return data[i] < data[j] })
+					return data, nil, 0
+				default:
+				}
+				break
+			}
+		}
+
+		words := strings.Fields(str)
+
+		if words == nil || len(words) < 1 {
+			return nil, nil, 0
+		}
+
+		// if no tilde proximity tests, and not building up phrase from multiple words,
+		// no need to use more expensive position tests when calculating intersection
+		if noProx && len(words) == 1 {
+			term := words[0]
+			if strings.HasPrefix(term, "+") {
+				return nil, nil, 0
+			}
+			term = strings.Replace(term, "_", " ", -1)
+			data, _ := GetPostingIDs(base, term, field, true)
+			count++
+			return data, nil, 1
+		}
+
+		dist := 0
+
+		var intersect []Arrays
+
+		var futures []<-chan Arrays
+
+		// schedule asynchronous fetching
+		for _, term := range words {
+
+			term = strings.Replace(term, "_", " ", -1)
+
+			if strings.HasPrefix(term, "+") {
+				dist += strings.Count(term, "+")
+				// run of stop words or explicit plus signs skip past one or more words in phrase
+				continue
+			}
+
+			fetch := PostingIDsFuture(base, term, field, dist)
+
+			futures = append(futures, fetch)
+
+			dist++
+		}
+
+		runtime.Gosched()
+
+		for _, chn := range futures {
+
+			// fetch postings data
+			fut := <-chn
+
+			if len(fut.Data) < 1 {
+				// bail if word not present
 				return nil, nil, 0
 			}
 
-			var intersect []Arrays
-			dist := 0
+			// append posting and positions
+			intersect = append(intersect, fut)
 
-			for _, term := range words {
+			runtime.Gosched()
+		}
 
-				if strings.HasPrefix(term, "+") {
-					dist += strings.Count(term, "+")
-					// stop words or explicit plus signs move position to require one wildcard word in phrase
-					continue
-				}
+		if len(intersect) < 1 {
+			return nil, nil, 0
+		}
 
-				data, ofst := GetPostingIDsEx(base, term)
-				if len(data) < 1 {
-					// bail if word not present
-					return nil, nil, 0
-				}
+		// start phrase with first word
+		data, ofst, dist := intersect[0].Data, intersect[0].Ofst, intersect[0].Dist+1
 
-				one := Arrays{Data: data, Ofst: ofst, Dist: dist}
-				// append posting and positions
-				intersect = append(intersect, one)
-
-				dist++
-			}
-
-			if len(intersect) < 1 {
-				return nil, nil, 0
-			}
-
-			if len(intersect) == 1 {
-				return intersect[0].Data, intersect[0].Ofst, 1
-			}
-
-			data, ofst, dist := intersect[0].Data, intersect[0].Ofst, 1
-
-			for i := 1; i < len(intersect); i++ {
-
-				data, ofst = ExtendPhraseIDs(data, ofst, intersect[i].Data, intersect[i].Ofst, intersect[i].Dist)
-				if len(data) < 1 {
-					// bail if phrase not present
-					return nil, nil, 0
-				}
-				dist = intersect[i].Dist + 1
-			}
-
-			count += len(intersect)
-
+		if len(intersect) == 1 {
 			return data, ofst, dist
 		}
 
-		nextToken := func() string {
+		for i := 1; i < len(intersect); i++ {
 
-			if len(tokens) < 1 {
-				return ""
+			// add subsequent words, keep starting positions of phrases that contain all words in proper position
+			data, ofst = ExtendPositionalIDs(data, ofst, intersect[i].Data, intersect[i].Ofst, intersect[i].Dist, phrasePositions)
+			if len(data) < 1 {
+				// bail if phrase not present
+				return nil, nil, 0
 			}
-
-			tkn := tokens[0]
-			tokens = tokens[1:]
-
-			return tkn
+			dist = intersect[i].Dist + 1
 		}
 
-		// recursive definitions
-		var fact func() ([]int32, [][]int16, int, string)
-		var prox func() ([]int32, string)
-		var excl func() ([]int32, string)
-		var term func() ([]int32, string)
-		var expr func() ([]int32, string)
+		count += len(intersect)
 
-		fact = func() ([]int32, [][]int16, int, string) {
+		// return UIDs and all positions of current phrase
+		return data, ofst, dist
+	}
 
-			var (
-				data  []int32
-				ofst  [][]int16
-				delta int
-				tkn   string
-			)
+	prevTkn := ""
 
-			tkn = nextToken()
-			if tkn == "(" {
-				data, tkn = expr()
-				if tkn == ")" {
-					tkn = nextToken()
-				}
-			} else {
-				data, ofst, delta = eval(tkn)
+	nextToken := func() string {
+
+		if len(clauses) < 1 {
+			return ""
+		}
+
+		// remove next token from slice
+		tkn := clauses[0]
+		clauses = clauses[1:]
+
+		if tkn == "(" && prevTkn != "" && prevTkn != "&" && prevTkn != "|" && prevTkn != "!" {
+			fmt.Fprintf(os.Stderr, "\nERROR: Tokens '%s' and '%s' should be separated by AND, OR, or NOT\n", prevTkn, tkn)
+			os.Exit(1)
+		}
+
+		if prevTkn == ")" && tkn != "" && tkn != "&" && tkn != "|" && tkn != "!" && tkn != ")" {
+			fmt.Fprintf(os.Stderr, "\nERROR: Tokens '%s' and '%s' should be separated by AND, OR, or NOT\n", prevTkn, tkn)
+			os.Exit(1)
+		}
+
+		prevTkn = tkn
+
+		return tkn
+	}
+
+	// recursive definitions
+	var fact func() ([]int32, [][]int16, int, string)
+	var prox func() ([]int32, string)
+	var excl func() ([]int32, string)
+	var term func() ([]int32, string)
+	var expr func() ([]int32, string)
+
+	fact = func() ([]int32, [][]int16, int, string) {
+
+		var (
+			data  []int32
+			ofst  [][]int16
+			delta int
+			tkn   string
+		)
+
+		tkn = nextToken()
+
+		if tkn == "(" {
+			// recursively process expression in parentheses
+			data, tkn = expr()
+			if tkn == ")" {
 				tkn = nextToken()
+			} else {
+				fmt.Fprintf(os.Stderr, "\nERROR: Expected ')' but received '%s'\n", tkn)
+				os.Exit(1)
 			}
-
-			return data, ofst, delta, tkn
+		} else if tkn == ")" {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unexpected ')' token\n")
+			os.Exit(1)
+		} else if tkn == "&" || tkn == "|" || tkn == "!" {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unexpected operator '%s' in expression\n", tkn)
+			os.Exit(1)
+		} else if tkn == "" {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unexpected end of expression\n")
+			os.Exit(1)
+		} else {
+			// evaluate current phrase
+			data, ofst, delta = eval(tkn)
+			tkn = nextToken()
 		}
 
-		prox = func() ([]int32, string) {
+		return data, ofst, delta, tkn
+	}
 
-			var (
-				next []int32
-				noff [][]int16
-				ndlt int
-			)
+	prox = func() ([]int32, string) {
 
-			data, ofst, delta, tkn := fact()
+		var (
+			next []int32
+			noff [][]int16
+			ndlt int
+		)
+
+		data, ofst, delta, tkn := fact()
+		if len(data) < 1 {
+			return nil, ""
+		}
+
+		for strings.HasPrefix(tkn, "~") {
+			dist := strings.Count(tkn, "~")
+			next, noff, ndlt, tkn = fact()
+			if len(next) < 1 {
+				return nil, ""
+			}
+			// next phrase must be within specified distance after the previous phrase
+			data, ofst = ExtendPositionalIDs(data, ofst, next, noff, delta+dist, proximityPositions)
 			if len(data) < 1 {
 				return nil, ""
 			}
-
-			for strings.HasPrefix(tkn, "~") {
-				dist := strings.Count(tkn, "~")
-				next, noff, ndlt, tkn = fact()
-				if len(next) < 1 {
-					return nil, ""
-				}
-				data, ofst = ProximityIDs(data, ofst, next, noff, delta+dist)
-				if len(data) < 1 {
-					return nil, ""
-				}
-				delta = ndlt
-			}
-
-			return data, tkn
+			delta = ndlt
 		}
 
-		excl = func() ([]int32, string) {
-
-			var next []int32
-
-			data, tkn := prox()
-			for tkn == "!" {
-				next, tkn = prox()
-				data = ExcludeIDs(data, next)
-			}
-
-			return data, tkn
-		}
-
-		term = func() ([]int32, string) {
-
-			var next []int32
-
-			data, tkn := excl()
-			for tkn == "&" {
-				next, tkn = excl()
-				data = IntersectIDs(data, next)
-			}
-
-			return data, tkn
-		}
-
-		expr = func() ([]int32, string) {
-
-			var next []int32
-
-			data, tkn := term()
-			for tkn == "|" {
-				next, tkn = term()
-				data = CombineIDs(data, next)
-			}
-
-			return data, tkn
-		}
-
-		// enter recursive descent parser
-		result, _ := expr()
-
-		return result
+		return data, tkn
 	}
 
-	result := testPhrase(clauses)
+	excl = func() ([]int32, string) {
+
+		var next []int32
+
+		data, tkn := prox()
+		for tkn == "!" {
+			next, tkn = prox()
+			data = ExcludeIDs(data, next)
+		}
+
+		return data, tkn
+	}
+
+	term = func() ([]int32, string) {
+
+		var next []int32
+
+		data, tkn := excl()
+		for tkn == "&" {
+			next, tkn = excl()
+			data = IntersectIDs(data, next)
+		}
+
+		return data, tkn
+	}
+
+	expr = func() ([]int32, string) {
+
+		var next []int32
+
+		data, tkn := term()
+		for tkn == "|" {
+			next, tkn = term()
+			data = CombineIDs(data, next)
+		}
+
+		return data, tkn
+	}
+
+	// enter recursive descent parser
+	result, tkn := expr()
+
+	if tkn != "" {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unexpected token '%s' at end of expression\n", tkn)
+		os.Exit(1)
+	}
 
 	// sort final result
 	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
 
+	// use buffers to speed up uid printing
+	var buffer strings.Builder
+
+	wrtr := bufio.NewWriter(os.Stdout)
+
 	for _, pmid := range result {
-		fmt.Fprintf(os.Stdout, "%d\n", pmid)
+		val := strconv.Itoa(int(pmid))
+		buffer.WriteString(val[:])
+		buffer.WriteString("\n")
 	}
+
+	txt := buffer.String()
+	if txt != "" {
+		// print buffer
+		wrtr.WriteString(txt[:])
+	}
+
+	wrtr.Flush()
+
+	runtime.Gosched()
 
 	return count
 }
 
-func SplitIntoWords(str string) []string {
+// QUERY PARSING FUNCTIONS
+
+func PrepareQuery(str string) string {
+
+	if str == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(str, "[PIPE]") {
+		str = "stdin " + str
+	}
+
+	// cleanup string
+	if IsNotASCII(str) {
+		str = DoAccentTransform(str)
+		if HasUnicodeMarkup(str) {
+			str = RepairUnicodeMarkup(str, SPACE)
+		}
+	}
+
+	if HasBadSpace(str) {
+		str = CleanupBadSpaces(str)
+	}
+	if HasAngleBracket(str) {
+		str = RepairEncodedMarkup(str)
+		str = RepairScriptMarkup(str, SPACE)
+		str = RepairMathMLMarkup(str, SPACE)
+		str = RemoveEmbeddedMarkup(str)
+	}
+
+	if HasAmpOrNotASCII(str) {
+		str = html.UnescapeString(str)
+	}
+
+	if IsNotASCII(str) {
+		if HasGreek(str) {
+			str = SpellGreek(str)
+			str = CompressRunsOfSpaces(str)
+		}
+		str = UnicodeToASCII(str)
+	}
+
+	str = strings.Replace(str, "~ ~", "~~", -1)
+	str = strings.Replace(str, "~ ~", "~~", -1)
+
+	str = strings.TrimSpace(str)
+
+	// temporarily flank with spaces to detect misplaced operators at ends
+	str = " " + str + " "
+
+	str = strings.Replace(str, " AND ", " & ", -1)
+	str = strings.Replace(str, " OR ", " | ", -1)
+	str = strings.Replace(str, " NOT ", " ! ", -1)
+
+	str = strings.Replace(str, "(", " ( ", -1)
+	str = strings.Replace(str, ")", " ) ", -1)
+	str = strings.Replace(str, "&", " & ", -1)
+	str = strings.Replace(str, "|", " | ", -1)
+	str = strings.Replace(str, "!", " ! ", -1)
+
+	// ensure that bracketed fields are flanked by spaces
+	str = strings.Replace(str, "[", " [", -1)
+	str = strings.Replace(str, "]", "] ", -1)
+
+	// remove temporary flanking spaces
+	str = strings.TrimSpace(str)
+
+	str = strings.ToLower(str)
+
+	str = strings.Replace(str, "_", " ", -1)
+
+	if HasPlusOrMinus(str) {
+		str = FixThemeCases(str)
+	}
+
+	if HasHyphenOrApostrophe(str) {
+		str = FixSpecialCases(str)
+	}
+
+	str = strings.Replace(str, "-", " ", -1)
+
+	// convert bracketed fields to capitalized words
+	str = DecodeFields(str)
+
+	// break terms at punctuation, and at non-ASCII characters, allowing Boolean control symbols, along with
+	// underscore for protected terms, asterisk to indicate truncation wildcard, tilde for maximum proximity,
+	// and plus sign for exactly one wildcard word
+	terms := strings.FieldsFunc(str, func(c rune) bool {
+		return (!unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '_' && c != '*' && c != '~' &&
+			c != '+' && c != '$' && c != '&' && c != '|' && c != '!' && c != '(' && c != ')') || c > 127
+	})
+
+	// rejoin into processed sentence
+	tmp := strings.Join(terms, " ")
+
+	tmp = CompressRunsOfSpaces(tmp)
+	tmp = strings.TrimSpace(tmp)
+
+	return tmp
+}
+
+func PrepareExact(str string) string {
+
+	if str == "" {
+		return ""
+	}
+
+	if str == "[Not Available]." || str == "Health." {
+		return ""
+	}
+
+	str = html.EscapeString(str)
+
+	if IsNotASCII(str) {
+		str = DoAccentTransform(str)
+		if HasUnicodeMarkup(str) {
+			str = RepairUnicodeMarkup(str, SPACE)
+		}
+	}
+
+	str = strings.ToLower(str)
+
+	if HasBadSpace(str) {
+		str = CleanupBadSpaces(str)
+	}
+	if HasAngleBracket(str) {
+		str = RepairEncodedMarkup(str)
+		str = RepairScriptMarkup(str, SPACE)
+		str = RepairMathMLMarkup(str, SPACE)
+		// RemoveEmbeddedMarkup must be called before UnescapeString, which was suppressed in ExploreElements
+		str = RemoveEmbeddedMarkup(str)
+	}
+
+	if HasAmpOrNotASCII(str) {
+		str = html.UnescapeString(str)
+	}
+
+	if IsNotASCII(str) {
+		if HasGreek(str) {
+			str = SpellGreek(str)
+			str = CompressRunsOfSpaces(str)
+		}
+	}
+
+	str = strings.Replace(str, "(", " ", -1)
+	str = strings.Replace(str, ")", " ", -1)
+
+	str = strings.Replace(str, "_", " ", -1)
+
+	if HasHyphenOrApostrophe(str) {
+		str = FixSpecialCases(str)
+	}
+
+	str = strings.Replace(str, "-", " ", -1)
+
+	// remove trailing punctuation from each word
+	var arry []string
+
+	terms := strings.Fields(str)
+	for _, item := range terms {
+		max := len(item)
+		for max > 1 {
+			ch := item[max-1]
+			if ch != '.' && ch != ',' && ch != ':' && ch != ';' {
+				break
+			}
+			// trim trailing period, comma, colon, and semicolon
+			item = item[:max-1]
+			// continue checking for runs of punctuation at end
+			max--
+		}
+		if item == "" {
+			continue
+		}
+		arry = append(arry, item)
+	}
+
+	// rejoin into string
+	cleaned := strings.Join(arry, " ")
+
+	// break clauses at punctuation other than space or underscore, and at non-ASCII characters
+	clauses := strings.FieldsFunc(cleaned, func(c rune) bool {
+		return (!unicode.IsLetter(c) && !unicode.IsDigit(c)) && c != ' ' && c != '_' || c > 127
+	})
+
+	// space replaces plus sign to separate runs of unpunctuated words
+	phrases := strings.Join(clauses, " ")
+
+	var chain []string
+
+	// break phrases into individual words
+	words := strings.Fields(phrases)
+
+	for _, item := range words {
+
+		// skip at site of punctuation break
+		if item == "+" {
+			chain = append(chain, "+")
+			continue
+		}
+
+		// skip terms that are all digits
+		if IsAllDigitsOrPeriod(item) {
+			chain = append(chain, "+")
+			continue
+		}
+
+		// optional stop word removal
+		if DeStop && IsStopWord(item) {
+			chain = append(chain, "+")
+			continue
+		}
+
+		// index single normalized term
+		chain = append(chain, item)
+	}
+
+	// rejoin into processed sentence
+	tmp := strings.Join(chain, " ")
+
+	tmp = strings.Replace(tmp, "+ +", "++", -1)
+	tmp = strings.Replace(tmp, "+ +", "++", -1)
+
+	tmp = CompressRunsOfSpaces(tmp)
+	tmp = strings.TrimSpace(tmp)
+
+	return tmp
+}
+
+func ProcessStopWords(str string) string {
+
+	if str == "" {
+		return ""
+	}
+
+	var chain []string
+
+	terms := strings.Fields(str)
+
+	nextField := func(terms []string) (string, int) {
+
+		for j, item := range terms {
+			for _, key := range IdxFields {
+				if item == key {
+					return item, j + 1
+				}
+			}
+		}
+
+		return "", 0
+	}
+
+	// replace unwanted and stop words with plus sign
+	for len(terms) > 0 {
+
+		item := terms[0]
+		terms = terms[1:]
+
+		fld, j := nextField(terms)
+
+		switch fld {
+		case "CHEM", "CODE", "CONV", "DISZ", "GENE", "PATH", "THME", "TREE":
+			for j > 0 {
+				// do not treat non-TIAB terms as stop words
+				chain = append(chain, item)
+				j--
+				item = terms[0]
+				terms = terms[1:]
+			}
+			chain = append(chain, fld)
+			continue
+		case "PIPE":
+			for j > 0 {
+				// add leading stdin term
+				chain = append(chain, item)
+				j--
+				item = terms[0]
+				terms = terms[1:]
+			}
+			chain = append(chain, fld)
+			continue
+		default:
+		}
+
+		// skip if stop word, breaking phrase chain
+		if DeStop && IsStopWord(item) {
+			chain = append(chain, "+")
+			continue
+		}
+
+		// index single normalized term
+		chain = append(chain, item)
+	}
+
+	// rejoin into processed sentence
+	tmp := strings.Join(chain, " ")
+
+	tmp = strings.Replace(tmp, "+ +", "++", -1)
+	tmp = strings.Replace(tmp, "+ +", "++", -1)
+
+	tmp = strings.Replace(tmp, "~ +", "~+", -1)
+	tmp = strings.Replace(tmp, "+ ~", "+~", -1)
+
+	for strings.Contains(tmp, "~+") {
+		tmp = strings.Replace(tmp, "~+", "~~", -1)
+	}
+	for strings.Contains(tmp, "+~") {
+		tmp = strings.Replace(tmp, "+~", "~~", -1)
+	}
+
+	tmp = CompressRunsOfSpaces(tmp)
+	tmp = strings.TrimSpace(tmp)
+
+	return tmp
+}
+
+func PartitionQuery(str string) []string {
 
 	if str == "" {
 		return nil
 	}
 
-	var arry []string
+	str = CompressRunsOfSpaces(str)
+	str = strings.TrimSpace(str)
 
-	parts := strings.Split(str, "+")
+	str = " " + str + " "
 
-	for _, segment := range parts {
+	// flank all operators with caret
+	str = strings.Replace(str, " ( ", " ^ ( ^ ", -1)
+	str = strings.Replace(str, " ) ", " ^ ) ^ ", -1)
+	str = strings.Replace(str, " & ", " ^ & ^ ", -1)
+	str = strings.Replace(str, " | ", " ^ | ^ ", -1)
+	str = strings.Replace(str, " ! ", " ^ ! ^ ", -1)
+	str = strings.Replace(str, " ~", " ^ ~", -1)
+	str = strings.Replace(str, "~ ", "~ ^ ", -1)
 
-		segment = strings.TrimSpace(segment)
+	str = CompressRunsOfSpaces(str)
+	str = strings.TrimSpace(str)
 
-		if segment == "" {
-			continue
-		}
+	str = strings.Replace(str, "^ ^", "^", -1)
 
-		words := strings.Fields(segment)
-
-		for _, item := range words {
-			arry = append(arry, item)
-		}
+	if strings.HasPrefix(str, "^ ") {
+		str = str[2:]
+	}
+	if strings.HasSuffix(str, " ^") {
+		max := len(str)
+		str = str[:max-2]
 	}
 
-	return arry
+	str = strings.Replace(str, "~ ^ +", "~+", -1)
+	str = strings.Replace(str, "+ ^ ~", "+~", -1)
+
+	str = strings.Replace(str, "~ +", "~+", -1)
+	str = strings.Replace(str, "+ ~", "+~", -1)
+
+	for strings.Contains(str, "~+") {
+		str = strings.Replace(str, "~+", "~~", -1)
+	}
+	for strings.Contains(str, "+~") {
+		str = strings.Replace(str, "+~", "~~", -1)
+	}
+
+	// split into non-broken phrase segments or operator symbols
+	tmp := strings.Split(str, " ^ ")
+
+	return tmp
 }
 
-func ProcessCount(base, phrase string) int {
+func SetFieldQualifiers(clauses []string, rlxd bool) []string {
 
-	if phrase == "" {
-		return 0
-	}
-
-	phrase = PrepareQuery(phrase)
-
-	clauses := PartitionQuery(phrase)
-
-	clauses = MarkClauses(clauses)
+	var res []string
 
 	if clauses == nil {
-		return 0
+		return nil
 	}
 
-	count := 0
+	performStemming := func(str string, allowStemming bool) string {
 
-	checkTermCounts := func(str string) {
-
-		words := SplitIntoWords(str)
-
-		if words == nil || len(words) < 1 {
-			return
+		if str == "" {
+			return ""
 		}
 
-		for _, term := range words {
+		var chain []string
 
-			data := GetPostingIDs(base, term)
-			size := len(data)
-			fmt.Fprintf(os.Stdout, "%d\t%s\n", size, term)
-			count += size
-		}
-	}
+		terms := strings.Fields(str)
 
-	for _, item := range clauses {
+		// replace unwanted and stop words with plus sign
+		for _, item := range terms {
 
-		// skip control symbols
-		if item == "(" || item == ")" || item == "&" || item == "|" || item == "!" {
-			continue
-		}
+			// allow tilde proximity indicator
+			if item == "~" {
+				chain = append(chain, item)
+				continue
+			}
 
-		checkTermCounts(item)
-	}
+			// skip terms that are all digits
+			if IsAllDigitsOrPeriod(item) {
+				chain = append(chain, "+")
+				continue
+			}
 
-	return count
-}
+			// skip if stop word, breaking phrase chain
+			if DeStop && IsStopWord(item) {
+				chain = append(chain, "+")
+				continue
+			}
 
-func ProcessCounts(base, phrase string) int {
-
-	if phrase == "" {
-		return 0
-	}
-
-	phrase = PrepareQuery(phrase)
-
-	clauses := PartitionQuery(phrase)
-
-	clauses = MarkClauses(clauses)
-
-	if clauses == nil {
-		return 0
-	}
-
-	count := 0
-
-	checkTermCounts := func(str string) {
-
-		words := SplitIntoWords(str)
-
-		if words == nil || len(words) < 1 {
-			return
-		}
-
-		for _, term := range words {
-
-			count += PrintTermCounts(base, term)
-		}
-	}
-
-	for _, item := range clauses {
-
-		// skip control symbols
-		if item == "(" || item == ")" || item == "&" || item == "|" || item == "!" {
-			continue
-		}
-
-		checkTermCounts(item)
-	}
-
-	return count
-}
-
-func ProcessPosCount(base, phrase string) int {
-
-	if phrase == "" {
-		return 0
-	}
-
-	phrase = PrepareQuery(phrase)
-
-	clauses := PartitionQuery(phrase)
-
-	clauses = MarkClauses(clauses)
-
-	if clauses == nil {
-		return 0
-	}
-
-	count := 0
-
-	checkTermCounts := func(str string) {
-
-		words := SplitIntoWords(str)
-
-		if words == nil || len(words) < 1 {
-			return
-		}
-
-		printUIDandPos := func(data []int32, ofst [][]int16) {
-
-			for i := 0; i < len(data); i++ {
-				fmt.Fprintf(os.Stdout, "%12d\t", data[i])
-				pos := ofst[i]
-				sep := ""
-				for j := 0; j < len(pos); j++ {
-					fmt.Fprintf(os.Stdout, "%s%d", sep, pos[j])
-					sep = ","
+			// apply stemming algorithm
+			if allowStemming {
+				isWildCard := strings.HasSuffix(item, "*")
+				if isWildCard {
+					// temporarily remove trailing asterisk
+					item = strings.TrimSuffix(item, "*")
 				}
-				fmt.Fprintf(os.Stdout, "\n")
+
+				item = porter2.Stem(item)
+				item = strings.TrimSpace(item)
+
+				if isWildCard {
+					// do wildcard search in stemmed term list
+					item += "*"
+				}
+			}
+
+			// record single term
+			chain = append(chain, item)
+		}
+
+		// rejoin into processed sentence
+		tmp := strings.Join(chain, " ")
+
+		tmp = strings.Replace(tmp, "+ +", "++", -1)
+		tmp = strings.Replace(tmp, "+ +", "++", -1)
+
+		tmp = CompressRunsOfSpaces(tmp)
+		tmp = strings.TrimSpace(tmp)
+
+		return tmp
+	}
+
+	for _, str := range clauses {
+
+		// pass control symbols unchanged
+		if str == "(" || str == ")" || str == "&" || str == "|" || str == "!" || strings.HasPrefix(str, "~") {
+			res = append(res, str)
+			continue
+		}
+
+		// pass angle bracket content delimiters (for -phrase, -require, -exclude)
+		if str == "<" || str == ">" {
+			res = append(res, str)
+			continue
+		}
+
+		slen := len(str)
+
+		allowStemming := false
+		explicitNorm := false
+
+		if strings.HasSuffix(str, " YEAR") {
+
+			str = str[:slen-5]
+
+			// regular 4-digit year
+			if len(str) == 4 && IsAllDigitsOrPeriod(str) {
+				res = append(res, str+" [YEAR]")
+				continue
+			}
+
+			// check for year wildcard
+			if len(str) == 4 && str[3] == '*' && IsAllDigitsOrPeriod(str[:3]) {
+
+				fmt.Fprintf(os.Stderr, "\nERROR: Wildcards not supported for years - use ####:#### range instead\n")
+				os.Exit(1)
+			}
+
+			// check for year range
+			if len(str) == 9 && str[4] == ' ' && IsAllDigitsOrPeriod(str[:4]) && IsAllDigitsOrPeriod(str[5:]) {
+				start, err := strconv.Atoi(str[:4])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unable to recognize starting year '%s'\n", str[:4])
+					os.Exit(1)
+				}
+				stop, err := strconv.Atoi(str[5:])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unable to recognize stopping year '%s'\n", str[5:])
+					os.Exit(1)
+				}
+				if start > stop {
+					continue
+				}
+				// expand year range into individual year-by-year queries
+				pfx := "("
+				sfx := ")"
+				for start <= stop {
+					res = append(res, pfx)
+					pfx = "|"
+					yr := strconv.Itoa(start)
+					res = append(res, yr+" [YEAR]")
+					start++
+				}
+				res = append(res, sfx)
+				continue
+			}
+
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to recognize year expression '%s'\n", str)
+			os.Exit(1)
+
+		} else if strings.HasSuffix(str, " TREE") {
+
+			str = str[:slen-5]
+
+			// pad if top-level mesh tree wildcard uses four character trie
+			if len(str) == 4 && str[3] == '*' {
+				key := str[:2]
+				num, ok := trieLen[key]
+				if ok && num > 3 {
+					str = str[0:3] + " " + "*"
+				}
+			}
+
+			str = strings.Replace(str, " ", ".", -1)
+			tmp := str
+			tmp = strings.TrimSuffix(tmp, "*")
+			if len(tmp) > 2 && unicode.IsLower(rune(tmp[0])) && IsAllDigitsOrPeriod(tmp[1:]) {
+				str = strings.Replace(str, ".", " ", -1)
+				res = append(res, str+" [TREE]")
+				continue
+			}
+
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to recognize mesh code expression '%s'\n", str)
+			os.Exit(1)
+
+		} else if strings.HasSuffix(str, " CODE") {
+
+			str = str[:slen-5]
+			res = append(res, str+" [CODE]")
+			continue
+
+		} else if strings.HasSuffix(str, " THME") {
+
+			str = str[:slen-5]
+			res = append(res, str+" [THME]")
+			continue
+
+		} else if strings.HasSuffix(str, " CONV") {
+
+			str = str[:slen-5]
+			res = append(res, str+" [CONV]")
+			continue
+
+		} else if strings.HasSuffix(str, " PATH") {
+
+			str = str[:slen-5]
+			res = append(res, str+" [PATH]")
+			continue
+
+		} else if strings.HasSuffix(str, " STEM") {
+
+			allowStemming = true
+			str = str[:slen-5]
+
+		} else if strings.HasSuffix(str, " NORM") {
+
+			explicitNorm = true
+			str = str[:slen-5]
+
+		} else {
+
+			found := false
+			for _, key := range IdxFields {
+				if strings.HasSuffix(str, " "+key) {
+					klen := len(key) + 1
+					str = str[:slen-klen]
+					res = append(res, str+" ["+key+"]")
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+
+			if rlxd {
+
+				allowStemming = true
 			}
 		}
 
+		// process clause, using plus sign to break runs of words
+		tmp := performStemming(str, allowStemming)
+
+		// remove leading and trailing plus signs and spaces
+		for strings.HasPrefix(tmp, "+") || strings.HasPrefix(tmp, " ") {
+			tmp = tmp[1:]
+		}
+		for strings.HasSuffix(tmp, "+") || strings.HasSuffix(tmp, " ") {
+			tlen := len(tmp)
+			tmp = tmp[:tlen-1]
+		}
+
+		if allowStemming {
+			tmp += " [STEM]"
+		} else if explicitNorm {
+			tmp += " [NORM]"
+		}
+
+		res = append(res, tmp)
+	}
+
+	return res
+}
+
+// SEARCH TERM LISTS FOR PHRASES OR NORMALIZED TERMS, OR MATCH BY PATTERN
+
+func ProcessSearch(base, phrase string, xact, rlxd bool) int {
+
+	if phrase == "" {
+		return 0
+	}
+
+	if xact {
+		phrase = PrepareExact(phrase)
+	} else {
+		phrase = PrepareQuery(phrase)
+	}
+
+	phrase = ProcessStopWords(phrase)
+
+	clauses := PartitionQuery(phrase)
+
+	clauses = SetFieldQualifiers(clauses, rlxd)
+
+	return EvaluateQuery(base, clauses)
+}
+
+func ProcessMock(base, phrase string, xact, rlxd bool) int {
+
+	if phrase == "" {
+		return 0
+	}
+
+	fmt.Fprintf(os.Stdout, "ProcessSearch:\n\n%s\n\n", phrase)
+
+	if xact {
+		phrase = PrepareExact(phrase)
+
+		fmt.Fprintf(os.Stdout, "PrepareExact:\n\n%s\n\n", phrase)
+	} else {
+		phrase = PrepareQuery(phrase)
+
+		fmt.Fprintf(os.Stdout, "PrepareQuery:\n\n%s\n\n", phrase)
+	}
+
+	phrase = ProcessStopWords(phrase)
+
+	fmt.Fprintf(os.Stdout, "ProcessStopWords:\n\n%s\n\n", phrase)
+
+	clauses := PartitionQuery(phrase)
+
+	fmt.Fprintf(os.Stdout, "PartitionQuery:\n\n")
+	for _, tkn := range clauses {
+		fmt.Fprintf(os.Stdout, "%s\n", tkn)
+	}
+	fmt.Fprintf(os.Stdout, "\n")
+
+	clauses = SetFieldQualifiers(clauses, rlxd)
+
+	fmt.Fprintf(os.Stdout, "SetFieldQualifiers:\n\n")
+	for _, tkn := range clauses {
+		fmt.Fprintf(os.Stdout, "%s\n", tkn)
+	}
+	fmt.Fprintf(os.Stdout, "\n")
+
+	return 0
+}
+
+func ProcessCount(base, phrase string, plrl, psns, rlxd bool) int {
+
+	if phrase == "" {
+		return 0
+	}
+
+	phrase = PrepareQuery(phrase)
+
+	phrase = ProcessStopWords(phrase)
+
+	clauses := PartitionQuery(phrase)
+
+	clauses = SetFieldQualifiers(clauses, rlxd)
+
+	if clauses == nil {
+		return 0
+	}
+
+	count := 0
+
+	splitIntoWords := func(str string) []string {
+
+		if str == "" {
+			return nil
+		}
+
+		var arry []string
+
+		parts := strings.Split(str, "+")
+
+		for _, segment := range parts {
+
+			segment = strings.TrimSpace(segment)
+
+			if segment == "" {
+				continue
+			}
+
+			words := strings.Fields(segment)
+
+			for _, item := range words {
+				if strings.HasPrefix(item, "~") {
+					continue
+				}
+				arry = append(arry, item)
+			}
+		}
+
+		return arry
+	}
+
+	parseField := func(str string) (string, string) {
+
+		field := "NORM"
+
+		slen := len(str)
+
+		for _, key := range IdxFields {
+			if strings.HasSuffix(str, " ["+key+"]") {
+				klen := len(key) + 3
+				str = str[:slen-klen]
+				field = key
+				switch key {
+				case "CHEM", "CODE", "CONV", "DISZ", "GENE", "PATH", "THME", "TREE":
+					str = strings.Replace(str, " ", "_", -1)
+				case "PIPE":
+				default:
+				}
+				break
+			}
+		}
+
+		return field, str
+	}
+
+	checkTermCounts := func(txt string) {
+
+		field, str := parseField(txt)
+
+		var words []string
+
+		words = splitIntoWords(str)
+
+		if words == nil || len(words) < 1 {
+			return
+		}
+
 		for _, term := range words {
 
-			data, ofst := GetPostingIDsEx(base, term)
-			size := len(data)
-			fmt.Fprintf(os.Stdout, "\n%d\t%s\n\n", size, term)
-			printUIDandPos(data, ofst)
-			count += size
+			term = strings.Replace(term, "_", " ", -1)
+
+			if psns {
+				count += PrintTermPositions(base, term, field)
+			} else if plrl {
+				count += PrintTermCounts(base, term, field)
+			} else {
+				count += PrintTermCount(base, term, field)
+			}
 		}
 	}
 
@@ -2111,6 +3040,8 @@ func ProcessPosCount(base, phrase string) int {
 
 		checkTermCounts(item)
 	}
+
+	runtime.Gosched()
 
 	return count
 }
@@ -2165,7 +3096,7 @@ func CreateUIDReader(in io.Reader) <-chan Extract {
 	return out
 }
 
-func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extract) <-chan string {
+func CreateStashers(stash, parent, indx, sfx string, hash, zipp bool, report int, inp <-chan Extract) <-chan string {
 
 	if inp == nil {
 		return nil
@@ -2179,9 +3110,8 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 
 	find := ParseIndex(indx)
 
-	sfx := ".xml"
 	if zipp {
-		sfx = ".xml.gz"
+		sfx += ".gz"
 	}
 
 	type StasherType int
@@ -2228,10 +3158,29 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 
 		wlock.Lock()
 
-		defer wlock.Unlock()
-
 		// free entry in map, later versions of same record can now be written
 		delete(inUse, id)
+
+		wlock.Unlock()
+	}
+
+	// mutex to protect access to rollingCount variable
+	var tlock sync.Mutex
+
+	rollingCount := 0
+
+	countSuccess := func() {
+
+		tlock.Lock()
+
+		rollingCount++
+		if rollingCount >= report {
+			rollingCount = 0
+			// print dot (progress monitor)
+			fmt.Fprintf(os.Stderr, ".")
+		}
+
+		tlock.Unlock()
 	}
 
 	// stashRecord saves individual XML record to archive file accessed by trie
@@ -2263,7 +3212,7 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 				time.Sleep(time.Second)
 				attempts--
 				if attempts < 1 {
-					// cannot get lock after several attempts
+					// could not get lock after several attempts
 					fmt.Fprintf(os.Stderr, "\nERROR: Unable to save '%s'\n", id)
 					return ""
 				}
@@ -2281,10 +3230,7 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 		if dpath == "" {
 			return ""
 		}
-		_, err := os.Stat(dpath)
-		if err != nil && os.IsNotExist(err) {
-			err = os.MkdirAll(dpath, os.ModePerm)
-		}
+		err := os.MkdirAll(dpath, os.ModePerm)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 			return ""
@@ -2301,10 +3247,6 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 			return ""
 		}
 
-		defer fl.Close()
-
-		defer fl.Sync()
-
 		res := ""
 
 		if hash {
@@ -2318,31 +3260,53 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 		if zipp {
 
 			zpr, err := gzip.NewWriterLevel(fl, gzip.DefaultCompression)
-			if err != nil {
+
+			if err == nil {
+
+				wrtr := bufio.NewWriter(zpr)
+
+				// compress and copy record to file
+				wrtr.WriteString(str)
+				if !strings.HasSuffix(str, "\n") {
+					wrtr.WriteString("\n")
+				}
+
+				err = wrtr.Flush()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+					return ""
+				}
+
+				err = zpr.Close()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+					return ""
+				}
+
+			} else {
+
 				fmt.Fprintf(os.Stderr, "%s\n", err.Error())
-				return ""
-			}
-
-			defer zpr.Close()
-
-			wrtr := bufio.NewWriter(zpr)
-
-			defer wrtr.Flush()
-
-			// compress and copy record to file
-			wrtr.WriteString(str)
-			if !strings.HasSuffix(str, "\n") {
-				wrtr.WriteString("\n")
 			}
 
 		} else {
 
-			// copy record to file
+			// copy uncompressed record to file
 			fl.WriteString(str)
 			if !strings.HasSuffix(str, "\n") {
 				fl.WriteString("\n")
 			}
 		}
+
+		// fl.Sync()
+
+		err = fl.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+			return ""
+		}
+
+		// progress monitor prints dot every 1000 (.xml) or 50000 (.e2x) records
+		countSuccess()
 
 		return res
 	}
@@ -2364,9 +3328,9 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 			}
 			res += "\n"
 
-			out <- res
-
 			runtime.Gosched()
+
+			out <- res
 		}
 	}
 
@@ -2382,12 +3346,14 @@ func CreateStashers(stash, parent, indx string, hash, zipp bool, inp <-chan Extr
 	go func() {
 		wg.Wait()
 		close(out)
+		// print newline after rows of dots (progress monitor)
+		fmt.Fprintf(os.Stderr, "\n")
 	}()
 
 	return out
 }
 
-func CreateFetchers(stash string, zipp bool, inp <-chan Extract) <-chan Extract {
+func CreateFetchers(stash, sfx string, zipp bool, inp <-chan Extract) <-chan Extract {
 
 	if inp == nil {
 		return nil
@@ -2399,9 +3365,8 @@ func CreateFetchers(stash string, zipp bool, inp <-chan Extract) <-chan Extract 
 		os.Exit(1)
 	}
 
-	sfx := ".xml"
 	if zipp {
-		sfx = ".xml.gz"
+		sfx += ".gz"
 	}
 
 	fetchRecord := func(file string, buf bytes.Buffer) string {
@@ -2422,10 +3387,10 @@ func CreateFetchers(stash string, zipp bool, inp <-chan Extract) <-chan Extract 
 
 		inFile, err := os.Open(fpath)
 
-		// if failed to find ".xml" file, try ".xml.gz" without requiring -gzip
+		// if failed to find ".xml" or ".e2x" file, try ".xml.gz" or ".e2x.gz" without requiring -gzip
 		if err != nil && os.IsNotExist(err) && !zipp {
 			iszip = true
-			fpath := path.Join(stash, trie, file+".xml.gz")
+			fpath := path.Join(stash, trie, file+sfx+".gz")
 			if fpath == "" {
 				return ""
 			}
@@ -2479,9 +3444,9 @@ func CreateFetchers(stash string, zipp bool, inp <-chan Extract) <-chan Extract 
 
 			str := fetchRecord(ext.Text, buf)
 
-			out <- Extract{ext.Index, "", str, nil}
-
 			runtime.Gosched()
+
+			out <- Extract{ext.Index, "", str, nil}
 		}
 	}
 
@@ -2540,14 +3505,14 @@ func CreateStreamers(stash string, inp <-chan Extract) <-chan Extract {
 			return nil
 		}
 
-		defer inFile.Close()
-
 		brd := bufio.NewReader(inFile)
 
 		// copy cached file contents
 		buf.ReadFrom(brd)
 
 		data := buf.Bytes()
+
+		inFile.Close()
 
 		return data
 	}
@@ -2566,9 +3531,9 @@ func CreateStreamers(stash string, inp <-chan Extract) <-chan Extract {
 
 			data := getRecord(ext.Text, buf)
 
-			out <- Extract{ext.Index, "", "", data}
-
 			runtime.Gosched()
+
+			out <- Extract{ext.Index, "", "", data}
 		}
 	}
 
@@ -2589,130 +3554,57 @@ func CreateStreamers(stash string, inp <-chan Extract) <-chan Extract {
 	return out
 }
 
-func CreateCollectors(args []string) <-chan string {
+func CreateDispensers(inp <-chan Extract) <-chan []string {
 
-	if args == nil {
+	if inp == nil {
 		return nil
 	}
 
-	out := make(chan string, ChanDepth)
-	if out == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create collector channel array\n")
-		os.Exit(1)
-	}
-
-	// xmlCollector sends IdxDocument objects from one file through a channel
-	xmlCollector := func(wg *sync.WaitGroup, fileName string) {
-
-		defer wg.Done()
-
-		f, err := os.Open(fileName)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nERROR: Unable to open input file '%s'\n", fileName)
-			os.Exit(1)
-		}
-
-		// close input file when all records have been processed
-		defer f.Close()
-
-		var in io.Reader
-
-		in = f
-
-		// if suffix is ".gz", use decompressor
-		iszip := false
-		if strings.HasSuffix(fileName, ".gz") {
-			iszip = true
-		}
-
-		if iszip {
-			brd := bufio.NewReader(f)
-			if brd == nil {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unable to create buffered reader on '%s'\n", fileName)
-				os.Exit(1)
-			}
-			zpr, err := gzip.NewReader(brd)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unable to create decompressor on '%s'\n", fileName)
-				os.Exit(1)
-			}
-
-			// close decompressor when all records have been processed
-			defer zpr.Close()
-
-			// use decompressor for reading file
-			in = zpr
-		}
-
-		rdr := NewXMLReader(in)
-
-		if rdr == nil {
-			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create XML Block Reader\n")
-			os.Exit(1)
-		}
-
-		// partition all input by pattern and send XML substring through channel
-		PartitionPattern("IdxDocument", "", rdr,
-			func(rec int, ofs int64, str string) {
-				out <- str[:]
-			})
-	}
-
-	var wg sync.WaitGroup
-
-	// launch multiple collector goroutines
-	for _, str := range args {
-		wg.Add(1)
-		go xmlCollector(&wg, str)
-	}
-
-	// launch separate anonymous goroutine to wait until all collectors are done
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-
-func CreateInverter(nvrt string, inp <-chan string) <-chan []string {
-
 	out := make(chan []string, ChanDepth)
 	if out == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create inverter channel array\n")
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create dispenser channel\n")
 		os.Exit(1)
 	}
+
+	var ilock sync.Mutex
 
 	// map for inverted index
 	inverted := make(map[string][]string)
 
 	// add single posting
-	addPost := func(term, pos, uid string) {
+	addPost := func(fld, term, pos, uid string) {
+
+		// protect map with mutex
+		ilock.Lock()
 
 		data, ok := inverted[term]
 		if !ok {
-			data = make([]string, 0, 3)
+			data = make([]string, 0, 4)
 			// first entry on new slice is term
 			data = append(data, term)
 		}
+		data = append(data, fld)
 		data = append(data, uid)
 		data = append(data, pos)
 		// always need to update inverted, since data may be reallocated
 		inverted[term] = data
+
+		// unlock at end to avoid defer overhead
+		ilock.Unlock()
 	}
 
-	// xmlInverter sends UID and term strings to a callback for inversion
-	xmlInverter := func(inp <-chan string, out chan<- []string) {
+	// xmlDispenser prepares UID, term, and position strings for inversion
+	xmlDispenser := func(wg *sync.WaitGroup, inp <-chan Extract, out chan<- []string) {
 
-		defer close(out)
+		defer wg.Done()
 
 		currUID := ""
 
-		doInvert := func(tag, attr, content string) {
+		doDispense := func(tag, attr, content string) {
 
 			if tag == "IdxUid" {
 				currUID = content
-			} else if tag == nvrt {
+			} else {
 
 				// expand Greek letters, anglicize characters in other alphabets
 				if IsNotASCII(content) {
@@ -2730,7 +3622,7 @@ func CreateInverter(nvrt string, inp <-chan string) <-chan []string {
 				}
 
 				// remove punctuation from term
-				content := strings.Map(func(c rune) rune {
+				content = strings.Map(func(c rune) rune {
 					if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != ' ' && c != '-' && c != '_' {
 						return -1
 					}
@@ -2744,30 +3636,44 @@ func CreateInverter(nvrt string, inp <-chan string) <-chan []string {
 				content = strings.TrimSpace(content)
 
 				if content != "" && currUID != "" {
-					addPost(content, attr, currUID)
+					addPost(tag, content, attr, currUID)
 				}
 			}
 		}
 
-		for str := range inp {
-			StreamValues(str[:], "IdxDocument", doInvert)
-		}
+		// read partitioned XML from producer channel
+		for ext := range inp {
 
-		// send results to sorters
+			StreamValues(ext.Text[:], "IdxDocument", doDispense)
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	// launch multiple dispenser goroutines
+	for i := 0; i < NumServe; i++ {
+		wg.Add(1)
+		go xmlDispenser(&wg, inp, out)
+	}
+
+	// launch separate anonymous goroutine to wait until all dispensers are done
+	go func() {
+		wg.Wait()
+
+		// send results to inverters
 		for _, data := range inverted {
 			out <- data
 
 			runtime.Gosched()
 		}
-	}
 
-	// launch single inverter goroutine
-	go xmlInverter(inp, out)
+		close(out)
+	}()
 
 	return out
 }
 
-func CreateSorters(nvrt string, inp <-chan []string) <-chan Extract {
+func CreateInverters(inp <-chan []string) <-chan Extract {
 
 	if inp == nil {
 		return nil
@@ -2775,12 +3681,12 @@ func CreateSorters(nvrt string, inp <-chan []string) <-chan Extract {
 
 	out := make(chan Extract, ChanDepth)
 	if out == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create sorter channel\n")
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create inverter channel\n")
 		os.Exit(1)
 	}
 
-	// xmlSorter reads from channel and prints one sorted posting list
-	xmlSorter := func(wg *sync.WaitGroup, nvrt string, inp <-chan []string, out chan<- Extract) {
+	// xmlInverter sorts and prints one posting list
+	xmlInverter := func(wg *sync.WaitGroup, inp <-chan []string, out chan<- Extract) {
 
 		defer wg.Done()
 
@@ -2788,38 +3694,21 @@ func CreateSorters(nvrt string, inp <-chan []string) <-chan Extract {
 
 		printPosting := func(key string, data []string) string {
 
-			positions := make(map[string]string)
+			fields := make(map[string]map[string]string)
 
 			for len(data) > 1 {
-				uid := data[0]
-				att := data[1]
+				fld := data[0]
+				uid := data[1]
+				att := data[2]
+				positions, ok := fields[fld]
+				if !ok {
+					positions = make(map[string]string)
+					fields[fld] = positions
+				}
 				// store position attribute string by uid
 				positions[uid] = att
 				// skip to next position
-				data = data[2:]
-			}
-
-			var arry []string
-
-			for item := range positions {
-				arry = append(arry, item)
-			}
-
-			if len(arry) > 1 {
-				sort.Slice(arry, func(i, j int) bool {
-					// numeric sort on strings checks lengths first
-					lni := len(arry[i])
-					lnj := len(arry[j])
-					// shorter string is numerically less, assuming no leading zeros
-					if lni < lnj {
-						return true
-					}
-					if lni > lnj {
-						return false
-					}
-					// same length, can now do string comparison on contents
-					return arry[i] < arry[j]
-				})
+				data = data[3:]
 			}
 
 			buffer.Reset()
@@ -2828,30 +3717,66 @@ func CreateSorters(nvrt string, inp <-chan []string) <-chan Extract {
 			buffer.WriteString("    <InvKey>")
 			buffer.WriteString(key)
 			buffer.WriteString("</InvKey>\n")
-
-			// print list of UIDs, skipping duplicates
 			buffer.WriteString("    <InvIDs>\n")
-			prev := ""
-			for _, uid := range arry {
-				if uid == prev {
-					continue
-				}
 
-				buffer.WriteString("      <")
-				buffer.WriteString(nvrt)
-				atr := positions[uid]
-				if atr != "" {
-					buffer.WriteString(" ")
-					buffer.WriteString(atr)
-				}
-				buffer.WriteString(">")
-				buffer.WriteString(uid)
-				buffer.WriteString("</")
-				buffer.WriteString(nvrt)
-				buffer.WriteString(">\n")
-
-				prev = uid
+			// sort fields in alphabetical order
+			var keys []string
+			for ky := range fields {
+				keys = append(keys, ky)
 			}
+			sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+			for _, fld := range keys {
+
+				positions := fields[fld]
+
+				var arry []string
+
+				for item := range positions {
+					arry = append(arry, item)
+				}
+
+				if len(arry) > 1 {
+					sort.Slice(arry, func(i, j int) bool {
+						// numeric sort on strings checks lengths first
+						lni := len(arry[i])
+						lnj := len(arry[j])
+						// shorter string is numerically less, assuming no leading zeros
+						if lni < lnj {
+							return true
+						}
+						if lni > lnj {
+							return false
+						}
+						// same length, can now do string comparison on contents
+						return arry[i] < arry[j]
+					})
+				}
+
+				// print list of UIDs, skipping duplicates
+				prev := ""
+				for _, uid := range arry {
+					if uid == prev {
+						continue
+					}
+
+					buffer.WriteString("      <")
+					buffer.WriteString(fld)
+					atr := positions[uid]
+					if atr != "" {
+						buffer.WriteString(" ")
+						buffer.WriteString(atr)
+					}
+					buffer.WriteString(">")
+					buffer.WriteString(uid)
+					buffer.WriteString("</")
+					buffer.WriteString(fld)
+					buffer.WriteString(">\n")
+
+					prev = uid
+				}
+			}
+
 			buffer.WriteString("    </InvIDs>\n")
 			buffer.WriteString("  </InvDocument>\n")
 
@@ -2875,13 +3800,13 @@ func CreateSorters(nvrt string, inp <-chan []string) <-chan Extract {
 
 	var wg sync.WaitGroup
 
-	// launch multiple sorter goroutines
+	// launch multiple inverter goroutines
 	for i := 0; i < NumServe; i++ {
 		wg.Add(1)
-		go xmlSorter(&wg, nvrt, inp, out)
+		go xmlInverter(&wg, inp, out)
 	}
 
-	// launch separate anonymous goroutine to wait until all sorters are done
+	// launch separate anonymous goroutine to wait until all inverters are done
 	go func() {
 		wg.Wait()
 		close(out)
@@ -2902,7 +3827,7 @@ func CreateResolver(inp <-chan Extract) <-chan string {
 		os.Exit(1)
 	}
 
-	// xmlResolver distributes adjacent records with the same identifier prefix
+	// xmlResolver prints inverted postings alphabetized by identifier prefix
 	xmlResolver := func(inp <-chan Extract, out chan<- string) {
 
 		// close channel when all records have been processed
@@ -2949,6 +3874,8 @@ type Plex struct {
 	Which int
 	Ident string
 	Text  string
+	Index int
+	Sibs  []string
 }
 
 type PlexHeap []Plex
@@ -3036,7 +3963,7 @@ func CreatePresenters(args []string) []<-chan Plex {
 			in = zpr
 		}
 
-		rdr := NewXMLReader(in)
+		rdr := CreateReader(in)
 
 		if rdr == nil {
 			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create XML Block Reader\n")
@@ -3047,10 +3974,10 @@ func CreatePresenters(args []string) []<-chan Plex {
 
 		// partition all input by pattern and send XML substring through channel
 		PartitionPattern("InvDocument", "", rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
 				id := FindIdentifier(str[:], "InvDocument", find)
 
-				out <- Plex{fileNum, id, str}
+				out <- Plex{fileNum, id, str, 0, nil}
 			})
 	}
 
@@ -3085,7 +4012,7 @@ func CreateManifold(inp []<-chan Plex) <-chan Plex {
 		os.Exit(1)
 	}
 
-	// xmlManifold restores original order with heap
+	// xmlManifold restores alphabetical order of merged postings
 	xmlManifold := func(inp []<-chan Plex, out chan<- Plex) {
 
 		// close channel when all records have been processed
@@ -3103,13 +4030,44 @@ func CreateManifold(inp []<-chan Plex) <-chan Plex {
 			}
 		}
 
+		// array to collect strings with same identifier
+		var arry []string
+
+		prevIdent := ""
+		rec := 0
+
 		// reading from heap returns objects in alphabetical order
 		for hp.Len() > 0 {
 
 			// remove lowest item from heap, use interface type assertion
 			curr := heap.Pop(hp).(Plex)
 
-			out <- Plex{curr.Which, curr.Ident, curr.Text}
+			// compare adjacent record identifiers
+			if prevIdent == curr.Ident {
+
+				// save next inverted object string in slice
+				arry = append(arry, curr.Text)
+
+			} else {
+
+				if len(arry) > 0 {
+
+					rec++
+					// send set from previous identifier to output channel
+					out <- Plex{0, prevIdent, "", rec, arry}
+
+					// empty the slice
+					arry = nil
+
+					runtime.Gosched()
+				}
+
+				// remember new identifier
+				prevIdent = curr.Ident
+
+				// save first inverted object with this identifier
+				arry = append(arry, curr.Text)
+			}
 
 			// read next object from channel that just supplied lowest item
 			chn := inp[curr.Which]
@@ -3117,6 +4075,15 @@ func CreateManifold(inp []<-chan Plex) <-chan Plex {
 			if ok {
 				heap.Push(hp, plx)
 			}
+		}
+
+		if len(arry) > 0 {
+
+			rec++
+			// send last record
+			out <- Plex{0, prevIdent, "", rec, arry}
+
+			arry = nil
 		}
 	}
 
@@ -3126,7 +4093,7 @@ func CreateManifold(inp []<-chan Plex) <-chan Plex {
 	return out
 }
 
-func CreateMerger(field string, inp <-chan Plex) <-chan Plex {
+func CreateFusers(inp <-chan Extract) <-chan Plex {
 
 	if inp == nil {
 		return nil
@@ -3134,165 +4101,244 @@ func CreateMerger(field string, inp <-chan Plex) <-chan Plex {
 
 	out := make(chan Plex, ChanDepth)
 	if out == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create merger channel\n")
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create fuser channel\n")
 		os.Exit(1)
 	}
 
-	fuseInverts := func(key string, data []string) string {
+	var flock sync.Mutex
 
-		// mutex for fused index
-		var ilock sync.Mutex
+	// map for combining inverted indices
+	inverted := make(map[string][]string)
 
-		positions := make(map[string]string)
+	addInverts := func(id, str string) {
 
-		addIdents := func(pos, uid string) {
+		// protect map with mutex
+		flock.Lock()
 
-			// protect with mutex
-			ilock.Lock()
-
-			defer ilock.Unlock()
-
-			positions[uid] = pos
+		data, ok := inverted[id]
+		if !ok {
+			data = make([]string, 0, 1)
 		}
 
-		addUID := func(tag, attr, content string) {
+		data = append(data, str)
+		// always need to update inverted, since data may be reallocated
+		inverted[id] = data
 
-			if tag == field {
-
-				addIdents(attr, content)
-			}
-		}
-
-		for _, str := range data {
-			StreamValues(str[:], "InvDocument", addUID)
-		}
-
-		var arry []string
-
-		for item := range positions {
-			arry = append(arry, item)
-		}
-
-		if len(arry) > 1 {
-			sort.Slice(arry, func(i, j int) bool {
-				// numeric sort on strings checks lengths first
-				lni := len(arry[i])
-				lnj := len(arry[j])
-				// shorter string is numerically less, assuming no leading zeros
-				if lni < lnj {
-					return true
-				}
-				if lni > lnj {
-					return false
-				}
-				// same length, can now do string comparison on contents
-				return arry[i] < arry[j]
-			})
-		}
-
-		var buffer strings.Builder
-
-		buffer.WriteString("  <InvDocument>\n")
-		buffer.WriteString("    <InvKey>")
-		buffer.WriteString(key)
-		buffer.WriteString("</InvKey>\n")
-
-		// print list of UIDs, skipping duplicates
-		buffer.WriteString("    <InvIDs>\n")
-		last := ""
-		for _, uid := range arry {
-			// detect duplicate UIDs, now in same list after conversion of one term entry from foreign alphabet
-			if uid == last {
-				continue
-			}
-			buffer.WriteString("      <")
-			buffer.WriteString(field)
-			atr := positions[uid]
-			if atr != "" {
-				buffer.WriteString(" ")
-				buffer.WriteString(atr)
-			}
-			buffer.WriteString(">")
-			buffer.WriteString(uid)
-			buffer.WriteString("</")
-			buffer.WriteString(field)
-			buffer.WriteString(">\n")
-
-			last = uid
-		}
-		buffer.WriteString("    </InvIDs>\n")
-		buffer.WriteString("  </InvDocument>\n")
-
-		txt := buffer.String()
-
-		return txt
+		// unlock at end to avoid defer overhead
+		flock.Unlock()
 	}
 
-	// xmlMerger fuses adjacent inverted records with the same identifier
-	xmlMerger := func(inp <-chan Plex, out chan<- Plex) {
+	xmlFuser := func(wg *sync.WaitGroup, inp <-chan Extract, out chan<- Plex) {
 
-		// close channel when all records have been processed
-		defer close(out)
+		defer wg.Done()
 
-		// remember previous record
-		prev := Plex{}
+		find := ParseIndex("InvKey")
 
-		// array to collect strings with same identifier
-		var arry []string
+		// read partitioned XML from producer channel
+		for ext := range inp {
 
-		for curr := range inp {
-
-			if curr.Text == "" {
-				continue
-			}
-
-			// compare adjacent record identifiers
-			if prev.Ident == curr.Ident {
-
-				// save next string in slice
-				arry = append(arry, curr.Text)
-
-			} else {
-
-				if len(arry) > 0 {
-
-					// if next identifier is different, fuse all saved components
-					prev.Text = fuseInverts(prev.Ident, arry)
-
-					// and send combined results to output channel
-					out <- prev
-
-					// empty the slice
-					arry = nil
-				}
-
-				// now remember this record
-				prev = curr
-
-				// and save its string as the first entry in the slice
-				arry = append(arry, curr.Text)
-			}
+			str := ext.Text[:]
+			id := FindIdentifier(str, "InvDocument", find)
+			addInverts(id, str)
 		}
+	}
 
-		if len(arry) > 0 {
+	var wg sync.WaitGroup
 
-			// fuse remaining saved components
-			prev.Text = fuseInverts(prev.Ident, arry)
+	// launch multiple fuser goroutines
+	for i := 0; i < NumServe; i++ {
+		wg.Add(1)
+		go xmlFuser(&wg, inp, out)
+	}
 
-			// send last record
-			out <- prev
+	// launch separate anonymous goroutine to wait until all fusers are done
+	go func() {
+		wg.Wait()
 
+		// sort id keys in alphabetical order
+		var keys []string
+		for ky := range inverted {
+			keys = append(keys, ky)
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+		rec := 0
+
+		for _, id := range keys {
+
+			arry := inverted[id]
+
+			rec++
+			// send array of records with same identifier to output channel
+			out <- Plex{0, id, "", rec, arry}
+
+			// empty the slice
 			arry = nil
 		}
-	}
 
-	// launch single merger goroutine
-	go xmlMerger(inp, out)
+		close(out)
+	}()
 
 	return out
 }
 
-func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
+func CreateMergers(inp <-chan Plex) <-chan Extract {
+
+	if inp == nil {
+		return nil
+	}
+
+	out := make(chan Extract, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create merger channel\n")
+		os.Exit(1)
+	}
+
+	// xmlMerger fuses adjacent InvDocument records with the same identifier
+	xmlMerger := func(wg *sync.WaitGroup, inp <-chan Plex, out chan<- Extract) {
+
+		defer wg.Done()
+
+		var buffer strings.Builder
+
+		fusePostings := func(key string, data []string) string {
+
+			fields := make(map[string]map[string]string)
+
+			addIdents := func(fld, pos, uid string) {
+
+				// no need for mutex here
+				positions, ok := fields[fld]
+				if !ok {
+					positions = make(map[string]string)
+					fields[fld] = positions
+				}
+
+				positions[uid] = pos
+			}
+
+			addUID := func(tag, attr, content string) {
+
+				if tag != "InvKey" {
+
+					addIdents(tag, attr, content)
+				}
+			}
+
+			for _, str := range data {
+				StreamValues(str[:], "InvDocument", addUID)
+			}
+
+			buffer.Reset()
+
+			buffer.WriteString("  <InvDocument>\n")
+			buffer.WriteString("    <InvKey>")
+			buffer.WriteString(key)
+			buffer.WriteString("</InvKey>\n")
+			buffer.WriteString("    <InvIDs>\n")
+
+			// sort fields in alphabetical order
+			var keys []string
+			for ky := range fields {
+				keys = append(keys, ky)
+			}
+			sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+			for _, fld := range keys {
+
+				positions := fields[fld]
+
+				var arry []string
+
+				for item := range positions {
+					arry = append(arry, item)
+				}
+
+				if len(arry) > 1 {
+					sort.Slice(arry, func(i, j int) bool {
+						// numeric sort on strings checks lengths first
+						lni := len(arry[i])
+						lnj := len(arry[j])
+						// shorter string is numerically less, assuming no leading zeros
+						if lni < lnj {
+							return true
+						}
+						if lni > lnj {
+							return false
+						}
+						// same length, can now do string comparison on contents
+						return arry[i] < arry[j]
+					})
+				}
+
+				// print list of UIDs, skipping duplicates
+				last := ""
+				for _, uid := range arry {
+					// detect duplicate UIDs, now in same list after conversion of one term entry from foreign alphabet
+					if uid == last {
+						continue
+					}
+					buffer.WriteString("      <")
+					buffer.WriteString(fld)
+					atr := positions[uid]
+					if atr != "" {
+						buffer.WriteString(" ")
+						buffer.WriteString(atr)
+					}
+					buffer.WriteString(">")
+					buffer.WriteString(uid)
+					buffer.WriteString("</")
+					buffer.WriteString(fld)
+					buffer.WriteString(">\n")
+
+					last = uid
+				}
+			}
+
+			buffer.WriteString("    </InvIDs>\n")
+			buffer.WriteString("  </InvDocument>\n")
+
+			txt := buffer.String()
+
+			return txt
+		}
+
+		for plx := range inp {
+
+			rec := plx.Index
+			key := plx.Ident
+			data := plx.Sibs
+
+			if len(data) < 1 {
+				continue
+			}
+
+			str := fusePostings(key, data)
+
+			out <- Extract{rec, key, str, nil}
+
+			runtime.Gosched()
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	// launch multiple merger goroutines
+	for i := 0; i < NumServe; i++ {
+		wg.Add(1)
+		go xmlMerger(&wg, inp, out)
+	}
+
+	// launch separate anonymous goroutine to wait until all mergers are done
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
+}
+
+func CreateSplitter(merg string, zipp bool, inp <-chan Extract) <-chan string {
 
 	if inp == nil {
 		return nil
@@ -3315,7 +4361,7 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 
 		sfx := ".mrg"
 		if zipp {
-			sfx = ".mrg.gz"
+			sfx += ".gz"
 		}
 
 		fpath := path.Join(merg, key+sfx)
@@ -3323,7 +4369,8 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 			return nil, nil, nil
 		}
 
-		fl, err = os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY, 0600)
+		// overwrites and truncates existing file
+		fl, err = os.Create(fpath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 			return nil, nil, nil
@@ -3346,6 +4393,10 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 
 		// create buffered writer layer
 		wrtr = bufio.NewWriter(out)
+		if wrtr == nil {
+			fmt.Fprintf(os.Stderr, "Unable to create bufio.NewWriter\n")
+			return nil, nil, nil
+		}
 
 		return fl, wrtr, zpr
 	}
@@ -3356,11 +4407,16 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 		if zpr != nil {
 			zpr.Close()
 		}
-		fl.Sync()
+		// fl.Sync()
+
+		err := fl.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+		}
 	}
 
 	// xmlSplitter distributes adjacent records with the same identifier prefix
-	xmlSplitter := func(inp <-chan Plex, out chan<- string) {
+	xmlSplitter := func(inp <-chan Extract, out chan<- string) {
 
 		// close channel when all records have been processed
 		defer close(out)
@@ -3375,7 +4431,7 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 		prevTag := ""
 
 		// remember previous record
-		prev := Plex{}
+		prev := Extract{}
 
 		for curr := range inp {
 
@@ -3385,14 +4441,35 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 				continue
 			}
 
-			// then truncate to 23 character prefix
+			// then truncate to 2, 3, or 4 character prefix
 			if len(currTag) > 2 {
-				currTag = currTag[:2]
+				key := currTag[:2]
+				num, ok := trieLen[key]
+				if ok {
+					if num > 3 && len(currTag) > 3 {
+						key = currTag[:3]
+						num, ok = mergLen[key]
+						if ok && num > 3 {
+							currTag = currTag[:4]
+						} else {
+							currTag = currTag[:3]
+						}
+					} else if num > 2 {
+						currTag = currTag[:3]
+					} else {
+						currTag = currTag[:2]
+					}
+				} else {
+					currTag = currTag[:2]
+				}
 			}
 
 			if fl == nil {
 				// open initial file
 				fl, wrtr, zpr = openSaver(merg, currTag, zipp)
+				if wrtr == nil {
+					continue
+				}
 
 				// send first opening tag and indent
 				wrtr.WriteString("<InvDocumentSet>\n  ")
@@ -3411,8 +4488,17 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 
 				out <- currTag
 
+				// force garbage collection
+				runtime.GC()
+				debug.FreeOSMemory()
+
+				runtime.Gosched()
+
 				// open next file
 				fl, wrtr, zpr = openSaver(merg, currTag, zipp)
+				if wrtr == nil {
+					continue
+				}
 
 				// send opening tag and indent
 				wrtr.WriteString("<InvDocumentSet>\n  ")
@@ -3440,6 +4526,12 @@ func CreateSplitter(merg string, zipp bool, inp <-chan Plex) <-chan string {
 			closeSaver(fl, wrtr, zpr)
 
 			out <- currTag
+
+			// force garbage collection
+			runtime.GC()
+			debug.FreeOSMemory()
+
+			runtime.Gosched()
 		}
 	}
 
@@ -3504,7 +4596,7 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 			in = zpr
 		}
 
-		rdr := NewXMLReader(in)
+		rdr := CreateReader(in)
 
 		if rdr == nil {
 			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create XML Block Reader\n")
@@ -3530,6 +4622,10 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 				} else if tag == field {
 
 					// convert UID string to integer
+					if content == "" {
+						fmt.Fprintf(os.Stderr, "\nERROR: Empty UID for term '%s'\n", term)
+						return
+					}
 					value, err := strconv.ParseInt(content, 10, 32)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "%s\n", err.Error())
@@ -3539,13 +4635,13 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 
 					if strings.HasPrefix(attr, "pos=\"") {
 						attr = attr[5:]
+						lgth := len(attr)
+						if lgth > 1 && attr[lgth-1] == '"' {
+							// "
+							attr = attr[:lgth-1]
+						}
+						atts = append(atts, attr)
 					}
-					lgth := len(attr)
-					if lgth > 1 && attr[lgth-1] == '"' {
-						// "
-						attr = attr[:lgth-1]
-					}
-					atts = append(atts, attr)
 				}
 			}
 
@@ -3593,6 +4689,10 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 			postPos += int32(dlength * 4)
 			termPos += int32(tlength + retlength)
 
+			// return if no position attributes
+			if alength < 1 {
+				return
+			}
 			if dlength != alength {
 				fmt.Fprintf(os.Stderr, "dlength %d, alength %d\n", dlength, alength)
 				return
@@ -3606,6 +4706,9 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 				atrs := strings.Split(attr, ",")
 				atln := len(atrs)
 				for _, att := range atrs {
+					if att == "" {
+						continue
+					}
 					value, err := strconv.ParseInt(att, 10, 32)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "%s\n", err.Error())
@@ -3633,15 +4736,12 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 				return
 			}
 
-			fl, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY, 0600)
+			// overwrites and truncates existing file
+			fl, err := os.Create(fpath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 				return
 			}
-
-			defer fl.Close()
-
-			defer fl.Sync()
 
 			data := bfr.Bytes()
 
@@ -3653,35 +4753,40 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 			}
 
 			wrtr.Flush()
+
+			// fl.Sync()
+
+			fl.Close()
 		}
 
 		writeFiveFiles := func(key string) {
 
 			var arry [516]rune
-			dpath, key := PostingPath(prom, key, arry)
+			dpath, key := PostingPath(prom, field, key, arry)
 			if dpath == "" {
 				return
 			}
 
 			// make subdirectories, if necessary
-			_, err := os.Stat(dpath)
-			if err != nil && os.IsNotExist(err) {
-				err = os.MkdirAll(dpath, os.ModePerm)
-			}
+			err = os.MkdirAll(dpath, os.ModePerm)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 				return
 			}
 
-			writeFile(dpath, key+".trm", termList)
+			writeFile(dpath, key+"."+field+".trm", termList)
 
-			writeFile(dpath, key+".pst", postList)
+			writeFile(dpath, key+"."+field+".pst", postList)
 
-			writeFile(dpath, key+".mst", indxList)
+			writeFile(dpath, key+"."+field+".mst", indxList)
 
-			writeFile(dpath, key+".uqi", uqidList)
+			// do not write position index and offset data files for fields with no position attributes recorded
+			if uqidList.Len() > 0 && ofstList.Len() > 0 {
 
-			writeFile(dpath, key+".ofs", ofstList)
+				writeFile(dpath, key+"."+field+".uqi", uqidList)
+
+				writeFile(dpath, key+"."+field+".ofs", ofstList)
+			}
 		}
 
 		currTag := ""
@@ -3690,7 +4795,7 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 		ok := false
 
 		PartitionPattern("InvDocument", "", rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
 
 				term, data, atts := getOnePosting(str)
 
@@ -3759,6 +4864,1643 @@ func CreatePromoters(args []string, prom, field string) <-chan string {
 	return out
 }
 
+func CreateMatchers(phrs string, exclude bool, inp <-chan Extract) <-chan Extract {
+
+	if inp == nil {
+		return nil
+	}
+
+	if phrs == "" {
+		// if -phrase (-require, -exclude) argument is not present, simply return input channel
+		return inp
+	}
+
+	phrs = PrepareQuery(phrs)
+
+	phrs = ProcessStopWords(phrs)
+
+	clauses := PartitionQuery(phrs)
+
+	clauses = SetFieldQualifiers(clauses, false)
+
+	if clauses == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to parse phrase\n")
+		os.Exit(1)
+	}
+
+	out := make(chan Extract, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create phrase matcher channel\n")
+		os.Exit(1)
+	}
+
+	// split at punctuation, but leave < and > in to delimit content strings
+	cleanupRecord := func(str string) string {
+
+		if IsNotASCII(str) {
+			str = DoAccentTransform(str)
+			if HasUnicodeMarkup(str) {
+				str = RepairUnicodeMarkup(str, SPACE)
+			}
+		}
+
+		if HasBadSpace(str) {
+			str = CleanupBadSpaces(str)
+		}
+
+		if HasAmpOrNotASCII(str) {
+			str = html.UnescapeString(str)
+		}
+
+		if IsNotASCII(str) {
+			if HasGreek(str) {
+				str = SpellGreek(str)
+			}
+		}
+
+		if HasHyphenOrApostrophe(str) {
+			str = FixSpecialCases(str)
+		}
+
+		var buffer strings.Builder
+
+		for _, ch := range str {
+			if ch > 127 {
+				buffer.WriteRune(' ')
+			} else if unicode.IsLetter(ch) || unicode.IsDigit(ch) {
+				buffer.WriteRune(ch)
+			} else if ch == '<' || ch == '>' {
+				buffer.WriteRune(' ')
+				buffer.WriteRune(ch)
+				buffer.WriteRune(' ')
+			} else {
+				buffer.WriteRune(' ')
+			}
+		}
+
+		res := buffer.String()
+
+		res = strings.TrimSpace(res)
+		res = CompressRunsOfSpaces(res)
+		res = strings.ToLower(res)
+
+		var chain []string
+
+		terms := strings.Fields(res)
+
+		// replace unwanted and stop words with plus sign
+		for _, item := range terms {
+
+			// allow tilde proximity indicator
+			if item == "~" {
+				chain = append(chain, item)
+				continue
+			}
+
+			// skip if stop word, breaking word pair chain
+			if DeStop && IsStopWord(item) {
+				chain = append(chain, "+")
+				continue
+			}
+
+			// apply stemming algorithm
+			if DoStem {
+				isWildCard := strings.HasSuffix(item, "*")
+				if isWildCard {
+					// temporarily remove trailing asterisk
+					item = strings.TrimSuffix(item, "*")
+				}
+				item = porter2.Stem(item)
+				item = strings.TrimSpace(item)
+				if isWildCard {
+					// do wildcard search in stemmed term list
+					item += "*"
+				}
+			}
+
+			// record single term
+			chain = append(chain, item)
+		}
+
+		// rejoin into processed sentence
+		tmp := strings.Join(chain, " ")
+
+		tmp = CompressRunsOfSpaces(tmp)
+		tmp = strings.TrimSpace(tmp)
+
+		return tmp
+	}
+
+	proximitySearch := func(srch, str string) bool {
+
+		// split into two words separated by run of tildes
+		words := strings.Split(str, " ")
+		// proximity variables
+		first := ""
+		secnd := ""
+		dist := 0
+		for _, item := range words {
+			if strings.Contains(item, "~") {
+				dist = len(item)
+			} else if first == "" {
+				first = item
+			} else if secnd == "" {
+				secnd = item
+			} else {
+				fmt.Fprintf(os.Stderr, "\nERROR: More than two terms in proximity search\n")
+				os.Exit(1)
+			}
+		}
+		if first == "" || secnd == "" || dist < 1 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Fields missing in proximity search\n")
+			os.Exit(1)
+		}
+
+		terms := strings.Fields(srch)
+
+		for j, fst := range terms {
+			if fst != first {
+				continue
+			}
+			rest := terms[j+1:]
+			for k, sec := range rest {
+				if sec == secnd {
+					return true
+				}
+				if k >= dist {
+					break
+				}
+			}
+		}
+
+		return false
+	}
+
+	// check each phrase against record
+	testPhrase := func(srch string, tokens []string) bool {
+
+		eval := func(str string) bool {
+
+			if strings.Contains(str, "~") {
+				return proximitySearch(srch, str)
+			}
+
+			return strings.Contains(srch, str)
+		}
+
+		nextToken := func() string {
+
+			if len(tokens) < 1 {
+				return ""
+			}
+
+			tkn := tokens[0]
+			tokens = tokens[1:]
+
+			return tkn
+		}
+
+		// recursive definitions
+		var excl func() (bool, string)
+		var expr func() (bool, string)
+		var fact func() (bool, string)
+		var term func() (bool, string)
+
+		fact = func() (bool, string) {
+
+			var res bool
+
+			tkn := nextToken()
+			if tkn == "(" {
+				res, tkn = expr()
+				if tkn == ")" {
+					tkn = nextToken()
+				}
+			} else {
+				res = eval(tkn)
+				tkn = nextToken()
+			}
+
+			return res, tkn
+		}
+
+		excl = func() (bool, string) {
+
+			var val bool
+
+			res, tkn := fact()
+			for tkn == "!" {
+				val, tkn = fact()
+				if val {
+					res = false
+				}
+			}
+
+			return res, tkn
+		}
+
+		term = func() (bool, string) {
+
+			var val bool
+
+			res, tkn := excl()
+			for tkn == "&" {
+				val, tkn = excl()
+				if !val {
+					res = false
+				}
+			}
+
+			return res, tkn
+		}
+
+		expr = func() (bool, string) {
+
+			var val bool
+
+			res, tkn := term()
+			for tkn == "|" {
+				val, tkn = term()
+				if val {
+					res = true
+				}
+			}
+
+			return res, tkn
+		}
+
+		// enter recursive descent parser
+		found, _ := expr()
+
+		return found
+	}
+
+	// xmlMatcher reads partitioned XML from channel and removes records that do not contain the phrase(s)
+	xmlMatcher := func(wg *sync.WaitGroup, inp <-chan Extract, out chan<- Extract) {
+
+		// report when this phrase matcher has no more records to process
+		defer wg.Done()
+
+		// read partitioned XML from producer channel
+		for ext := range inp {
+
+			idx := ext.Index
+			text := ext.Text
+
+			if text == "" {
+				// should never see empty input data
+				out <- Extract{idx, "", text, nil}
+				continue
+			}
+
+			srch := cleanupRecord(text)
+
+			ok := testPhrase(srch, clauses)
+
+			if exclude != ok {
+				// send text of record if phrase match succeeded with -require, or failed with -exclude
+				out <- Extract{idx, "", text, nil}
+				continue
+			}
+
+			// otherwise send empty text so unshuffler does not have to deal with record index gaps
+			out <- Extract{idx, "", "", nil}
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	// launch multiple phrase matcher goroutines
+	for i := 0; i < NumServe; i++ {
+		wg.Add(1)
+		go xmlMatcher(&wg, inp, out)
+	}
+
+	// launch separate anonymous goroutine to wait until all phrase matchers are done
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
+}
+
+func CreateExternalIndexer(args []string, zipp bool, in io.Reader) int {
+
+	recordCount := 0
+
+	transform := make(map[string]string)
+
+	readTransformTable := func(tf string) {
+
+		inFile, err := os.Open(tf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Unable to open transformation file %s - %s\n", tf, err.Error())
+			os.Exit(1)
+		}
+
+		scant := bufio.NewScanner(inFile)
+
+		// populate transformation map
+		for scant.Scan() {
+
+			line := scant.Text()
+			frst, scnd := SplitInTwoAt(line, "\t", LEFT)
+
+			transform[frst] = scnd
+		}
+
+		inFile.Close()
+	}
+
+	// BIOCONCEPTS INDEXER
+
+	// create intermediate table for {chemical|disease|gene}2pubtatorcentral.gz (undocumented)
+	if args[0] == "-bioconcepts" {
+
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Insufficient arguments for -bioconcepts\n")
+			os.Exit(1)
+		}
+
+		// read transformation file
+		tf := args[1]
+		readTransformTable(tf)
+
+		var buffer strings.Builder
+		count := 0
+		okay := false
+
+		wrtr := bufio.NewWriter(os.Stdout)
+
+		scanr := bufio.NewScanner(in)
+
+		currpmid := ""
+
+		// read lines of PMIDs and extracted concepts
+		for scanr.Scan() {
+
+			line := scanr.Text()
+
+			cols := strings.Split(line, "\t")
+			if len(cols) != 5 {
+				continue
+			}
+
+			pmid := cols[0]
+			if currpmid != pmid {
+				// end current block
+				currpmid = pmid
+
+				if pmid == "" {
+					continue
+				}
+
+				recordCount++
+				count++
+
+				if count >= 1000 {
+					count = 0
+					txt := buffer.String()
+					if txt != "" {
+						// print current buffer
+						wrtr.WriteString(txt[:])
+					}
+					buffer.Reset()
+				}
+
+				okay = true
+			}
+
+			typ := cols[1]
+			val := cols[2]
+			switch typ {
+			case "Gene":
+				genes := strings.Split(val, ";")
+				for _, gene := range genes {
+					if gene == "None" {
+						continue
+					}
+					buffer.WriteString(pmid)
+					buffer.WriteString("\t")
+					buffer.WriteString("GENE")
+					buffer.WriteString("\t")
+					buffer.WriteString(gene)
+					buffer.WriteString("\n")
+					gn, ok := transform[gene]
+					if !ok || gn == "" {
+						continue
+					}
+					buffer.WriteString(pmid)
+					buffer.WriteString("\t")
+					buffer.WriteString("GENE")
+					buffer.WriteString("\t")
+					buffer.WriteString(gn)
+					buffer.WriteString("\n")
+				}
+			case "Disease":
+				if strings.HasPrefix(val, "MESH:") {
+					diszs := strings.Split(val[5:], "|")
+					for _, disz := range diszs {
+						buffer.WriteString(pmid)
+						buffer.WriteString("\t")
+						buffer.WriteString("DISZ")
+						buffer.WriteString("\t")
+						buffer.WriteString(disz)
+						buffer.WriteString("\n")
+						dn, ok := transform[disz]
+						if !ok || dn == "" {
+							continue
+						}
+						buffer.WriteString(pmid)
+						buffer.WriteString("\t")
+						buffer.WriteString("DISZ")
+						buffer.WriteString("\t")
+						buffer.WriteString(dn)
+						buffer.WriteString("\n")
+					}
+				} else if strings.HasPrefix(val, "OMIM:") {
+					omims := strings.Split(val[5:], "|")
+					for _, omim := range omims {
+						// was OMIM, now fused with DISZ
+						buffer.WriteString(pmid)
+						buffer.WriteString("\t")
+						buffer.WriteString("DISZ")
+						buffer.WriteString("\t")
+						// tag OMIM identifiers with M prefix
+						buffer.WriteString("M" + omim)
+						buffer.WriteString("\n")
+					}
+				}
+			case "Chemical":
+				if strings.HasPrefix(val, "MESH:") {
+					chems := strings.Split(val[5:], "|")
+					for _, chem := range chems {
+						buffer.WriteString(pmid)
+						buffer.WriteString("\t")
+						buffer.WriteString("CHEM")
+						buffer.WriteString("\t")
+						buffer.WriteString(chem)
+						buffer.WriteString("\n")
+						ch, ok := transform[chem]
+						if !ok || ch == "" {
+							continue
+						}
+						buffer.WriteString(pmid)
+						buffer.WriteString("\t")
+						buffer.WriteString("CHEM")
+						buffer.WriteString("\t")
+						buffer.WriteString(ch)
+						buffer.WriteString("\n")
+					}
+				} else if strings.HasPrefix(val, "CHEBI:") {
+					chebs := strings.Split(val[6:], "|")
+					for _, cheb := range chebs {
+						// was CEBI, now fused with CHEM
+						buffer.WriteString(pmid)
+						buffer.WriteString("\t")
+						buffer.WriteString("CHEM")
+						buffer.WriteString("\t")
+						// tag CHEBI identifiers with H prefix
+						buffer.WriteString("H" + cheb)
+						buffer.WriteString("\n")
+					}
+				}
+			case "Species":
+			case "Mutation":
+			case "CellLine":
+			default:
+			}
+		}
+
+		if okay {
+			txt := buffer.String()
+			if txt != "" {
+				// print current buffer
+				wrtr.WriteString(txt[:])
+			}
+		}
+		buffer.Reset()
+
+		wrtr.Flush()
+
+		return recordCount
+	}
+
+	// GENERIF INDEXER
+
+	// create intermediate table for generifs_basic.gz (undocumented)
+	if args[0] == "-generif" || args[0] == "-generifs" {
+
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Insufficient arguments for -generif\n")
+			os.Exit(1)
+		}
+
+		// read transformation file
+		tf := args[1]
+		readTransformTable(tf)
+
+		var buffer strings.Builder
+		count := 0
+		okay := false
+
+		wrtr := bufio.NewWriter(os.Stdout)
+
+		scanr := bufio.NewScanner(in)
+
+		currpmid := ""
+
+		// skip first line with column heading names
+		for scanr.Scan() {
+
+			line := scanr.Text()
+			cols := strings.Split(line, "\t")
+			if len(cols) != 5 {
+				fmt.Fprintf(os.Stderr, "Unexpected number of columns (%d) in generifs_basic.gz\n", len(cols))
+				os.Exit(1)
+			}
+			if len(cols) != 5 || cols[0] != "#Tax ID" {
+				fmt.Fprintf(os.Stderr, "Unrecognized contents in generifs_basic.gz\n")
+				os.Exit(1)
+			}
+			break
+		}
+
+		// read lines of PMIDs and gene references
+		for scanr.Scan() {
+
+			line := scanr.Text()
+
+			cols := strings.Split(line, "\t")
+			if len(cols) != 5 {
+				continue
+			}
+
+			val := cols[2]
+			pmids := strings.Split(val, ",")
+			for _, pmid := range pmids {
+				if currpmid != pmid {
+					// end current block
+					currpmid = pmid
+
+					if pmid == "" {
+						continue
+					}
+
+					recordCount++
+					count++
+
+					if count >= 1000 {
+						count = 0
+						txt := buffer.String()
+						if txt != "" {
+							// print current buffer
+							wrtr.WriteString(txt[:])
+						}
+						buffer.Reset()
+					}
+
+					okay = true
+				}
+
+				gene := cols[1]
+				// was GRIF, now fused with GENE
+				buffer.WriteString(pmid)
+				buffer.WriteString("\t")
+				buffer.WriteString("GENE")
+				buffer.WriteString("\t")
+				buffer.WriteString(gene)
+				buffer.WriteString("\n")
+				gn, ok := transform[gene]
+				if !ok || gn == "" {
+					continue
+				}
+				buffer.WriteString(pmid)
+				buffer.WriteString("\t")
+				buffer.WriteString("GENE")
+				buffer.WriteString("\t")
+				buffer.WriteString(gn)
+				buffer.WriteString("\n")
+			}
+		}
+
+		if okay {
+			txt := buffer.String()
+			if txt != "" {
+				// print current buffer
+				wrtr.WriteString(txt[:])
+			}
+		}
+		buffer.Reset()
+
+		wrtr.Flush()
+
+		return recordCount
+	}
+
+	// THEME INDEXER
+
+	// create intermediate table for chemical-gene-disease themes (undocumented)
+	if args[0] == "-theme" || args[0] == "-themes" {
+
+		if len(args) < 4 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Insufficient arguments for -theme\n")
+			os.Exit(1)
+		}
+
+		one := args[1]
+		two := args[2]
+		tag := args[3]
+
+		// for disambiguating B, E, E+, and J themes, in CHDI, CHGE, GEDI, and GEGE data sets
+		sfx := ""
+		if len(tag) > 0 {
+			switch tag[0] {
+			case 'C':
+				sfx = "c"
+			case 'G':
+				sfx = "g"
+			}
+		}
+
+		fl, err := os.Open(one)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to open input file '%s'\n", one)
+			os.Exit(1)
+		}
+
+		scanr := bufio.NewScanner(fl)
+
+		var columns []string
+		numCols := 0
+
+		// read first line with column heading names
+		if scanr.Scan() {
+
+			line := scanr.Text()
+			line = strings.Replace(line, "+", "p", -1)
+			line = strings.Replace(line, "-", "m", -1)
+			columns = strings.Split(line, "\t")
+			numCols = len(columns)
+
+			if numCols < 3 {
+				fmt.Fprintf(os.Stderr, "Unexpected number of columns (%d) in part-i file\n", numCols)
+				os.Exit(1)
+			}
+			if columns[0] != "path" {
+				fmt.Fprintf(os.Stderr, "Unrecognized contents in part-i file\n")
+				os.Exit(1)
+			}
+		}
+
+		var scores []int
+
+		for i := 0; i < numCols; i++ {
+			scores = append(scores, 0)
+		}
+
+		mapper := make(map[string]string)
+
+		scorer := make(map[string]int)
+
+		// read lines of dependency paths, scores for each theme
+		for scanr.Scan() {
+
+			line := scanr.Text()
+
+			cols := strings.Split(line, "\t")
+			if len(cols) != numCols {
+				fmt.Fprintf(os.Stderr, "Mismatched columns in '%s'\n", line)
+				continue
+			}
+
+			for i := 0; i < numCols; i++ {
+				scores[i] = 0
+			}
+
+			sum := 0
+			// increment by 2 to ignore flagship indicator fields
+			for i := 1; i < numCols; i += 2 {
+				str := cols[i]
+				str, _ = SplitInTwoAt(str, ".", LEFT)
+				val, err := strconv.Atoi(str)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Unrecognized number '%s'\n", str)
+					continue
+				}
+				scores[i] = val
+				sum += val
+			}
+			if sum == 0 {
+				continue
+			}
+
+			path := cols[0]
+			path = strings.ToLower(path)
+			themes := ""
+			comma := ""
+			for i := 1; i < numCols; i += 2 {
+				// find scores over cutoff
+				if scores[i]*3 > sum {
+					theme := columns[i]
+					themes += comma
+					themes += theme
+					comma = ","
+					scorer[path+"_"+theme] = scores[i] * 100 / sum
+				}
+			}
+			if themes == "" {
+				continue
+			}
+			// populate theme lookup table
+			mapper[path] = themes
+		}
+
+		fl.Close()
+
+		fl, err = os.Open(two)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to open input file '%s'\n", two)
+			os.Exit(1)
+		}
+
+		var buffer strings.Builder
+		count := 0
+		okay := false
+
+		wrtr := bufio.NewWriter(os.Stdout)
+
+		scanr = bufio.NewScanner(fl)
+
+		// read lines of PMIDs and dependency paths
+		for scanr.Scan() {
+
+			line := scanr.Text()
+
+			cols := strings.Split(line, "\t")
+			if len(cols) != 14 {
+				fmt.Fprintf(os.Stderr, "Mismatched columns in '%s'\n", line)
+				continue
+			}
+
+			pmid := cols[0]
+			path := cols[12]
+			path = strings.ToLower(path)
+			themes, ok := mapper[path]
+			if !ok {
+				continue
+			}
+
+			fwd := tag[0:2] + tag[2:4]
+			rev := tag[2:4] + tag[0:2]
+
+			cleanCol := func(str string) string {
+				if str == "" || str == "null" {
+					return ""
+				}
+				// remove database prefixes, tag OMIM and CHEBI identifiers with M and H prefixes
+				if strings.HasPrefix(str, "MESH:") {
+					str = strings.TrimPrefix(str, "MESH:")
+				} else if strings.HasPrefix(str, "OMIM:") {
+					str = "M" + strings.TrimPrefix(str, "OMIM:")
+				} else if strings.HasPrefix(str, "CHEBI:") {
+					str = "H" + strings.TrimPrefix(str, "CHEBI:")
+				}
+				idx := strings.Index(str, "(")
+				if idx > 0 {
+					// remove parenthetical Tax suffix
+					str = str[:idx]
+				}
+				str = strings.ToLower(str)
+				return str
+			}
+
+			splitCol := func(str string) []string {
+				// multiple genes may be separated by semicolons
+				if strings.Index(str, ";") >= 0 {
+					return strings.Split(str, ";")
+				}
+				// mesh, omim, and chebi may be separated by vertical bars
+				return strings.Split(str, "|")
+			}
+
+			frst := splitCol(cols[8])
+			scnd := splitCol(cols[9])
+
+			printItem := func(pmid, fld, item string) {
+				if pmid == "" || fld == "" || item == "" {
+					return
+				}
+				buffer.WriteString(pmid)
+				buffer.WriteString("\t")
+				buffer.WriteString(fld)
+				buffer.WriteString("\t")
+				buffer.WriteString(item)
+				buffer.WriteString("\n")
+			}
+
+			thms := strings.Split(themes, ",")
+			for _, theme := range thms {
+				if theme == "" {
+					continue
+				}
+
+				printItem(pmid, "THME", theme)
+
+				// disambiguate B, E, E+, and J themes that appear in two data sets
+				switch theme {
+				case "B", "E", "J":
+					printItem(pmid, "THME", theme+sfx)
+				case "Ep":
+					printItem(pmid, "THME", "E"+sfx+"p")
+				case "Em":
+					printItem(pmid, "THME", "E"+sfx+"m")
+				}
+			}
+
+			for _, frs := range frst {
+				fst := cleanCol(frs)
+				if fst == "" {
+					continue
+				}
+
+				for _, snd := range scnd {
+					scd := cleanCol(snd)
+					if scd == "" {
+						continue
+					}
+
+					printItem(pmid, "CONV", fwd)
+
+					printItem(pmid, "CONV", rev)
+
+					printItem(pmid, "CONV", fst+" "+scd)
+
+					printItem(pmid, "CONV", scd+" "+fst)
+
+					printItem(pmid, "CONV", fwd+" "+fst+" "+scd)
+
+					printItem(pmid, "CONV", rev+" "+scd+" "+fst)
+
+					for _, theme := range thms {
+						if theme == "" {
+							continue
+						}
+
+						score := scorer[path+"_"+theme]
+						pct := strconv.Itoa(score)
+
+						printItem(pmid, "CONV", theme+" "+fwd)
+
+						printItem(pmid, "CONV", theme+" "+rev)
+
+						printItem(pmid, "CONV", theme+" "+fst+" "+scd+" "+pct)
+
+						printItem(pmid, "CONV", theme+" "+scd+" "+fst+" "+pct)
+
+						printItem(pmid, "CONV", theme+" "+fwd+" "+fst+" "+scd+" "+pct)
+
+						printItem(pmid, "CONV", theme+" "+rev+" "+scd+" "+fst+" "+pct)
+					}
+				}
+			}
+
+			recordCount++
+			count++
+
+			if count >= 1000 {
+				count = 0
+				txt := buffer.String()
+				if txt != "" {
+					// print current buffer
+					wrtr.WriteString(txt[:])
+				}
+				buffer.Reset()
+			}
+
+			okay = true
+		}
+
+		if okay {
+			txt := buffer.String()
+			if txt != "" {
+				// print current buffer
+				wrtr.WriteString(txt[:])
+			}
+		}
+		buffer.Reset()
+
+		wrtr.Flush()
+
+		fl.Close()
+
+		return recordCount
+	}
+
+	// DEPENDENCY PATH INDEXER
+
+	// create intermediate table for chemical-gene-disease dependency paths (undocumented)
+	if args[0] == "-dpath" || args[0] == "-dpaths" {
+
+		var buffer strings.Builder
+		count := 0
+		okay := false
+
+		replr := strings.NewReplacer(
+			">", "_gtrthan_",
+			"<", "_lssthan_",
+			"/", "_slash_",
+			"%", "_prcnt_",
+			":", "_colln_",
+			"+", "_pluss_",
+			"!", "_exclam_",
+			"?", "_qmark_",
+			"'", "_squot_",
+			"(", "_lparen_",
+			")", "_rparen_",
+		)
+		if replr == nil {
+			fmt.Fprintf(os.Stderr, "Unable to create replacer\n")
+			os.Exit(1)
+		}
+
+		wrtr := bufio.NewWriter(os.Stdout)
+
+		scanr := bufio.NewScanner(in)
+
+		// read lines of PMIDs and dependency paths
+		for scanr.Scan() {
+
+			line := scanr.Text()
+
+			cols := strings.Split(line, "\t")
+			if len(cols) != 14 {
+				fmt.Fprintf(os.Stderr, "Mismatched columns in '%s'\n", line)
+				continue
+			}
+
+			pmid := cols[0]
+			path := cols[12]
+			path = strings.ToLower(path)
+
+			// rescue known characters
+			tmp := CompressRunsOfSpaces(path)
+			tmp = strings.TrimSpace(tmp)
+
+			tmp = " " + tmp + " "
+
+			tmp = replr.Replace(tmp)
+
+			tmp = CompressRunsOfSpaces(tmp)
+			tmp = strings.TrimSpace(tmp)
+
+			// final cleanup
+			tmp = strings.Replace(tmp, "|", "_", -1)
+			tmp = strings.Replace(tmp, "__", "_", -1)
+
+			pths := strings.Split(tmp, " ")
+			for _, pth := range pths {
+				if pth == "" {
+					continue
+				}
+				buffer.WriteString(pmid)
+				buffer.WriteString("\t")
+				buffer.WriteString("PATH")
+				buffer.WriteString("\t")
+				buffer.WriteString(pth)
+				buffer.WriteString("\n")
+			}
+
+			recordCount++
+			count++
+
+			if count >= 1000 {
+				count = 0
+				txt := buffer.String()
+				if txt != "" {
+					// print current buffer
+					wrtr.WriteString(txt[:])
+				}
+				buffer.Reset()
+			}
+
+			okay = true
+		}
+
+		if okay {
+			txt := buffer.String()
+			if txt != "" {
+				// print current buffer
+				wrtr.WriteString(txt[:])
+			}
+		}
+		buffer.Reset()
+
+		wrtr.Flush()
+
+		return recordCount
+	}
+
+	// THESIS INDEXER
+
+	// create -e2index file for bioconcepts, geneRIFs, and themes and their dependency paths (undocumented)
+	if args[0] == "-thesis" {
+
+		// e.g., -thesis 250000 "$target" "biocchem"
+		if len(args) < 4 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Insufficient arguments for -thesis\n")
+			os.Exit(1)
+		}
+
+		chunk, err := strconv.Atoi(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Unrecognized count - '%s'\n", err.Error())
+			os.Exit(1)
+		}
+		target := strings.TrimSuffix(args[2], "/")
+		prefix := args[3]
+
+		suffix := "e2x"
+		sfx := suffix
+		if zipp {
+			sfx += ".gz"
+		}
+
+		fnum := 0
+
+		fld := ""
+
+		scanr := bufio.NewScanner(os.Stdin)
+
+		processChunk := func() bool {
+
+			// map for combined index
+			indexed := make(map[string][]string)
+
+			writeChunk := func() {
+
+				var (
+					fl   *os.File
+					wrtr *bufio.Writer
+					zpr  *gzip.Writer
+					err  error
+				)
+
+				fnum++
+				fpath := fmt.Sprintf("%s/%s%03d.%s", target, prefix, fnum, sfx)
+				fl, err = os.Create(fpath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+					return
+				}
+				defer fl.Close()
+
+				pth := fmt.Sprintf("%s%03d.%s", prefix, fnum, suffix)
+				os.Stderr.WriteString(pth + "\n")
+
+				var out io.Writer
+
+				out = fl
+
+				if zipp {
+
+					zpr, err = gzip.NewWriterLevel(fl, gzip.BestSpeed)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+						return
+					}
+
+					out = zpr
+				}
+
+				wrtr = bufio.NewWriter(out)
+				if wrtr == nil {
+					fmt.Fprintf(os.Stderr, "Unable to create bufio.NewWriter\n")
+					return
+				}
+
+				var buffer strings.Builder
+				count := 0
+
+				buffer.WriteString("<IdxDocumentSet>\n")
+
+				// sort fields in alphabetical order
+				var keys []string
+				for ky := range indexed {
+					keys = append(keys, ky)
+				}
+
+				if len(keys) > 1 {
+					sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+				}
+
+				for _, idx := range keys {
+
+					item, ok := indexed[idx]
+					if !ok {
+						continue
+					}
+
+					uid := item[0]
+					data := item[1:]
+
+					if uid == "" || len(data) < 1 {
+						continue
+					}
+
+					if len(data) > 1 {
+						sort.Slice(data, func(i, j int) bool { return data[i] < data[j] })
+					}
+
+					buffer.WriteString("  <IdxDocument>\n")
+					buffer.WriteString("    <IdxUid>")
+					buffer.WriteString(uid)
+					buffer.WriteString("</IdxUid>\n")
+					buffer.WriteString("    <IdxSearchFields>\n")
+
+					prev := ""
+					for len(data) > 0 {
+						val := data[0]
+						data = data[1:]
+
+						if val == prev {
+							continue
+						}
+
+						buffer.WriteString("      <")
+						buffer.WriteString(fld)
+						buffer.WriteString(">")
+						buffer.WriteString(val)
+						buffer.WriteString("</")
+						buffer.WriteString(fld)
+						buffer.WriteString(">\n")
+
+						prev = val
+					}
+
+					buffer.WriteString("    </IdxSearchFields>\n")
+					buffer.WriteString("  </IdxDocument>\n")
+
+					recordCount++
+					count++
+
+					if count >= 1000 {
+						count = 0
+						txt := buffer.String()
+						if txt != "" {
+							// print current buffer
+							wrtr.WriteString(txt[:])
+						}
+						buffer.Reset()
+					}
+				}
+
+				buffer.WriteString("</IdxDocumentSet>\n")
+
+				txt := buffer.String()
+				if txt != "" {
+					// print current buffer
+					wrtr.WriteString(txt[:])
+				}
+				buffer.Reset()
+
+				wrtr.Flush()
+
+				if zpr != nil {
+					zpr.Close()
+				}
+			}
+
+			lineCount := 0
+			okay := false
+
+			// read lines of dependency paths, scores for each theme
+			for scanr.Scan() {
+
+				line := scanr.Text()
+
+				cols := strings.Split(line, "\t")
+				if len(cols) != 3 {
+					fmt.Fprintf(os.Stderr, "Mismatched columns in '%s'\n", line)
+					continue
+				}
+
+				uid := cols[0]
+				fd := cols[1]
+				val := cols[2]
+				if uid == "" || fd == "" || val == "" {
+					continue
+				}
+				if fld == "" {
+					fld = fd
+				}
+				if fld != fd {
+					fmt.Fprintf(os.Stderr, "Field '%s' expected, '%s' found\n", fld, fd)
+					continue
+				}
+
+				val = strings.ToLower(val)
+				// convert angle brackets in chemical names
+				val = html.EscapeString(val)
+
+				data, ok := indexed[uid]
+				if !ok {
+					data = make([]string, 0, 2)
+					// first entry on new slice is uid
+					data = append(data, uid)
+				}
+				data = append(data, val)
+				// always need to update indexed, since data may be reallocated
+				indexed[uid] = data
+
+				okay = true
+
+				lineCount++
+				if lineCount > chunk {
+					break
+				}
+			}
+
+			if okay {
+				writeChunk()
+				return true
+			}
+
+			return false
+		}
+
+		for processChunk() {
+			// loop until scanner runs out of lines
+		}
+
+		return recordCount
+	}
+
+	return 0
+}
+
+func CreateExternalArchive(stash string, args []string) <-chan string {
+
+	createPresenters := func(args []string) []<-chan Plex {
+
+		if args == nil {
+			return nil
+		}
+
+		numFiles := len(args)
+		if numFiles < 1 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Not enough indexed files to merge\n")
+			os.Exit(1)
+		}
+
+		chns := make([]<-chan Plex, numFiles)
+		if chns == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create presenter channel array\n")
+			os.Exit(1)
+		}
+
+		// xmlPresenter sends partitioned XML strings through channel
+		xmlPresenter := func(fileNum int, fileName string, out chan<- Plex) {
+
+			// close channel when all records have been processed
+			defer close(out)
+
+			f, err := os.Open(fileName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unable to open input file '%s'\n", fileName)
+				os.Exit(1)
+			}
+
+			// close input file when all records have been processed
+			defer f.Close()
+
+			var in io.Reader
+
+			in = f
+
+			// if suffix is ".gz", use decompressor
+			iszip := false
+			if strings.HasSuffix(fileName, ".gz") {
+				iszip = true
+			}
+
+			if iszip {
+				brd := bufio.NewReader(f)
+				if brd == nil {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unable to create buffered reader on '%s'\n", fileName)
+					os.Exit(1)
+				}
+				zpr, err := gzip.NewReader(brd)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unable to create decompressor on '%s'\n", fileName)
+					os.Exit(1)
+				}
+
+				// close decompressor when all records have been processed
+				defer zpr.Close()
+
+				// use decompressor for reading file
+				in = zpr
+			}
+
+			rdr := CreateReader(in)
+
+			if rdr == nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unable to create XML Block Reader\n")
+				os.Exit(1)
+			}
+
+			find := ParseIndex("IdxUid")
+
+			// partition all input by pattern and send XML substring through channel
+			PartitionPattern("IdxDocument", "", rdr,
+				func(str string) {
+					id := FindIdentifier(str[:], "IdxDocument", find)
+
+					out <- Plex{fileNum, id, str, 0, nil}
+				})
+		}
+
+		// launch multiple presenter goroutines
+		for i, str := range args {
+
+			chn := make(chan Plex, ChanDepth)
+			if chn == nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unable to create presenter channel\n")
+				os.Exit(1)
+			}
+
+			go xmlPresenter(i, str, chn)
+
+			chns[i] = chn
+		}
+
+		// no need for separate anonymous goroutine to wait until all presenters are done
+
+		return chns
+	}
+
+	createManifold := func(inp []<-chan Plex) <-chan Plex {
+
+		if inp == nil {
+			return nil
+		}
+
+		out := make(chan Plex, ChanDepth)
+		if out == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create manifold channel\n")
+			os.Exit(1)
+		}
+
+		// xmlManifold restores alphabetical order of merged postings
+		xmlManifold := func(inp []<-chan Plex, out chan<- Plex) {
+
+			// close channel when all records have been processed
+			defer close(out)
+
+			// initialize empty heap
+			hp := &PlexHeap{}
+			heap.Init(hp)
+
+			// read first object from all input channels in turn
+			for _, chn := range inp {
+				plx, ok := <-chn
+				if ok {
+					heap.Push(hp, plx)
+				}
+			}
+
+			// array to collect strings with same identifier
+			var arry []string
+
+			prevIdent := ""
+			rec := 0
+
+			// reading from heap returns objects in alphabetical order
+			for hp.Len() > 0 {
+
+				// remove lowest item from heap, use interface type assertion
+				curr := heap.Pop(hp).(Plex)
+
+				// compare adjacent record identifiers
+				if prevIdent == curr.Ident {
+
+					// save next indexed object string in slice
+					arry = append(arry, curr.Text)
+
+				} else {
+
+					if len(arry) > 0 {
+
+						rec++
+						// send set from previous identifier to output channel
+						out <- Plex{0, prevIdent, "", rec, arry}
+
+						// empty the slice
+						arry = nil
+					}
+
+					// remember new identifier
+					prevIdent = curr.Ident
+
+					// save first indexed object with this identifier
+					arry = append(arry, curr.Text)
+				}
+
+				// read next object from channel that just supplied lowest item
+				chn := inp[curr.Which]
+				plx, ok := <-chn
+				if ok {
+					heap.Push(hp, plx)
+				}
+			}
+
+			if len(arry) > 0 {
+
+				rec++
+				// send last record
+				out <- Plex{0, prevIdent, "", rec, arry}
+
+				arry = nil
+			}
+		}
+
+		// launch single manifold goroutine
+		go xmlManifold(inp, out)
+
+		return out
+	}
+
+	createMergers := func(inp <-chan Plex) <-chan Extract {
+
+		if inp == nil {
+			return nil
+		}
+
+		out := make(chan Extract, ChanDepth)
+		if out == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create merger channel\n")
+			os.Exit(1)
+		}
+
+		// xmlMerger fuses adjacent IdxDocument records with the same identifier
+		xmlMerger := func(wg *sync.WaitGroup, inp <-chan Plex, out chan<- Extract) {
+
+			defer wg.Done()
+
+			var buffer strings.Builder
+
+			fusePostings := func(key string, data []string) string {
+
+				fields := make(map[string]map[string]string)
+
+				addIdents := func(fld, pos, uid string) {
+
+					// no need for mutex here
+					positions, ok := fields[fld]
+					if !ok {
+						positions = make(map[string]string)
+						fields[fld] = positions
+					}
+
+					positions[uid] = pos
+				}
+
+				addUID := func(tag, attr, content string) {
+
+					if tag != "IdxUid" {
+
+						addIdents(tag, attr, content)
+					}
+				}
+
+				for _, str := range data {
+					StreamValues(str[:], "IdxDocument", addUID)
+				}
+
+				buffer.Reset()
+
+				buffer.WriteString("<IdxDocument>\n")
+				buffer.WriteString("<IdxUid>")
+				buffer.WriteString(key)
+				buffer.WriteString("</IdxUid>\n")
+				buffer.WriteString("<InvIDs>\n")
+
+				// sort fields in alphabetical order
+				var keys []string
+				for ky := range fields {
+					keys = append(keys, ky)
+				}
+				sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+				for _, fld := range keys {
+
+					positions := fields[fld]
+
+					var arry []string
+
+					for item := range positions {
+						arry = append(arry, item)
+					}
+
+					if len(arry) > 1 {
+						sort.Slice(arry, func(i, j int) bool {
+							// numeric sort on strings checks lengths first
+							lni := len(arry[i])
+							lnj := len(arry[j])
+							// shorter string is numerically less, assuming no leading zeros
+							if lni < lnj {
+								return true
+							}
+							if lni > lnj {
+								return false
+							}
+							// same length, can now do string comparison on contents
+							return arry[i] < arry[j]
+						})
+					}
+
+					// print list of UIDs, skipping duplicates
+					last := ""
+					for _, uid := range arry {
+						// detect duplicate UIDs, now in same list after conversion of one term entry from foreign alphabet
+						if uid == last {
+							continue
+						}
+						buffer.WriteString("<")
+						buffer.WriteString(fld)
+						atr := positions[uid]
+						if atr != "" {
+							buffer.WriteString(" ")
+							buffer.WriteString(atr)
+						}
+						buffer.WriteString(">")
+						buffer.WriteString(uid)
+						buffer.WriteString("</")
+						buffer.WriteString(fld)
+						buffer.WriteString(">\n")
+
+						last = uid
+					}
+				}
+
+				buffer.WriteString("</InvIDs>\n")
+				buffer.WriteString("</IdxDocument>\n")
+
+				txt := buffer.String()
+
+				return txt
+			}
+
+			for plx := range inp {
+
+				rec := plx.Index
+				key := plx.Ident
+				data := plx.Sibs
+
+				if len(data) < 1 {
+					continue
+				}
+
+				str := fusePostings(key, data)
+
+				out <- Extract{rec, key, str, nil}
+
+				runtime.Gosched()
+			}
+		}
+
+		var wg sync.WaitGroup
+
+		// launch multiple merger goroutines
+		for i := 0; i < NumServe; i++ {
+			wg.Add(1)
+			go xmlMerger(&wg, inp, out)
+		}
+
+		// launch separate anonymous goroutine to wait until all mergers are done
+		go func() {
+			wg.Wait()
+			close(out)
+		}()
+
+		return out
+	}
+
+	chns := createPresenters(args)
+	mfld := createManifold(chns)
+	mrgr := createMergers(mfld)
+	stsq := CreateStashers(stash, "IdxDocument", "IdxDocument/IdxUid", ".e2x", false, true, 50000, mrgr)
+
+	if chns == nil || mfld == nil || mrgr == nil || stsq == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create extra index stasher\n")
+		os.Exit(1)
+	}
+
+	return stsq
+}
+
 // MAIN FUNCTION
 
 func main() {
@@ -3799,7 +6541,8 @@ func main() {
 	FarmSize = 64
 
 	// garbage collector control can be set by environment variable or default value with -gogc 0
-	goGc := 600
+	goGc := 200
+	gcdefault := true
 
 	// -flag sets -strict or -mixed cleanup flags from argument
 	flgs := ""
@@ -3810,6 +6553,8 @@ func main() {
 	fileName := ""
 
 	// debugging
+	dbug := false
+	stts := false
 	timr := false
 
 	// profiling
@@ -3826,13 +6571,22 @@ func main() {
 	ftch := ""
 	strm := ""
 
-	// field for inverted index
-	nvrt := ""
+	// path for local extra link data
+	smmn := ""
 
-	// field for merging index files
+	// flag for inverted index
+	nvrt := false
+
+	// flag for combining sets of inverted files
+	join := false
+
+	// flag for combining sets of inverted files
+	fuse := false
+
+	// destination directory for merging and splitting inverted files
 	merg := ""
 
-	// base for promoting inverted index to retrieval indices
+	// base destination directory for promoting inverted index to retrieval indices
 	prom := ""
 
 	// field for promoting inverted index files
@@ -3843,6 +6597,10 @@ func main() {
 
 	// query by phrase, normalized terms (with truncation wildcarding)
 	phrs := ""
+	rlxd := false
+	xact := false
+	mock := false
+	btch := false
 
 	// print term list with counts
 	trms := ""
@@ -3922,7 +6680,7 @@ func main() {
 		case "-cons":
 			serverRatio = getNumericArg("Parser to processor ratio", 4, 1, 32)
 		case "-serv":
-			NumServe = getNumericArg("Concurrent parser count", 0, ncpu, 128)
+			NumServe = getNumericArg("Concurrent parser count", 0, 1, 128)
 		case "-chan":
 			ChanDepth = getNumericArg("Communication channel depth", 0, ncpu, 128)
 		case "-heap":
@@ -3930,7 +6688,8 @@ func main() {
 		case "-farm":
 			FarmSize = getNumericArg("Node buffer length", 4, 4, 2048)
 		case "-gogc":
-			goGc = getNumericArg("Garbage collection percentage", 0, 100, 1000)
+			goGc = getNumericArg("Garbage collection percentage", 0, 50, 1000)
+			gcdefault = false
 
 		// read data from file
 		case "-input":
@@ -3989,6 +6748,19 @@ func main() {
 			// skip past first of two arguments
 			args = args[1:]
 
+		// local directory path for extra link retrieval
+		case "-summon":
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "\nERROR: Summon path is missing\n")
+				os.Exit(1)
+			}
+			smmn = args[1]
+			if smmn != "" && !strings.HasSuffix(smmn, "/") {
+				smmn += "/"
+			}
+			// skip past first of two arguments
+			args = args[1:]
+
 		// data element for indexing
 		case "-index":
 			if len(args) < 2 {
@@ -4001,13 +6773,14 @@ func main() {
 
 		// build inverted index
 		case "-invert":
-			if len(args) < 2 {
-				fmt.Fprintf(os.Stderr, "\nERROR: Invert field is missing\n")
-				os.Exit(1)
-			}
-			nvrt = args[1]
-			// skip past first of two arguments
-			args = args[1:]
+			nvrt = true
+
+		// combine sets of inverted index files
+		case "-join":
+			join = true
+
+		case "-fuse":
+			fuse = true
 
 		// merge inverted index files, distribute by prefix
 		case "-merge":
@@ -4016,9 +6789,8 @@ func main() {
 				os.Exit(1)
 			}
 			merg = args[1]
-			fild = args[2]
-			// skip past first and second arguments
-			args = args[2:]
+			// skip past first of two arguments
+			args = args[1:]
 
 		// promote inverted index to term-specific postings files
 		case "-promote":
@@ -4031,15 +6803,54 @@ func main() {
 			// skip past first and second arguments
 			args = args[2:]
 
-		case "-query":
-			if len(args) < 3 {
+		case "-path":
+			if len(args) < 2 {
 				fmt.Fprintf(os.Stderr, "\nERROR: Postings path is missing\n")
 				os.Exit(1)
 			}
 			base = args[1]
-			phrs = args[2]
-			// skip past first and second arguments
-			args = args[2:]
+			// skip past first of two arguments
+			args = args[1:]
+
+		case "-exact":
+			xact = true
+			fallthrough
+		case "-search":
+			rlxd = true
+			fallthrough
+		case "-query":
+			if xact && rlxd {
+				rlxd = false
+			}
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "\nERROR: Query argument is missing\n")
+				os.Exit(1)
+			}
+			phrs = args[1]
+			// skip past first of two arguments
+			args = args[1:]
+
+		case "-batch":
+			btch = true
+
+		case "-mockx":
+			xact = true
+			fallthrough
+		case "-mocks":
+			rlxd = true
+			fallthrough
+		case "-mock":
+			if xact && rlxd {
+				rlxd = false
+			}
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "\nERROR: Query argument is missing\n")
+				os.Exit(1)
+			}
+			phrs = args[1]
+			mock = true
+			// skip past first of two arguments
+			args = args[1:]
 
 		// -countp tests the files containing positions of terms per UID (undocumented)
 		case "-countp":
@@ -4048,15 +6859,20 @@ func main() {
 		case "-counts":
 			plrl = true
 			fallthrough
+		case "-countr":
+			rlxd = true
+			fallthrough
 		case "-count":
-			if len(args) < 3 {
-				fmt.Fprintf(os.Stderr, "\nERROR: Postings path is missing\n")
+			if plrl && rlxd {
+				rlxd = false
+			}
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "\nERROR: Count argument is missing\n")
 				os.Exit(1)
 			}
-			base = args[1]
-			trms = args[2]
-			// skip past first and second arguments
-			args = args[2:]
+			trms = args[1]
+			// skip past first of two arguments
+			args = args[1:]
 
 		case "-gzip":
 			zipp = true
@@ -4079,9 +6895,9 @@ func main() {
 			DoCleanup = true
 		case "-strict":
 			DoStrict = true
-		case "-mixed", "-relaxed":
+		case "-mixed":
 			DoMixed = true
-		case "-accent", "-plain":
+		case "-accent":
 			DeAccent = true
 		case "-ascii":
 			DoASCII = true
@@ -4092,7 +6908,7 @@ func main() {
 		case "-stops", "-stop":
 			DeStop = false
 
-		case "-unicode", "-repair":
+		case "-unicode":
 			DoUnicode = true
 		case "-script":
 			DoScript = true
@@ -4142,6 +6958,11 @@ func main() {
 			// skip past first of two arguments
 			args = args[1:]
 
+		// debugging flags
+		case "-debug":
+			dbug = true
+		case "-stats", "-stat":
+			stts = true
 		case "-timer":
 			timr = true
 		case "-profile":
@@ -4182,6 +7003,7 @@ func main() {
 		}
 	}
 
+	CountLines = DoMixed
 	AllowEmbed = DoStrict || DoMixed
 	ContentMods = AllowEmbed || DoCompress || DoUnicode || DoScript || DoMathML || DeAccent || DoASCII
 
@@ -4191,9 +7013,15 @@ func main() {
 		if defProcs > 0 {
 			numProcs = defProcs
 		} else {
-			// best performance measurement with current code is obtained when 4 to 6 processors are assigned,
+			// best performance measurement with current code is obtained when 6 to 8 processors are assigned,
 			// varying slightly among queries on PubmedArticle, gene DocumentSummary, and INSDSeq sequence records
-			numProcs = 4
+			numProcs = 8
+			if cpuid.CPU.ThreadsPerCore > 1 {
+				cores := ncpu / cpuid.CPU.ThreadsPerCore
+				if cores > 4 && cores < 8 {
+					numProcs = cores
+				}
+			}
 		}
 	}
 	if numProcs > ncpu {
@@ -4207,7 +7035,7 @@ func main() {
 	runtime.GOMAXPROCS(numProcs)
 
 	// adjust garbage collection target percentage
-	if goGc >= 100 {
+	if goGc >= 50 && goGc <= 1000 {
 		debug.SetGCPercent(goGc)
 	}
 
@@ -4233,10 +7061,39 @@ func main() {
 		ChanDepth = NumServe
 	}
 
+	// -stats prints number of CPUs and performance tuning values if no other arguments (undocumented)
+	if stts && len(args) < 1 {
+
+		fmt.Fprintf(os.Stderr, "Core %d\n", ncpu/cpuid.CPU.ThreadsPerCore)
+		fmt.Fprintf(os.Stderr, "Thrd %d\n", ncpu)
+		fmt.Fprintf(os.Stderr, "Sock %d\n", ncpu/cpuid.CPU.LogicalCores)
+		fmt.Fprintf(os.Stderr, "Mmry %d\n", memory.TotalMemory()/(1024*1024*1024))
+
+		fmt.Fprintf(os.Stderr, "Proc %d\n", numProcs)
+		if serverRatio > 0 {
+			fmt.Fprintf(os.Stderr, "Cons %d\n", serverRatio)
+		}
+		fmt.Fprintf(os.Stderr, "Serv %d\n", NumServe)
+		fmt.Fprintf(os.Stderr, "Chan %d\n", ChanDepth)
+		fmt.Fprintf(os.Stderr, "Heap %d\n", HeapSize)
+		fmt.Fprintf(os.Stderr, "Farm %d\n", FarmSize)
+		fmt.Fprintf(os.Stderr, "Gogc %d\n", goGc)
+
+		fi, err := os.Stdin.Stat()
+		if err == nil {
+			mode := fi.Mode().String()
+			fmt.Fprintf(os.Stderr, "Mode %s\n", mode)
+		}
+
+		fmt.Fprintf(os.Stderr, "\n")
+
+		return
+	}
+
 	// if copying from local files accessed by identifier, add dummy argument to bypass length tests
 	if stsh != "" && indx == "" {
 		args = append(args, "-dummy")
-	} else if ftch != "" || strm != "" {
+	} else if ftch != "" || strm != "" || smmn != "" {
 		args = append(args, "-dummy")
 	} else if base != "" {
 		args = append(args, "-dummy")
@@ -4292,31 +7149,41 @@ func main() {
 		}
 	}
 
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "\nERROR: Insufficient command-line arguments supplied to rchive\n")
-		os.Exit(1)
+	// expand -summon ~/ to home directory path
+	if smmn != "" {
+
+		if smmn[:2] == "~/" {
+			cur, err := user.Current()
+			if err == nil {
+				hom := cur.HomeDir
+				smmn = strings.Replace(smmn, "~/", hom+"/", 1)
+			}
+		}
 	}
 
 	// DOCUMENTATION COMMANDS
 
-	inSwitch = true
+	if len(args) > 0 {
 
-	switch args[0] {
-	case "-version":
-		fmt.Printf("%s\n", rchiveVersion)
-	case "-help":
-		fmt.Printf("rchive %s\n%s\n", rchiveVersion, rchiveHelp)
-	case "-extras", "-extra", "-advanced":
-		fmt.Printf("rchive %s\n%s\n", rchiveVersion, rchiveExtras)
-	case "-internal":
-		fmt.Printf("rchive %s\n%s\n", rchiveVersion, rchiveInternal)
-	default:
-		// if not any of the documentation commands, keep going
-		inSwitch = false
-	}
+		inSwitch = true
 
-	if inSwitch {
-		return
+		switch args[0] {
+		case "-version":
+			fmt.Printf("%s\n", rchiveVersion)
+		case "-help":
+			fmt.Printf("rchive %s\n%s\n", rchiveVersion, rchiveHelp)
+		case "-extras", "-extra", "-advanced":
+			fmt.Printf("rchive %s\n%s\n", rchiveVersion, rchiveExtras)
+		case "-internal", "-internals":
+			fmt.Printf("rchive %s\n%s\n", rchiveVersion, rchiveInternal)
+		default:
+			// if not any of the documentation commands, keep going
+			inSwitch = false
+		}
+
+		if inSwitch {
+			return
+		}
 	}
 
 	// FILE NAME CAN BE SUPPLIED WITH -input COMMAND
@@ -4325,8 +7192,8 @@ func main() {
 
 	// check for data being piped into stdin
 	isPipe := false
-	fi, err := os.Stdin.Stat()
-	if err == nil {
+	fi, staterr := os.Stdin.Stat()
+	if staterr == nil {
 		isPipe = bool((fi.Mode() & os.ModeNamedPipe) != 0)
 	}
 
@@ -4376,62 +7243,169 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	// INITIALIZE PROCESS TIMER AND RECORD COUNT
+	// INITIALIZE RECORD COUNT
 
-	startTime := time.Now()
 	recordCount := 0
 	byteCount := 0
 
 	// print processing rate and program duration
 	printDuration := func(name string) {
 
-		stopTime := time.Now()
-		duration := stopTime.Sub(startTime)
-		seconds := float64(duration.Nanoseconds()) / 1e9
-
-		if recordCount >= 1000000 {
-			throughput := float64(recordCount/100000) / 10.0
-			fmt.Fprintf(os.Stderr, "\nRchive processed %.1f million %s in %.3f seconds", throughput, name, seconds)
-		} else {
-			fmt.Fprintf(os.Stderr, "\nRchive processed %d %s in %.3f seconds", recordCount, name, seconds)
-		}
-
-		if seconds >= 0.001 && recordCount > 0 {
-			rate := int(float64(recordCount) / seconds)
-			if rate >= 1000000 {
-				fmt.Fprintf(os.Stderr, " (%d mega%s/second", rate/1000000, name)
-			} else {
-				fmt.Fprintf(os.Stderr, " (%d %s/second", rate, name)
-			}
-			if byteCount > 0 {
-				rate := int(float64(byteCount) / seconds)
-				if rate >= 1000000 {
-					fmt.Fprintf(os.Stderr, ", %d megabytes/second", rate/1000000)
-				} else if rate >= 1000 {
-					fmt.Fprintf(os.Stderr, ", %d kilobytes/second", rate/1000)
-				} else {
-					fmt.Fprintf(os.Stderr, ", %d bytes/second", rate)
-				}
-			}
-			fmt.Fprintf(os.Stderr, ")")
-		}
-
-		fmt.Fprintf(os.Stderr, "\n\n")
+		PrintDuration(name, recordCount, byteCount)
 	}
 
-	// ENTREZ INDEX INVERSION
+	// EXTERNAL INDEXERS AND LINK ARCHIVER
 
-	// -invert PAIR *.e2x.gz reads IdxDocumentSet XML and creates an inverted index
-	if nvrt != "" {
+	if len(args) > 0 {
+		switch args[0] {
+		case "-bioconcepts", "-generif", "-generifs":
+			recordCount = CreateExternalIndexer(args, zipp, in)
 
-		colq := CreateCollectors(args)
-		invq := CreateInverter(nvrt, colq)
-		srtq := CreateSorters(nvrt, invq)
-		rslq := CreateResolver(srtq)
+			debug.FreeOSMemory()
 
-		if colq == nil || invq == nil || srtq == nil || rslq == nil {
-			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create inverter\n")
+			if timr {
+				printDuration("records")
+			}
+
+			return
+		case "-theme", "-themes", "-dpath", "-dpaths", "-thesis":
+			recordCount = CreateExternalIndexer(args, zipp, in)
+
+			debug.FreeOSMemory()
+
+			if timr {
+				printDuration("lines")
+			}
+
+			return
+		default:
+		}
+	}
+
+	if len(args) > 1 {
+		switch args[0] {
+		case "-distribute":
+			args = args[1:]
+
+			// first argument is archive path
+			path := args[0]
+			if path == "" {
+				fmt.Fprintf(os.Stderr, "\nERROR: Need path in order to create extra index stasher\n")
+				os.Exit(1)
+			}
+			if path[:2] == "~/" {
+				cur, err := user.Current()
+				if err == nil {
+					hom := cur.HomeDir
+					path = strings.Replace(path, "~/", hom+"/", 1)
+				}
+			}
+
+			// remaining arguments are *.e2x files
+			// e.g., rchive -timer -distribute archive_directory *.e2x
+			args = args[1:]
+			stsq := CreateExternalArchive(path, args)
+
+			if stsq == nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unable to create extra index stasher\n")
+				os.Exit(1)
+			}
+
+			// drain output channel
+			for str := range stsq {
+
+				if hshv {
+					// print table of UIDs and hash values
+					os.Stdout.WriteString(str)
+				}
+
+				recordCount++
+				runtime.Gosched()
+			}
+
+			debug.FreeOSMemory()
+
+			if timr {
+				printDuration("records")
+			}
+
+			return
+		default:
+		}
+	}
+
+	// JOIN SUBSETS OF INVERTED INDEX FILES
+
+	// -join combines subsets of inverted files for subsequent -merge operation
+	if join {
+
+		// environment variable can override garbage collector (undocumented)
+		gcEnv := os.Getenv("EDIRECT_JOIN_GOGC")
+		if gcEnv != "" {
+			val, err := strconv.Atoi(gcEnv)
+			if err == nil {
+				if val >= 50 && val <= 1000 {
+					debug.SetGCPercent(val)
+				} else {
+					debug.SetGCPercent(100)
+				}
+			}
+		} else if gcdefault {
+			// default to 200 for join
+			debug.SetGCPercent(200)
+		}
+
+		// environment variable can override number of servers (undocumented)
+		svEnv := os.Getenv("EDIRECT_JOIN_SERV")
+		if svEnv != "" {
+			val, err := strconv.Atoi(svEnv)
+			if err == nil {
+				if val >= 1 && val <= 128 {
+					NumServe = val
+				} else {
+					NumServe = 1
+				}
+			}
+		}
+
+		chns := CreatePresenters(args)
+		mfld := CreateManifold(chns)
+		mrgr := CreateMergers(mfld)
+		unsq := CreateUnshuffler(mrgr)
+
+		if chns == nil || mfld == nil || mrgr == nil || unsq == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create inverted index joiner\n")
 			os.Exit(1)
+		}
+
+		if dbug {
+
+			// drain results, but suppress normal output
+			for range unsq {
+				recordCount++
+				runtime.Gosched()
+			}
+
+			// force garbage collection, return memory to operating system
+			debug.FreeOSMemory()
+
+			// print processing parameters as XML object
+			stopTime := time.Now()
+			duration := stopTime.Sub(StartTime)
+			seconds := float64(duration.Nanoseconds()) / 1e9
+
+			// Threads is a more easily explained concept than GOMAXPROCS
+			fmt.Printf("<Xtract>\n")
+			fmt.Printf("  <Threads>%d</Threads>\n", numProcs)
+			fmt.Printf("  <Parsers>%d</Parsers>\n", NumServe)
+			fmt.Printf("  <Time>%.3f</Time>\n", seconds)
+			if seconds >= 0.001 && recordCount > 0 {
+				rate := int(float64(recordCount) / seconds)
+				fmt.Printf("  <Rate>%d</Rate>\n", rate)
+			}
+			fmt.Printf("</Xtract>\n")
+
+			return
 		}
 
 		var out io.Writer
@@ -4459,7 +7433,13 @@ func main() {
 		wrtr.WriteString("<InvDocumentSet>\n")
 
 		// drain channel of alphabetized results
-		for str := range rslq {
+		for curr := range unsq {
+
+			str := curr.Text
+
+			if str == "" {
+				continue
+			}
 
 			// send result to output
 			wrtr.WriteString(str)
@@ -4484,31 +7464,117 @@ func main() {
 	// MERGE INVERTED INDEX FILES AND GROUP BY TERM
 
 	// -merge combines inverted files, distributes by prefix
-	if merg != "" && fild != "" {
+	if merg != "" {
+
+		// environment variable can override garbage collector (undocumented)
+		gcEnv := os.Getenv("EDIRECT_MERGE_GOGC")
+		if gcEnv != "" {
+			val, err := strconv.Atoi(gcEnv)
+			if err == nil {
+				if val >= 50 && val <= 1000 {
+					debug.SetGCPercent(val)
+				} else {
+					debug.SetGCPercent(100)
+				}
+			}
+		} else if gcdefault {
+			// default to 100 for merge
+			debug.SetGCPercent(100)
+		}
+
+		// environment variable can override number of servers (undocumented)
+		svEnv := os.Getenv("EDIRECT_MERGE_SERV")
+		if svEnv != "" {
+			val, err := strconv.Atoi(svEnv)
+			if err == nil {
+				if val >= 1 && val <= 128 {
+					NumServe = val
+				} else {
+					NumServe = 1
+				}
+			}
+		}
 
 		chns := CreatePresenters(args)
 		mfld := CreateManifold(chns)
-		mrgr := CreateMerger(fild, mfld)
-		sptr := CreateSplitter(merg, zipp, mrgr)
+		mrgr := CreateMergers(mfld)
+		unsq := CreateUnshuffler(mrgr)
+		sptr := CreateSplitter(merg, zipp, unsq)
 
-		if chns == nil || mfld == nil || mrgr == nil || sptr == nil {
+		if chns == nil || mfld == nil || mrgr == nil || unsq == nil || sptr == nil {
 			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create inverted index merger\n")
 			os.Exit(1)
 		}
 
-		// drain channel, print two-character index name
+		if dbug {
+
+			// drain results, but suppress normal output
+			for range sptr {
+				recordCount++
+				runtime.Gosched()
+			}
+
+			// force garbage collection, return memory to operating system
+			debug.FreeOSMemory()
+
+			// print processing parameters as XML object
+			stopTime := time.Now()
+			duration := stopTime.Sub(StartTime)
+			seconds := float64(duration.Nanoseconds()) / 1e9
+
+			// Threads is a more easily explained concept than GOMAXPROCS
+			fmt.Printf("<Xtract>\n")
+			fmt.Printf("  <Threads>%d</Threads>\n", numProcs)
+			fmt.Printf("  <Parsers>%d</Parsers>\n", NumServe)
+			fmt.Printf("  <Time>%.3f</Time>\n", seconds)
+			if seconds >= 0.001 && recordCount > 0 {
+				rate := int(float64(recordCount) / seconds)
+				fmt.Printf("  <Rate>%d</Rate>\n", rate)
+			}
+			fmt.Printf("</Xtract>\n")
+
+			return
+		}
+
+		// drain channel, print two-to-four-character index name
+		startTime := time.Now()
+		first := true
+
 		for str := range sptr {
 
-			fmt.Fprintf(os.Stdout, "%s\n", str)
+			stopTime := time.Now()
+			duration := stopTime.Sub(startTime)
+			seconds := float64(duration.Nanoseconds()) / 1e9
+
+			if timr {
+				if first {
+					first = false
+				} else {
+					fmt.Fprintf(os.Stdout, "%.3f\n", seconds)
+				}
+				fmt.Fprintf(os.Stdout, "%s\t", str)
+			} else {
+				fmt.Fprintf(os.Stdout, "%s\n", str)
+			}
 
 			recordCount++
 			runtime.Gosched()
+
+			startTime = time.Now()
+		}
+
+		stopTime := time.Now()
+		duration := stopTime.Sub(startTime)
+		seconds := float64(duration.Nanoseconds()) / 1e9
+
+		if timr {
+			fmt.Fprintf(os.Stdout, "%.3f\n", seconds)
 		}
 
 		debug.FreeOSMemory()
 
 		if timr {
-			printDuration("terms")
+			printDuration("groups")
 		}
 
 		return
@@ -4545,15 +7611,53 @@ func main() {
 
 	// QUERY POSTINGS FILES
 
-	if base != "" && phrs != "" {
+	if phrs != "" || trms != "" || btch {
+		if base == "" {
+			// obtain path from environment variable within rchive as a convenience
+			base = os.Getenv("EDIRECT_PUBMED_MASTER")
+			if base != "" {
+				if !strings.HasSuffix(base, "/") {
+					base += "/"
+				}
+				base += "Postings"
+			}
+		}
+	}
 
-		// deStop should match value used in building the indices
-		recordCount = ProcessQuery(base, phrs)
+	if base != "" && btch {
+
+		// read query lines for exact match
+		scanr := bufio.NewScanner(in)
+
+		for scanr.Scan() {
+			txt := scanr.Text()
+
+			// deStop should match value used in building the indices
+			recordCount += ProcessSearch(base, txt, true, false)
+		}
 
 		debug.FreeOSMemory()
 
 		if timr {
-			printDuration("terms")
+			printDuration("records")
+		}
+
+		return
+	}
+
+	if base != "" && phrs != "" {
+
+		// deStop should match value used in building the indices
+		if mock {
+			recordCount = ProcessMock(base, phrs, xact, rlxd)
+		} else {
+			recordCount = ProcessSearch(base, phrs, xact, rlxd)
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
 		}
 
 		return
@@ -4562,13 +7666,7 @@ func main() {
 	if base != "" && trms != "" {
 
 		// deStop should match value used in building the indices
-		if psns {
-			recordCount = ProcessPosCount(base, trms)
-		} else if plrl {
-			recordCount = ProcessCounts(base, trms)
-		} else {
-			recordCount = ProcessCount(base, trms)
-		}
+		recordCount = ProcessCount(base, trms, plrl, psns, rlxd)
 
 		debug.FreeOSMemory()
 
@@ -4577,14 +7675,6 @@ func main() {
 		}
 
 		return
-	}
-
-	// CREATE XML BLOCK READER FROM STDIN OR FILE
-
-	rdr := NewXMLReader(in)
-	if rdr == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create XML Block Reader\n")
-		os.Exit(1)
 	}
 
 	// CONFIRM INPUT DATA AVAILABILITY AFTER RUNNING COMMAND GENERATORS
@@ -4664,11 +7754,11 @@ func main() {
 	// -trie converts identifier to directory subpath plus file name (undocumented)
 	if trei {
 
-		scanr := bufio.NewScanner(rdr.Reader)
+		scanr := bufio.NewScanner(in)
 
 		sfx := ".xml"
 		if zipp {
-			sfx = ".xml.gz"
+			sfx += ".gz"
 		}
 
 		// read lines of identifiers
@@ -4699,11 +7789,11 @@ func main() {
 	// -archive plus -missing checks for missing records
 	if stsh != "" && msng {
 
-		scanr := bufio.NewScanner(rdr.Reader)
+		scanr := bufio.NewScanner(in)
 
 		sfx := ".xml"
 		if zipp {
-			sfx = ".xml.gz"
+			sfx += ".gz"
 		}
 
 		// read lines of identifiers
@@ -4754,7 +7844,7 @@ func main() {
 	// alternative windows version limits memory by not using goroutines
 	if ftch != "" && indx == "" && runtime.GOOS == "windows" && windows {
 
-		scanr := bufio.NewScanner(rdr.Reader)
+		scanr := bufio.NewScanner(in)
 		if scanr == nil {
 			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create UID scanner\n")
 			os.Exit(1)
@@ -4762,7 +7852,7 @@ func main() {
 
 		sfx := ".xml"
 		if zipp {
-			sfx = ".xml.gz"
+			sfx += ".gz"
 		}
 
 		if head != "" {
@@ -4889,8 +7979,8 @@ func main() {
 	// -fetch without -index retrieves XML files in trie-based directory structure
 	if ftch != "" && indx == "" {
 
-		uidq := CreateUIDReader(rdr.Reader)
-		strq := CreateFetchers(ftch, zipp, uidq)
+		uidq := CreateUIDReader(in)
+		strq := CreateFetchers(ftch, ".xml", zipp, uidq)
 		unsq := CreateUnshuffler(strq)
 
 		if uidq == nil || strq == nil || unsq == nil {
@@ -4959,7 +8049,7 @@ func main() {
 	// -stream without -index retrieves compressed XML files in trie-based directory structure
 	if strm != "" && indx == "" {
 
-		uidq := CreateUIDReader(rdr.Reader)
+		uidq := CreateUIDReader(in)
 		strq := CreateStreamers(strm, uidq)
 		unsq := CreateUnshuffler(strq)
 
@@ -4978,8 +8068,9 @@ func main() {
 			}
 
 			recordCount++
+			runtime.Gosched()
 
-			_, err = os.Stdout.Write(data)
+			_, err := os.Stdout.Write(data)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 			}
@@ -4989,6 +8080,299 @@ func main() {
 
 		if timr {
 			printDuration("records")
+		}
+
+		return
+	}
+
+	// -summon retrieves link files in trie-based directory structure
+	if smmn != "" && indx == "" {
+
+		uidq := CreateUIDReader(in)
+		strq := CreateFetchers(smmn, ".e2x", zipp, uidq)
+		unsq := CreateUnshuffler(strq)
+
+		if uidq == nil || strq == nil || unsq == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create link reader\n")
+			os.Exit(1)
+		}
+
+		if head != "" {
+			os.Stdout.WriteString(head)
+			os.Stdout.WriteString("\n")
+		}
+
+		// drain output channel
+		for curr := range unsq {
+
+			str := curr.Text
+
+			if str == "" {
+				continue
+			}
+
+			if hd != "" {
+				os.Stdout.WriteString(hd)
+				os.Stdout.WriteString("\n")
+			}
+
+			if hshv {
+				// calculate hash code for verification table
+				hsh := crc32.NewIEEE()
+				hsh.Write([]byte(str))
+				val := hsh.Sum32()
+				res := strconv.FormatUint(uint64(val), 10)
+				txt := curr.Ident + "\t" + res + "\n"
+				os.Stdout.WriteString(txt)
+			} else {
+				// send result to output
+				os.Stdout.WriteString(str)
+				if !strings.HasSuffix(str, "\n") {
+					os.Stdout.WriteString("\n")
+				}
+			}
+
+			if tl != "" {
+				os.Stdout.WriteString(tl)
+				os.Stdout.WriteString("\n")
+			}
+
+			recordCount++
+			runtime.Gosched()
+		}
+
+		if tail != "" {
+			os.Stdout.WriteString(tail)
+			os.Stdout.WriteString("\n")
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// CREATE XML BLOCK READER FROM STDIN OR FILE
+
+	rdr := CreateReader(in)
+	if rdr == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create XML Block Reader\n")
+		os.Exit(1)
+	}
+
+	// ENTREZ INDEX INVERSION
+
+	// -invert reads IdxDocumentSet XML and creates an inverted index
+	if nvrt {
+
+		// environment variable can override garbage collector (undocumented)
+		gcEnv := os.Getenv("EDIRECT_INVERT_GOGC")
+		if gcEnv != "" {
+			val, err := strconv.Atoi(gcEnv)
+			if err == nil {
+				if val >= 50 && val <= 1000 {
+					debug.SetGCPercent(val)
+				} else {
+					debug.SetGCPercent(100)
+				}
+			}
+		}
+
+		// environment variable can override number of servers (undocumented)
+		svEnv := os.Getenv("EDIRECT_INVERT_SERV")
+		if svEnv != "" {
+			val, err := strconv.Atoi(svEnv)
+			if err == nil {
+				if val >= 1 && val <= 128 {
+					NumServe = val
+				} else {
+					NumServe = 1
+				}
+			}
+		}
+
+		colq := CreateProducer("IdxDocument", "", rdr)
+		dspq := CreateDispensers(colq)
+		invq := CreateInverters(dspq)
+		rslq := CreateResolver(invq)
+
+		if colq == nil || dspq == nil || invq == nil || rslq == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create inverter\n")
+			os.Exit(1)
+		}
+
+		if dbug {
+
+			// drain results, but suppress normal output
+			for range rslq {
+				recordCount++
+				runtime.Gosched()
+			}
+
+			// force garbage collection, return memory to operating system
+			debug.FreeOSMemory()
+
+			// print processing parameters as XML object
+			stopTime := time.Now()
+			duration := stopTime.Sub(StartTime)
+			seconds := float64(duration.Nanoseconds()) / 1e9
+
+			// Threads is a more easily explained concept than GOMAXPROCS
+			fmt.Printf("<Xtract>\n")
+			fmt.Printf("  <Threads>%d</Threads>\n", numProcs)
+			fmt.Printf("  <Parsers>%d</Parsers>\n", NumServe)
+			fmt.Printf("  <Time>%.3f</Time>\n", seconds)
+			if seconds >= 0.001 && recordCount > 0 {
+				rate := int(float64(recordCount) / seconds)
+				fmt.Printf("  <Rate>%d</Rate>\n", rate)
+			}
+			fmt.Printf("</Xtract>\n")
+
+			return
+		}
+
+		var out io.Writer
+
+		out = os.Stdout
+
+		if zipp {
+
+			zpr, err := gzip.NewWriterLevel(out, gzip.BestSpeed)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unable to create compressor\n")
+				os.Exit(1)
+			}
+
+			// close decompressor when all records have been processed
+			defer zpr.Close()
+
+			// use compressor for writing file
+			out = zpr
+		}
+
+		// create buffered writer layer
+		wrtr := bufio.NewWriter(out)
+
+		wrtr.WriteString("<InvDocumentSet>\n")
+
+		// drain channel of alphabetized results
+		for str := range rslq {
+
+			// send result to output
+			wrtr.WriteString(str)
+
+			recordCount++
+			runtime.Gosched()
+		}
+
+		wrtr.WriteString("</InvDocumentSet>\n\n")
+
+		wrtr.Flush()
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("terms")
+		}
+
+		return
+	}
+
+	// FUSE SUBSETS OF INVERTED INDEX FILES
+
+	// -fuse combines subsets of inverted files for subsequent -merge operation
+	if fuse {
+
+		// environment variable can override garbage collector (undocumented)
+		gcEnv := os.Getenv("EDIRECT_FUSE_GOGC")
+		if gcEnv != "" {
+			val, err := strconv.Atoi(gcEnv)
+			if err == nil {
+				if val >= 50 && val <= 1000 {
+					debug.SetGCPercent(val)
+				} else {
+					debug.SetGCPercent(100)
+				}
+			}
+		} else if gcdefault {
+			// default to 100 for fuse and merge
+			debug.SetGCPercent(100)
+		}
+
+		// environment variable can override number of servers (undocumented)
+		svEnv := os.Getenv("EDIRECT_FUSE_SERV")
+		if svEnv != "" {
+			val, err := strconv.Atoi(svEnv)
+			if err == nil {
+				if val >= 1 && val <= 128 {
+					NumServe = val
+				} else {
+					NumServe = 1
+				}
+			}
+		}
+
+		chns := CreateProducer("InvDocument", "", rdr)
+		fusr := CreateFusers(chns)
+		mrgr := CreateMergers(fusr)
+		unsq := CreateUnshuffler(mrgr)
+
+		if chns == nil || fusr == nil || mrgr == nil || unsq == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create inverted index fuser\n")
+			os.Exit(1)
+		}
+
+		var out io.Writer
+
+		out = os.Stdout
+
+		if zipp {
+
+			zpr, err := gzip.NewWriterLevel(out, gzip.BestSpeed)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unable to create compressor\n")
+				os.Exit(1)
+			}
+
+			// close decompressor when all records have been processed
+			defer zpr.Close()
+
+			// use compressor for writing file
+			out = zpr
+		}
+
+		// create buffered writer layer
+		wrtr := bufio.NewWriter(out)
+
+		wrtr.WriteString("<InvDocumentSet>\n")
+
+		// drain channel of alphabetized results
+		for curr := range unsq {
+
+			str := curr.Text
+
+			if str == "" {
+				continue
+			}
+
+			// send result to output
+			wrtr.WriteString(str)
+
+			recordCount++
+			runtime.Gosched()
+		}
+
+		wrtr.WriteString("</InvDocumentSet>\n\n")
+
+		wrtr.Flush()
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("terms")
 		}
 
 		return
@@ -5040,6 +8424,96 @@ func main() {
 		os.Exit(1)
 	}
 
+	// FILTER XML RECORDS BY PRESENCE OF ONE OR MORE PHRASES
+
+	// -pattern plus -phrase (-require, -exclude) filters by phrase in XML (undocumented)
+	if len(args) > 2 && (args[2] == "-phrase" || args[2] == "-require" || args[2] == "-exclude") {
+
+		exclude := false
+		if args[2] == "-exclude" {
+			exclude = true
+		}
+
+		if len(args) < 4 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Missing argument after %s\n", args[2])
+			os.Exit(1)
+		} else if len(args) > 4 {
+			fmt.Fprintf(os.Stderr, "\nERROR: No arguments allowed after %s value\n", args[2])
+			os.Exit(1)
+		}
+
+		// phrase to find anywhere in XML
+		phrs := args[3]
+
+		// convert old "+" phrase separator to new "AND" convention for entrez-phrase-search backward compatibility
+		phrs = strings.Replace(phrs, " + ", " AND ", -1)
+		// remove wildcard asterisk characters
+		phrs = strings.Replace(phrs, "*", " ", -1)
+		phrs = CompressRunsOfSpaces(phrs)
+		phrs = strings.TrimSpace(phrs)
+
+		if phrs == "" {
+			fmt.Fprintf(os.Stderr, "\nERROR: Missing argument after %s\n", args[2])
+			os.Exit(1)
+		}
+
+		xmlq := CreateProducer(topPattern, star, rdr)
+		mchq := CreateMatchers(phrs, exclude, xmlq)
+		unsq := CreateUnshuffler(mchq)
+
+		if xmlq == nil || mchq == nil || unsq == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create phrase matcher\n")
+			os.Exit(1)
+		}
+
+		if head != "" {
+			os.Stdout.WriteString(head)
+			os.Stdout.WriteString("\n")
+		}
+
+		// drain output channel
+		for curr := range unsq {
+
+			str := curr.Text
+
+			if str == "" {
+				continue
+			}
+
+			if hd != "" {
+				os.Stdout.WriteString(hd)
+				os.Stdout.WriteString("\n")
+			}
+
+			// send result to output
+			os.Stdout.WriteString(str)
+			if !strings.HasSuffix(str, "\n") {
+				os.Stdout.WriteString("\n")
+			}
+
+			if tl != "" {
+				os.Stdout.WriteString(tl)
+				os.Stdout.WriteString("\n")
+			}
+
+			recordCount++
+			runtime.Gosched()
+		}
+
+		if tail != "" {
+			os.Stdout.WriteString(tail)
+			os.Stdout.WriteString("\n")
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
 	// REPORT RECORDS THAT CONTAIN DAMAGED EMBEDDED HTML TAGS
 
 	// -damaged plus -index plus -pattern reports records with multiply-encoded HTML tags
@@ -5048,7 +8522,7 @@ func main() {
 		find := ParseIndex(indx)
 
 		PartitionPattern(topPattern, star, rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
 				recordCount++
 
 				id := FindIdentifier(str[:], parent, find)
@@ -5093,7 +8567,7 @@ func main() {
 		}
 
 		PartitionPattern(topPattern, star, rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
 				recordCount++
 
 				id := FindIdentifier(str[:], parent, find)
@@ -5169,10 +8643,7 @@ func main() {
 				}
 
 				txt := string(buf[:])
-				if strings.HasSuffix(txt, "\n") {
-					tlen := len(txt)
-					txt = txt[:tlen-1]
-				}
+				txt = strings.TrimSuffix(txt, "\n")
 
 				// check for optional -ignore argument
 				if ignr != "" {
@@ -5230,7 +8701,7 @@ func main() {
 	if stsh != "" && indx != "" {
 
 		xmlq := CreateProducer(topPattern, star, rdr)
-		stsq := CreateStashers(stsh, parent, indx, hshv, zipp, xmlq)
+		stsq := CreateStashers(stsh, parent, indx, ".xml", hshv, zipp, 1000, xmlq)
 
 		if xmlq == nil || stsq == nil {
 			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create stash generator\n")
@@ -5297,7 +8768,7 @@ func main() {
 		}
 
 		PartitionPattern(topPattern, star, rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
 				recordCount++
 
 				id := FindIdentifier(str[:], parent, find)
@@ -5347,7 +8818,7 @@ func main() {
 
 	// GENERATE RECORD INDEX ON XML INPUT FILE
 
-	// -index plus -pattern prints record identifier, file offset, and XML size
+	// -index plus -pattern prints record identifier and XML size
 	if indx != "" {
 
 		lbl := ""
@@ -5366,12 +8837,12 @@ func main() {
 			lbl = strings.TrimSpace(lbl)
 		}
 
-		// legend := "ID\tREC\tOFST\tSIZE"
+		// legend := "ID\tREC\tSIZE"
 
 		find := ParseIndex(indx)
 
 		PartitionPattern(topPattern, star, rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
 				recordCount++
 
 				id := FindIdentifier(str[:], parent, find)
@@ -5379,11 +8850,76 @@ func main() {
 					return
 				}
 				if lbl != "" {
-					fmt.Printf("%s\t%d\t%d\t%d\t%s\n", id, rec, ofs, len(str), lbl)
+					fmt.Printf("%s\t%d\t%s\n", id, len(str), lbl)
 				} else {
-					fmt.Printf("%s\t%d\t%d\t%d\n", id, rec, ofs, len(str))
+					fmt.Printf("%s\t%d\n", id, len(str))
 				}
 			})
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// SORT XML RECORDS BY IDENTIFIER
+
+	// -pattern record_name -sort parent/element@attribute^version, strictly alphabetic sort order (undocumented)
+	if len(args) == 4 && args[2] == "-sort" {
+
+		indx := args[3]
+
+		// create map that records each UID
+		order := make(map[string][]string)
+
+		find := ParseIndex(indx)
+
+		PartitionPattern(topPattern, star, rdr,
+			func(str string) {
+				recordCount++
+
+				id := FindIdentifier(str[:], parent, find)
+				if id == "" {
+					return
+				}
+
+				data, ok := order[id]
+				if !ok {
+					data = make([]string, 0, 1)
+				}
+				data = append(data, str)
+				// always need to update order, since data may be reallocated
+				order[id] = data
+			})
+
+		var keys []string
+		for ky := range order {
+			keys = append(keys, ky)
+		}
+		// sort fields in alphabetical order, unlike xtract version, which sorts numbers by numeric value
+		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+		if head != "" {
+			os.Stdout.WriteString(head)
+			os.Stdout.WriteString("\n")
+		}
+
+		for _, id := range keys {
+
+			strs := order[id]
+			for _, str := range strs {
+				os.Stdout.WriteString(str)
+				os.Stdout.WriteString("\n")
+			}
+		}
+
+		if tail != "" {
+			os.Stdout.WriteString(tail)
+			os.Stdout.WriteString("\n")
+		}
+
+		debug.FreeOSMemory()
 
 		if timr {
 			printDuration("records")

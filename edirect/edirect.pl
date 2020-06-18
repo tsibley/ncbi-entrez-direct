@@ -43,7 +43,7 @@ use File::Spec;
 
 # EDirect version number
 
-$version = "8.70";
+$version = "13.7";
 
 BEGIN
 {
@@ -63,22 +63,38 @@ BEGIN
 }
 use lib $LibDir;
 
+# support automatic fallback to IPv4
+BEGIN
+{
+  if ( !defined $ENV{EDIRECT_IPV6_OK} ) {
+    use IO::Socket::SSL 'inet4';
+  }
+}
+
 # usage - edirect.pl -function arguments
 
 use Data::Dumper;
 use Encode;
 use Getopt::Long;
 use HTML::Entities;
+use JSON::PP;
 use LWP::Simple;
 use LWP::UserAgent;
+use MIME::Base64;
+use Net::FTP;
 use Net::hostent;
 use POSIX;
 use Time::HiRes;
 use URI::Escape;
+use XML::Simple;
 
 # required first argument is name of function to run
 
 $fnc = shift or die "Must supply function name on command line\n";
+
+if ( $fnc eq "-internal" ) {
+  $fnc = shift or die "Must supply function name on command line\n";
+}
 
 # get starting time
 
@@ -114,20 +130,28 @@ sub clearflags {
   $batch = false;
   $chr_start = -1;
   $chr_stop = -1;
+  $cited = false;
+  $cites = false;
+  $class = "";
   $clean = false;
   $cmd = "";
+  $compact = false;
   $complexity = 0;
+  $country = "";
   $db = "";
   $dbase = "";
   $dbs = "";
   $dbto = "";
+  $dcsm = false;
   $debug = false;
+  $dev = false;
   $drop = false;
   $dttype = "";
   $emaddr = "";
   $email = "";
   $err = "";
   $extend = -1;
+  $external = false;
   $extrafeat = -1;
   $field = "";
   $fields = false;
@@ -138,9 +162,12 @@ sub clearflags {
   $http = "";
   $id = "";
   $input = "";
+  $internal = false;
   $journal = "";
+  $json = false;
   $just_num = false;
   $key = "";
+  $kind = "";
   $lbl = "";
   $links = false;
   $location = "";
@@ -160,10 +187,13 @@ sub clearflags {
   $page = "";
   $pair = "";
   $pipe = false;
+  $pathway = "";
   $pub = "";
   $query = "";
   $raw = false;
   $related = false;
+  $result = 0;
+  $revcomp = false;
   $rldate = 0;
   $seq_start = 0;
   $seq_stop = 0;
@@ -175,6 +205,7 @@ sub clearflags {
   $split = "";
   $status = "";
   $stp = "";
+  $stpminusone = 0;
   $strand = "";
   $style = "";
   $tool = "";
@@ -185,6 +216,7 @@ sub clearflags {
   $verbose = false;
   $volume = "";
   $web = "";
+  $released = "";
   $word = false;
   $year = "";
 
@@ -203,22 +235,34 @@ sub clearflags {
 
   $api_key = "";
   $api_key = $ENV{NCBI_API_KEY} if defined $ENV{NCBI_API_KEY};
+
+  $abbrv_flag = false;
+  if (defined $ENV{EDIRECT_DO_AUTO_ABBREV} && $ENV{EDIRECT_DO_AUTO_ABBREV} eq "true" ) {
+    $abbrv_flag = true;
+  }
 }
 
 sub do_sleep {
+
+  if ( $internal || $dev ) {
+    if ( ! $external ) {
+      Time::HiRes::usleep(1000);
+      return;
+    }
+  }
 
   if ( $api_key ne "" ) {
     if ( $log ) {
       print STDERR "sleeping 1/10 second\n";
     }
-    Time::HiRes::usleep(110);
+    Time::HiRes::usleep(110000);
     return;
   }
 
   if ( $log ) {
     print STDERR "sleeping 1/3 second\n";
   }
-  Time::HiRes::usleep(350);
+  Time::HiRes::usleep(350000);
 }
 
 # gets a live UID for any database
@@ -230,33 +274,37 @@ sub get_zero_uid {
   my $val = "";
 
   %zeroUidHash = (
+    'annotinfo'        =>  '122134',
     'assembly'         =>  '443538',
+    'biocollections'   =>  '7370',
     'bioproject'       =>  '146229',
     'biosample'        =>  '3737421',
     'biosystems'       =>  '1223165',
-    'blastdbinfo'      =>  '1023214',
+    'blastdbinfo'      =>  '998664',
     'books'            =>  '1371014',
-    'cdd'              =>  '277499',
+    'cdd'              =>  '274590',
     'clinvar'          =>  '10510',
     'clone'            =>  '18646800',
     'dbvar'            =>  '6173073',
     'gap'              =>  '872875',
+    'gapplus'          =>  '136686',
     'gds'              =>  '200022309',
     'gencoll'          =>  '398148',
     'gene'             =>  '3667',
     'genome'           =>  '52',
-    'genomeprj'        =>  '72363',
     'geoprofiles'      =>  '16029743',
-    'gtr'              =>  '558757',
+    'grasp'            =>  '2852486',
+    'gtr'              =>  '559277',
     'homologene'       =>  '510',
+    'ipg'              =>  '422234',
     'medgen'           =>  '162753',
     'mesh'             =>  '68007328',
+    'ncbisearch'       =>  '3158',
     'nlmcatalog'       =>  '0404511',
     'nuccore'          =>  '1322283',
-    'nucest'           =>  '338968657',
-    'nucgss'           =>  '168803471',
     'nucleotide'       =>  '1322283',
     'omim'             =>  '176730',
+    'orgtrack'         =>  '319950',
     'pcassay'          =>  '1901',
     'pccompound'       =>  '16132302',
     'pcsubstance'      =>  '126522451',
@@ -266,9 +314,9 @@ sub get_zero_uid {
     'protein'          =>  '4557671',
     'proteinclusters'  =>  '2945638',
     'pubmed'           =>  '2539356',
-    'pubmedhealth'     =>  '27364',
     'seqannot'         =>  '9561',
     'snp'              =>  '137853337',
+    'sparcle'          =>  '10022454',
     'sra'              =>  '190091',
     'structure'        =>  '61024',
     'taxonomy'         =>  '562',
@@ -279,9 +327,7 @@ sub get_zero_uid {
     $val = $zeroUidHash{$db};
   }
 
-# return $val below to restore debugging test
-
-  return 0;
+  return $val;
 }
 
 # support for substitution of (#keyword) to full query phrase or URL component
@@ -353,7 +399,25 @@ sub read_aliases {
 
 sub adjust_base {
 
+  if ( $external ) {
+    $internal = false;
+  }
+
+  if ( $basx ne "" ) {
+    $internal = false;
+  }
+
   if ( $basx eq "" ) {
+
+    if ( $dev ) {
+      $base = "https://dev.ncbi.nlm.nih.gov/entrez/eutils/";
+      return;
+    }
+
+    if ( $internal ) {
+      $base = "https://eutils-internal.ncbi.nlm.nih.gov/entrez/eutils/";
+      return;
+    }
 
     # if base not overridden, check URL of previous query, stick with main or colo site,
     # since history server data for EUtils does not copy between locations, by design
@@ -500,15 +564,19 @@ sub get_count {
   $numx = "";
   $errx = "";
 
+  do_sleep ();
+
   $output = get ($url);
 
   if ( ! defined $output ) {
-    print STDERR "Failure of '$url'\n";
+    print STDERR "Failure of get_count '$url'\n";
+    $result = 1;
     return "", "";
   }
 
   if ( $output eq "" ) {
     print STDERR "No get_count output returned from '$url'\n";
+    $result = 1;
     return "", ""
   }
 
@@ -522,10 +590,12 @@ sub get_count {
 
   if ( $errx ne "" ) {
     close (STDOUT);
+    $result = 1;
     die "ERROR in count output: $errx\nURL: $url\n\n";
   }
 
   if ( $numx eq "" ) {
+    $result = 1;
     die "Count value not found in count output - WebEnv $webx\n";
   }
 
@@ -591,12 +661,15 @@ sub get_uids {
   $keep_trying = true;
   for ( $try = 0; $try < 3 && $keep_trying; $try++) {
 
+    do_sleep ();
+
     $data = get ($url);
 
     if ( defined $data ) {
       $keep_trying = false;
     } else {
-      print STDERR "Failure of '$url'\n";
+      print STDERR "Failure of get_uids '$url'\n";
+      $result = 1;
     }
   }
   if ( $keep_trying ) {
@@ -671,15 +744,19 @@ sub do_post_yielding_ref {
       $urlx .= "$argx";
     }
 
+    do_sleep ();
+
     $rslt = get ($urlx);
 
     if ( ! defined $rslt ) {
-      print STDERR "Failure of '$urlx'\n";
+      print STDERR "Failure of do_get '$urlx'\n";
+      $result = 1;
       return "";
     }
 
     if ( $rslt eq "" ) {
       print STDERR "No do_get output returned from '$urlx'\n";
+      $result = 1;
       return "";
     }
 
@@ -697,12 +774,22 @@ sub do_post_yielding_ref {
   $req->content_type('application/x-www-form-urlencoded');
   $req->content("$argx");
 
+  do_sleep ();
+
   $res = $usragnt->request ( $req );
 
   if ( $res->is_success) {
     $rslt = $res->content_ref;
   } else {
-    print STDERR $res->status_line . "\n";
+    $stts = $res->status_line;
+    print STDERR $stts . "\n";
+    if ( $stts eq "429 Too Many Requests" ) {
+      if ( $api_key eq "" ) {
+        print STDERR "PLEASE REQUEST AN API_KEY FROM NCBI\n";
+      } else {
+        print STDERR "TOO MANY REQUESTS EVEN WITH API_KEY\n";
+      }
+    }
   }
 
   if ( $$rslt eq "" ) {
@@ -710,6 +797,9 @@ sub do_post_yielding_ref {
       $urlx .= "?";
       $urlx .= "$argx";
     }
+
+    do_sleep ();
+
     print STDERR "No do_post output returned from '$urlx'\n";
     print STDERR "Result of do_post http request is\n";
     print STDERR Dumper($res);
@@ -788,40 +878,56 @@ sub read_edirect {
       } elsif ( $thisline =~ /<Val>(.+)<\/Val>/ ) {
         $vl = $1;
       }
-    } elsif ( $thisline =~ /<Db>(\S+)<\/Db>/ ) {
+    }
+    if ( $thisline =~ /<Db>(\S+)<\/Db>/ ) {
       $dbsx = $1;
-    } elsif ( $thisline =~ /<WebEnv>(\S+)<\/WebEnv>/ ) {
+    }
+    if ( $thisline =~ /<WebEnv>(\S+)<\/WebEnv>/ ) {
       $webx = $1;
-    } elsif ( $thisline =~ /<QueryKey>(\S+)<\/QueryKey>/ ) {
+    }
+    if ( $thisline =~ /<QueryKey>(\S+)<\/QueryKey>/ ) {
       $keyx = $1;
-    } elsif ( $thisline =~ /<Count>(\S+)<\/Count>/ ) {
+    }
+    if ( $thisline =~ /<Count>(\S+)<\/Count>/ ) {
       $numx = $1;
-    } elsif ( $thisline =~ /<Step>(\S+)<\/Step>/ ) {
+    }
+    if ( $thisline =~ /<Step>(\S+)<\/Step>/ ) {
       $stpx = $1 + 1;
-    } elsif ( $thisline =~ /<Error>(.+?)<\/Error>/i ) {
+    }
+    if ( $thisline =~ /<Error>(.+?)<\/Error>/i ) {
       $errx = $1;
-    } elsif ( $thisline =~ /<Tool>(.+?)<\/Tool>/i ) {
+    }
+    if ( $thisline =~ /<Tool>(.+?)<\/Tool>/i ) {
       $tulx = $1;
-    } elsif ( $thisline =~ /<Email>(.+?)<\/Email>/i ) {
+    }
+    if ( $thisline =~ /<Email>(.+?)<\/Email>/i ) {
       $emlx = $1;
-    } elsif ( $thisline =~ /<Silent>Y<\/Silent>/i ) {
+    }
+    if ( $thisline =~ /<Silent>Y<\/Silent>/i ) {
       $silent = true;
-    } elsif ( $thisline =~ /<Silent>N<\/Silent>/i ) {
+    }
+    if ( $thisline =~ /<Silent>N<\/Silent>/i ) {
       $silent = false;
     } elsif ( $thisline =~ /<Verbose>Y<\/Verbose>/i ) {
       $verbose = true;
-    } elsif ( $thisline =~ /<Verbose>N<\/Verbose>/i ) {
+    }
+    if ( $thisline =~ /<Verbose>N<\/Verbose>/i ) {
       $verbose = false;
-    } elsif ( $thisline =~ /<Debug>Y<\/Debug>/i ) {
+    }
+    if ( $thisline =~ /<Debug>Y<\/Debug>/i ) {
       $debug = true;
       $silent = false;
-    } elsif ( $thisline =~ /<Debug>N<\/Debug>/i ) {
+    }
+    if ( $thisline =~ /<Debug>N<\/Debug>/i ) {
       $debug = false;
-    } elsif ( $thisline =~ /<Log>Y<\/Log>/i ) {
+    }
+    if ( $thisline =~ /<Log>Y<\/Log>/i ) {
       $log = true;
-    } elsif ( $thisline =~ /<Log>N<\/Log>/i ) {
+    }
+    if ( $thisline =~ /<Log>N<\/Log>/i ) {
       $log = false;
-    } elsif ( $thisline =~ /<ENTREZ_DIRECT>/i ) {
+    }
+    if ( $thisline =~ /<ENTREZ_DIRECT>/i ) {
     } elsif ( $thisline =~ /<\/ENTREZ_DIRECT>/i ) {
     } elsif ( $thisline =~ /<Labels>/i ) {
     } elsif ( $thisline =~ /<\/Labels>/i ) {
@@ -935,6 +1041,25 @@ sub write_edirect {
     print STDERR "\n";
   }
 
+  if ( $compact ) {
+    print STDERR "<ENTREZ_DIRECT>";
+
+    if ( $dbsx ne "" ) {
+      print STDERR " <Db>$dbsx</Db>";
+    }
+    if ( $webx ne "" ) {
+      print STDERR " <WebEnv>$webx</WebEnv>";
+    }
+    if ( $keyx ne "" ) {
+      print STDERR " <QueryKey>$keyx</QueryKey>";
+    }
+    if ( $numx ne "" ) {
+      print STDERR " <Count>$numx</Count>";
+    }
+
+    print STDERR " </ENTREZ_DIRECT>\n";
+  }
+
   print "<ENTREZ_DIRECT>\n";
 
   if ( $dbsx ne "" ) {
@@ -999,12 +1124,32 @@ sub write_edirect {
 
 # wrapper to detect command line errors
 
+my $abbrev_help = qq{
+  To enable argument auto abbreviation resolution, run:
+
+    export EDIRECT_DO_AUTO_ABBREV="true"
+
+  in the terminal, or add that line to your .bash_profile configuration file.
+
+};
+
 sub MyGetOptions {
 
   my $help_msg = shift @_;
 
+  if ( $abbrv_flag ) {
+    Getopt::Long::Configure("auto_abbrev");
+  } else {
+    Getopt::Long::Configure("no_auto_abbrev");
+  }
+
   if ( !GetOptions(@_) ) {
-    die $help_msg;
+    if ( $abbrv_flag ) {
+      die $help_msg;
+    } else {
+      print $help_msg;
+      die $abbrev_help;
+    }
   } elsif (@ARGV) {
     die ("Entrez Direct does not support positional arguments.\n"
          . "Please remember to quote parameter values containing\n"
@@ -1036,7 +1181,11 @@ sub ecntc {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -1097,11 +1246,14 @@ Spell Check
 Publication Filters
 
   -pub         abstract, clinical, english, free, historical,
-               journal, last_week, last_month, last_year,
-               medline, preprint, published, review, structured
+               journal, medline, preprint, published, review,
+               structured
+  -journal     pnas, "j bacteriol", ...
+  -released    last_week, last_month, last_year, prev_years
 
 Sequence Filters
 
+  -country     usa:minnesota, united_kingdom, "pacific ocean", ...
   -feature     gene, mrna, cds, mat_peptide, ...
   -location    mitochondrion, chloroplast, plasmid, plastid
   -molecule    genomic, mrna, trna, rrna, ncrna
@@ -1115,6 +1267,16 @@ Gene Filters
   -status      alive
   -type        coding, pseudo
 
+SNP Filters
+
+  -class       acceptor, donor, frameshift, indel, intron,
+               missense, nonsense, synonymous
+
+Biosystems Filters
+
+  -kind        pathway
+  -pathway     reactome, wikipathways
+
 Miscellaneous Arguments
 
   -label       Alias for query step
@@ -1125,6 +1287,9 @@ sub process_extras {
 
   my $frst = shift (@_);
   my $publ = shift (@_);
+  my $rlsd = shift (@_);
+  my $jrnl = shift (@_);
+  my $ctry = shift (@_);
   my $fkey = shift (@_);
   my $locn = shift (@_);
   my $bmol = shift (@_);
@@ -1132,8 +1297,14 @@ sub process_extras {
   my $sorc = shift (@_);
   my $stat = shift (@_);
   my $gtyp = shift (@_);
+  my $clss = shift (@_);
+  my $kind = shift (@_);
+  my $ptwy = shift (@_);
 
   $publ = lc($publ);
+  $rlsd = lc($rlsd);
+  $jrnl = lc($jrnl);
+  $ctry = lc($ctry);
   $fkey = lc($fkey);
   $bmol = lc($bmol);
   $locn = lc($locn);
@@ -1141,6 +1312,9 @@ sub process_extras {
   $sorc = lc($sorc);
   $stat = lc($stat);
   $gtyp = lc($gtyp);
+  $clss = lc($clss);
+  $kind = lc($kind);
+  $ptwy = lc($ptwy);
 
   %pubHash = (
     'abstract'     =>  'has abstract [FILT]',
@@ -1160,6 +1334,15 @@ sub process_extras {
     'review'       =>  'review [FILT]',
     'structured'   =>  'hasstructuredabstract [WORD]',
     'trial'        =>  'clinical trial [FILT]',
+  );
+
+  %releasedHash = (
+    'last_month'   =>  'published last month [FILT]',
+    'last month'   =>  'published last month [FILT]',
+    'last_week'    =>  'published last week [FILT]',
+    'last week'    =>  'published last week [FILT]',
+    'last_year'    =>  'published last year [FILT]',
+    'last year'    =>  'published last year [FILT]',
   );
 
   @featureArray = (
@@ -1305,6 +1488,17 @@ sub process_extras {
     'viruses'          =>  'viruses [FILT]',
   );
 
+  %snpHash = (
+    'acceptor'    =>  'splice acceptor variant [FXN]',
+    'donor'       =>  'splice donor variant [FXN]',
+    'frameshift'  =>  'frameshift [FXN]',
+    'indel'       =>  'inframe indel [FXN]',
+    'intron'      =>  'intron variant [FXN]',
+    'missense'    =>  'missense variant [FXN]',
+    'nonsense'    =>  'terminator codon variant [FXN]',
+    'synonymous'  =>  'synonymous variant [FXN]',
+  );
+
   %sourceHash = (
     'ddbj'       =>  'srcdb ddbj [PROP]',
     'embl'       =>  'srcdb embl [PROP]',
@@ -1328,31 +1522,76 @@ sub process_extras {
     'pseudo'  =>  'genetype pseudo [PROP]',
   );
 
+  %kindHash = (
+    'pathway'  =>  'pathway [TYPE]',
+  );
+
+  %pathwayHash = (
+    'reactome'      =>  'src reactome [FILT]',
+    'wikipathways'  =>  'src wikipathways [FILT]',
+  );
+
   my @working = ();
 
-  my $suffix = "";
+  my $suffix1 = "";
+  my $suffix2 = "";
+
+  my $is_published = false;
+  my $is_prev_year = false;
 
   if ( $frst ne "" ) {
     push (@working, $frst);
   }
 
   if ( $publ ne "" ) {
-    if ( defined $pubHash{$publ} ) {
-      $val = $pubHash{$publ};
-      push (@working, $val);
-    } elsif ( $publ eq "published" ) {
-      $suffix = "published";
-    } else {
-      die "\nUnrecognized -pub argument '$publ', use efilter -help to see available choices\n\n";
+    # -pub can use comma-separated list
+    my @pbs = split (',', $publ);
+    foreach $pb (@pbs) {
+      if ( defined $pubHash{$pb} ) {
+        $val = $pubHash{$pb};
+        push (@working, $val);
+      } elsif ( $pb eq "published" ) {
+        $is_published = true;
+      } else {
+        die "\nUnrecognized -pub argument '$pb', use efilter -help to see available choices\n\n";
+      }
     }
   }
 
-  if ( $fkey ne "" ) {
-    if ( grep( /^$fkey$/, @featureArray ) ) {
-      $val = $fkey . " [FKEY]";
+  if ( $rlsd ne "" ) {
+    if ( defined $releasedHash{$rlsd} ) {
+      $val = $releasedHash{$rlsd};
+      push (@working, $val);
+    } elsif ( $rlsd eq "prev_years" ) {
+      $is_prev_year = true;
+    } elsif ( $rlsd =~ /^\d\d\d\d$/ ) {
+      $val = $rlsd . " [PDAT]";
       push (@working, $val);
     } else {
-      die "\nUnrecognized -feature argument '$fkey', use efilter -help to see available choices\n\n";
+      die "\nUnrecognized -released argument '$rlsd', use efilter -help to see available choices\n\n";
+    }
+  }
+
+  if ( $jrnl ne "" ) {
+    $val = $jrnl . " [JOUR]";
+    push (@working, $val);
+  }
+
+  if ( $ctry ne "" ) {
+    $val = "country " . $ctry . " [TEXT]";
+    push (@working, $val);
+  }
+
+  if ( $fkey ne "" ) {
+    # -feature can use comma-separated list
+    my @fts = split (',', $fkey);
+    foreach $ft (@fts) {
+      if ( grep( /^$ft$/, @featureArray ) ) {
+        $val = $ft . " [FKEY]";
+        push (@working, $val);
+      } else {
+        die "\nUnrecognized -feature argument '$ft', use efilter -help to see available choices\n\n";
+      }
     }
   }
 
@@ -1379,7 +1618,10 @@ sub process_extras {
       $val = $organismHash{$orgn};
       push (@working, $val);
     } else {
-      die "\nUnrecognized -organism argument '$orgn', use efilter -help to see available choices\n\n";
+      # allow any organism
+      $val = $orgn . " [ORGN]";
+      push (@working, $val);
+      # die "\nUnrecognized -organism argument '$orgn', use efilter -help to see available choices\n\n";
     }
   }
 
@@ -1410,10 +1652,41 @@ sub process_extras {
     }
   }
 
+  if ( $clss ne "" ) {
+    if ( defined $snpHash{$clss} ) {
+      $val = $snpHash{$clss};
+      push (@working, $val);
+    } else {
+      die "\nUnrecognized -class argument '$clss', use efilter -help to see available choices\n\n";
+    }
+  }
+
+  if ( $kind ne "" ) {
+    if ( defined $kindHash{$kind} ) {
+      $val = $kindHash{$kind};
+      push (@working, $val);
+    } else {
+      die "\nUnrecognized -kind argument '$kind', use efilter -help to see available choices\n\n";
+    }
+  }
+
+  if ( $ptwy ne "" ) {
+    if ( defined $pathwayHash{$ptwy} ) {
+      $val = $pathwayHash{$ptwy};
+      push (@working, $val);
+    } else {
+      die "\nUnrecognized -pathway argument '$ptwy', use efilter -help to see available choices\n\n";
+    }
+  }
+
   my $xtras = join (" AND ", @working);
 
-  if ( $suffix eq "published" ) {
+  if ( $is_published ) {
     $xtras = $xtras . " NOT ahead of print [FILT]";
+  }
+
+  if ( $is_prev_year ) {
+    $xtras = $xtras . " NOT published last year [FILT]";
   }
 
   return $xtras;
@@ -1449,6 +1722,7 @@ sub efilt {
   MyGetOptions(
     $filt_help,
     "query=s" => \$query,
+    "q=s" => \$query,
     "sort=s" => \$sort,
     "days=i" => \$rldate,
     "mindate=s" => \$mndate,
@@ -1458,7 +1732,10 @@ sub efilt {
     "field=s" => \$field,
     "spell" => \$spell,
     "pairs=s" => \$pair,
+    "journal=s" => \$journal,
     "pub=s" => \$pub,
+    "released=s" => \$released,
+    "country=s" => \$country,
     "feature=s" => \$feature,
     "location=s" => \$location,
     "molecule=s" => \$molecule,
@@ -1466,6 +1743,9 @@ sub efilt {
     "source=s" => \$source,
     "status=s" => \$status,
     "type=s" => \$gtype,
+    "class=s" => \$class,
+    "kind=s" => \$kind,
+    "pathway=s" => \$pathway,
     "api_key=s" => \$api_key,
     "email=s" => \$emaddr,
     "tool=s" => \$tuul,
@@ -1473,7 +1753,11 @@ sub efilt {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -1487,7 +1771,7 @@ sub efilt {
   }
 
   # process special filter flags, add to query string
-  $query = process_extras ( $query, $pub, $feature, $location, $molecule, $organism, $source, $status, $gtype );
+  $query = process_extras ( $query, $pub, $released, $journal, $country, $feature, $location, $molecule, $organism, $source, $status, $gtype, $class, $kind, $pathway );
 
   if ( -t STDIN ) {
     if ( $query eq "" ) {
@@ -1518,8 +1802,8 @@ sub efilt {
     $email = $emaddr;
   }
 
-  if ( $query eq "" && $rldate < 1 and $mndate eq "" and $mxdate eq "" ) {
-    die "Must supply -query or -days or -mindate and -maxdate arguments on command line\n";
+  if ( $query eq "" && $sort eq "" && $rldate < 1 and $mndate eq "" and $mxdate eq "" ) {
+    die "Must supply -query or -sort or -days or -mindate and -maxdate arguments on command line\n";
   }
 
   binmode STDOUT, ":utf8";
@@ -1830,6 +2114,9 @@ sub esmry {
   my $silent = shift (@_);
   my $verbose = shift (@_);
   my $debug = shift (@_);
+  my $internal = shift (@_);
+  my $dev = shift (@_);
+  my $external = shift (@_);
   my $log = shift (@_);
   my $http = shift (@_);
   my $alias = shift (@_);
@@ -1864,7 +2151,21 @@ sub esmry {
       $arg .= "&retmode=$mode";
     }
 
-    $data = do_post ($url, $arg, $tool, $email, true);
+    $data = "";
+    $retry = true;
+
+    for ( $tries = 0; $tries < 3 && $retry; $tries++) {
+      $data = do_post ($url, $arg, $tool, $email, true);
+
+      if ($data =~ /<eSummaryResult>/i and $data =~ /<ERROR>(.+?)<\/ERROR>/i) {
+        if ( ! $silent ) {
+          print STDERR "Retrying esummary, step $stp: $err\n";
+        }
+        sleep 3;
+      } else {
+        $retry = false;
+      }
+    }
 
     if ($data =~ /<eSummaryResult>/i and $data =~ /<ERROR>(.+?)<\/ERROR>/i) {
       $err = $1;
@@ -1882,7 +2183,7 @@ sub esmry {
     }
 
     if (! $raw) {
-      if ($data !~ /<Id>\d+<\/Id>/i) {
+      if ($data !~ /<Id>\d+<\/Id>/) {
         $data =~ s/<DocumentSummary uid=\"(\d+)\">/<DocumentSummary><Id>$1<\/Id>/g;
       }
       if ( $dbase eq "gtr" ) {
@@ -1901,6 +2202,10 @@ sub esmry {
     $data =~ s/<eSummaryResult>//g;
     $data =~ s/<\/eSummaryResult>//g;
 
+    if ( $json ) {
+      $data = xml_to_json($data);
+    }
+
     print "$data";
 
     return;
@@ -1913,7 +2218,9 @@ sub esmry {
 
   test_edirect ( $dbase, $web, $key, $num, "summary" );
 
-  $stpminusone = $stp - 1;
+  if ( $stp ne "" ) {
+    $stpminusone = $stp - 1;
+  }
 
   if ( $max == 0 ) {
     if ( $silent ) {
@@ -1923,6 +2230,14 @@ sub esmry {
 
   # use larger chunk for document summaries
   $chunk = 1000;
+  if ( $mode eq "json" ) {
+    # json has a 500 limit
+    $chunk = 500;
+    if ( $dbase eq "gtr" ) {
+      # use smaller chunk for GTR JSON
+      $chunk = 50;
+    }
+  }
   for ( $start = $min; $start < $max; $start += $chunk ) {
     $url = $base . $esummary;
 
@@ -2009,7 +2324,7 @@ sub esmry {
       }
 
       if (! $raw) {
-        if ($data !~ /<Id>\d+<\/Id>/i) {
+        if ($data !~ /<Id>\d+<\/Id>/) {
           $data =~ s/<DocumentSummary uid=\"(\d+)\">/<DocumentSummary><Id>$1<\/Id>/g;
         }
         if ( $dbase eq "gtr" ) {
@@ -2028,10 +2343,12 @@ sub esmry {
       $data =~ s/<eSummaryResult>//g;
       $data =~ s/<\/eSummaryResult>//g;
 
+      if ( $json ) {
+        $data = xml_to_json($data);
+      }
+
       print "$data";
     }
-
-    do_sleep ();
   }
 }
 
@@ -2053,7 +2370,8 @@ Sequence Range
 
   -seq_start     First sequence position to retrieve
   -seq_stop      Last sequence position to retrieve
-  -strand        Strand of DNA to retrieve
+  -strand        1 = forward DNA strand, 2 = reverse complement
+  -revcomp       Shortcut for strand 2
 
 Gene Range
 
@@ -2066,9 +2384,15 @@ Sequence Flags
   -extend        Extend sequence retrieval in both directions
   -extrafeat     Bit flag specifying extra features
 
+Subset Retrieval
+
+  -start         First record to fetch
+  -stop          Last record to fetch
+
 Miscellaneous
 
   -raw           Skip database-specific XML modifications
+  -json          Convert adjusted XML output to JSON
 
 Format Examples
 
@@ -2094,11 +2418,18 @@ Format Examples
   biosystems
                  native             xml      Sys-set XML
 
+  clinvar
+                 variation                   Older Format
+                 variationid                 Transition Format
+                 vcv                         VCV Report
+                 clinvarset                  RCV Report
+
   gds
                  native             xml      RecordSet XML
                  summary                     Summary
 
   gene
+                 full_report                 Detailed Report
                  gene_table                  Gene Table
                  native                      Gene Report
                  native             asn.1    Entrezgene ASN.1
@@ -2123,11 +2454,13 @@ Format Examples
                  native             xml      NLMCatalogRecordSet XML
 
   pmc
+                 bioc                        PubTator Central BioC XML
                  medline                     MEDLINE
                  native             xml      pmc-articleset XML
 
   pubmed
                  abstract                    Abstract
+                 bioc                        PubTator Central BioC XML
                  medline                     MEDLINE
                  native             asn.1    Pubmed-entry ASN.1
                  native             xml      PubmedArticleSet XML
@@ -2155,14 +2488,7 @@ Format Examples
                  seqid                       Seq-id ASN.1
 
   snp
-                 chr                         Chromosome Report
-                 docset                      Summary
-                 fasta                       FASTA
-                 flt                         Flat File
-                 native             asn.1    Rs ASN.1
-                 native             xml      ExchangeSet XML
-                 rsr                         RS Cluster Report
-                 ssexemplar                  SS Exemplar List
+                 json                        Reference SNP Report
 
   sra
                  native             xml      EXPERIMENT_PACKAGE_SET XML
@@ -2193,10 +2519,10 @@ sub fix_pubmed_xml_encoding {
 
   my $x = shift (@_);
 
-  my $markup = '(?:[biu]|su[bp])';
-  my $attrs = ' ?';
-  # my $markup = '(?:(?:[\w.:_-]*:)?[[:lower:]-]+|DispFormula)';
-  # my $attrs = '(?:\s[^>]*)?';
+  # my $markup = '(?:[biu]|su[bp])';
+  # my $attrs = ' ?';
+  my $markup = '(?:[\w.:_-]*:)?[[:lower:]-]+';
+  my $attrs = '(?:\s[\w.:_-]+=[^>]*)?';
 
   # check for possible newline artifact
   $x =~ s|</$markup>\n||g;
@@ -2205,6 +2531,7 @@ sub fix_pubmed_xml_encoding {
   # removed mixed content tags
   $x =~ s|</$markup>||g;
   $x =~ s|<$markup$attrs/?>||g;
+  $x =~ s|</?DispFormula$attrs>| |g;
 
   # check for encoded tags
   if ( $x =~ /\&amp\;/ || $x =~ /\&lt\;/ || $x =~ /\&gt\;/ ) {
@@ -2213,6 +2540,7 @@ sub fix_pubmed_xml_encoding {
     # fix secondary encoding
     $x =~ s|&amp;lt;|&lt;|g;
     $x =~ s|&amp;gt;|&gt;|g;
+    $x =~ s|&amp;#(\d+);|&#$1;|g;
     # temporarily protect encoded scientific symbols, e.g., PMID 9698410 and 21892341
     $x =~ s|(?<= )(&lt;)(=*$markup&gt;)(?= )|$1=$2|g;
     # remove encoded markup
@@ -2225,6 +2553,9 @@ sub fix_pubmed_xml_encoding {
   # compress runs of horizontal whitespace
   $x =~ s/\h+/ /g;
 
+  # remove lines with just space
+  $x =~ s/\n \n/\n/g;
+
   # remove spaces just outside of angle brackets
   $x =~ s|> |>|g;
   $x =~ s| <|<|g;
@@ -2233,7 +2564,131 @@ sub fix_pubmed_xml_encoding {
   $x =~ s|\( |\(|g;
   $x =~ s| \)|\)|g;
 
+  # remove newlines flanking spaces
+  $x =~ s|\n ||g;
+  $x =~ s| \n| |g;
+
   return $x;
+}
+
+sub convert_bools {
+    my %unrecognized;
+
+    local *_convert_bools = sub {
+        my $ref_type = ref($_[0]);
+        if (!$ref_type) {
+            # Nothing.
+        }
+        elsif ($ref_type eq 'HASH') {
+            _convert_bools($_) for values(%{ $_[0] });
+        }
+        elsif ($ref_type eq 'ARRAY') {
+            _convert_bools($_) for @{ $_[0] };
+        }
+        elsif (
+               $ref_type eq 'JSON::PP::Boolean'           # JSON::PP
+            || $ref_type eq 'Types::Serialiser::Boolean'  # JSON::XS
+        ) {
+            $_[0] = $_[0] ? 1 : 0;
+        }
+        else {
+            ++$unrecognized{$ref_type};
+        }
+    };
+
+    &_convert_bools;
+}
+
+sub xml_to_json {
+
+  my $data = shift (@_);
+
+  my $xc = new XML::Simple(KeepRoot => 1);
+  my $conv = $xc->XMLin($data);
+  convert_bools($conv);
+  my $jc = JSON::PP->new->ascii->pretty->allow_nonref;
+  $data = $jc->encode($conv);
+
+  return $data;
+}
+
+sub bioc_do_get {
+
+  my $urlx = shift (@_);
+  my $argx = shift (@_);
+
+  if ( $argx ne "" ) {
+    $urlx .= "?";
+    $urlx .= "$argx";
+  }
+
+  $rslt = get ($urlx);
+
+    if ( ! defined $rslt ) {
+      print STDERR "Failure of bioc_do_get '$urlx'\n";
+      $result = 1;
+      return "";
+    }
+
+    if ( $rslt eq "" ) {
+      print STDERR "No bioc_do_get output returned from '$urlx'\n";
+      $result = 1;
+      return "";
+    }
+
+
+  if ( $rslt eq "" && $debug ) {
+    print STDERR "No bioc_do_get output returned from '$urlx'\n";
+  }
+
+  if ( $debug ) {
+    print STDERR "$rslt\n";
+  }
+
+  return $rslt;
+}
+
+sub do_icite_link {
+
+  my $urlx = shift (@_);
+  my $argx = shift (@_);
+
+  if ( $argx ne "" ) {
+    $urlx .= "?";
+    $urlx .= "$argx";
+  }
+
+  $item = get ($urlx);
+
+  if ( ! defined $item ) {
+    die "Failure of get https://icite.od.nih.gov/api/pubs/\n";
+  }
+
+  if ( $item eq "" ) {
+    die "No get output returned from get https://icite.od.nih.gov/api/pubs/\n";
+  }
+
+  # convert json to xml
+  my $jc = JSON::PP->new->ascii->pretty->allow_nonref;
+  my $conv = $jc->decode($item);
+  convert_json($conv);
+  my $result = XMLout($conv, SuppressEmpty => undef);
+
+  my @unsorted = ();
+  my @ids = ();
+  if ( $cited ) {
+    @ids = ($result =~ /<cited_by>(\d+)<\/cited_by>/g);
+  } elsif ( $cites ) {
+    @ids = ($result =~ /<references>(\d+)<\/references>/g);
+  }
+
+  foreach $uid (@ids) {
+    push (@unsorted, $uid);
+  }
+
+  @sorted = sort { $a <=> $b } @unsorted;
+
+  return @sorted;
 }
 
 # for id in 9698410 16271163 17282049 20968289 21892341 22785267 25435818 27672066 28635620 28976125 29547395
@@ -2254,11 +2709,14 @@ sub eftch {
     "db=s" => \$db,
     "id=s" => \$id,
     "format=s" => \$type,
+    "docsum" => \$dcsm,
     "style=s" => \$style,
     "mode=s" => \$mode,
+    "json" => \$json,
     "seq_start=i" => \$seq_start,
     "seq_stop=i" => \$seq_stop,
     "strand=s" => \$strand,
+    "revcomp" => \$revcomp,
     "complexity=i" => \$complexity,
     "chr_start=i" => \$chr_start,
     "chr_stop=i" => \$chr_stop,
@@ -2275,7 +2733,11 @@ sub eftch {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "raw" => \$raw,
     "http=s" => \$http,
     "https=s" => \$http,
@@ -2294,11 +2756,21 @@ sub eftch {
   $id =~ s/ /,/g;
   $id =~ s/,,/,/g;
 
+  # efetch -docsum typo now repaired as efetch -format docsum
+
+  if ( $type eq "" && $dcsm ) {
+    $type = "docsum";
+  }
+
   # "-format xml" is a shortcut for "-format full -mode xml"
 
   if ( $type eq "xml" and $mode eq "" ) {
     $type = "full";
     $mode = "xml";
+  }
+
+  if ( $type eq "asn" ) {
+    $type = "asn.1";
   }
 
   if ( $style eq "normal" or $style eq "none" ) {
@@ -2317,6 +2789,10 @@ sub eftch {
   } elsif ( $type eq "gbwithparts" or $type eq "gbwithpart" ) {
     $type = "gb";
     $style = "withparts";
+  }
+
+  if ( $type eq "gbc" and $mode eq "" ) {
+    $mode = "xml";
   }
 
   if ( -t STDIN and not @ARGV ) {
@@ -2359,10 +2835,13 @@ sub eftch {
     $email = $emaddr;
   }
 
-  if ( $strand eq "plus" ) {
+  if ( $revcomp ) {
+    $strand = "2";
+  }
+  if ( $strand eq "plus" or $strand eq "+" ) {
     $strand = "1";
   }
-  if ( $strand eq "minus" ) {
+  if ( $strand eq "minus" or $strand eq "-" or $strand eq "revcomp" ) {
     $strand = "2";
   }
 
@@ -2379,8 +2858,8 @@ sub eftch {
 
   if ( $type eq "docsum" or $fnc eq "-summary" ) {
 
-    esmry ( $dbase, $web, $key, $num, $id, $mode, $min, $max, $tool, $email,
-            $silent, $verbose, $debug, $log, $http, $alias, $basx );
+    esmry ( $dbase, $web, $key, $num, $id, $mode, $min, $max, $tool, $email, $silent,
+            $verbose, $debug, $internal, $dev, $external, $log, $http, $alias, $basx );
 
     return;
   }
@@ -2420,15 +2899,13 @@ sub eftch {
     }
 
     # use larger chunk for UID format
-    $chunk = 5000;
+    $chunk = 25000;
     for ( $start = $min; $start < $max; $start += $chunk ) {
 
       my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $max, $tool, $email );
       foreach $uid (@ids) {
         print "$uid\n";
       }
-
-      do_sleep ();
     }
 
     return;
@@ -2467,7 +2944,7 @@ sub eftch {
     }
 
     # use larger chunk for URL format
-    $chunk = 2000;
+    $chunk = 25000;
     for ( $start = $min; $start < $max; $start += $chunk ) {
 
       my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $max, $tool, $email );
@@ -2479,8 +2956,6 @@ sub eftch {
         $pfx = ",";
       }
       print "$url\n";
-
-      do_sleep ();
     }
 
     return;
@@ -2514,16 +2989,61 @@ sub eftch {
     }
 
     # use larger chunk for URL format
-    $chunk = 2000;
+    $chunk = 25000;
     for ( $start = $min; $start < $max; $start += $chunk ) {
 
       my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $max, $tool, $email );
       foreach $uid (@ids) {
         print "https://www.ncbi.nlm.nih.gov/$dbase/$uid\n";
       }
-
-      do_sleep ();
     }
+
+    return;
+  }
+
+  if ( $dbase eq "pubmed" and $type eq "bioc" and $id ne "" and $id ne "0" ) {
+
+    # efetch -db pubmed -id 28483577 -format bioc
+
+    $url = "https://www.ncbi.nlm.nih.gov/research/pubtator-api/publications/export/biocxml";
+    $arg = "pmids=$id";
+
+    $output = bioc_do_get ($url, $arg);
+
+    if ( $output !~ /\n$/ ) {
+      $output .= "\n";
+    }
+
+    print $output;
+
+    return;
+  }
+
+  if ( $dbase eq "pmc" and $type eq "bioc" and $id ne "" and $id ne "0" ) {
+
+    # efetch -db pmc -id 6207735,3681088 -format bioc
+
+    my @accum = ();
+    my @ids = split (',', $id);
+    foreach $pmcid (@ids) {
+      if ( $pmcid !~ /^PMC/ ) {
+        # add PMC prefix if not already in argument
+        $pmcid = "PMC" . $pmcid;
+      }
+      push (@accum, $pmcid);
+    }
+    $id = join (',', @accum);
+
+    $url = "https://www.ncbi.nlm.nih.gov/research/pubtator-api/publications/export/biocxml";
+    $arg = "pmcids=$id";
+
+    $output = bioc_do_get ($url, $arg);
+
+    if ( $output !~ /\n$/ ) {
+      $output .= "\n";
+    }
+
+    print $output;
 
     return;
   }
@@ -2544,104 +3064,130 @@ sub eftch {
       }
     }
 
-    $url = $base . $efetch;
+    # should not have space, initializes array with single item, original comma-separated ID string
+    my @ids = split (' ', $id);
 
-    if ( $dbase eq "pubmed" ) {
-      $id =~ s/(\d+)\.\d+/$1/g;
+    if ( $dbase eq "nuccore" or $dbase eq "nucleotide" ) {
+      if ( $style eq "withparts" or $style eq "conwithfeat" ) {
+        # repopulate with individual IDs to process large sequence results one at a time
+        # e.g., -id NC_000001.11,NC_000002.12,...,NC_000023.11,NC_000024.10
+        @ids = split (',', $id);
+      }
     }
 
-    $arg = "db=$dbase&id=$id";
+    foreach $id (@ids) {
 
-    if ( $type eq "gb" ) {
-      if ( $style eq "withparts" or $style eq "master" ) {
-        $arg .= "&rettype=gbwithparts";
+      $url = $base . $efetch;
+
+      if ( $dbase eq "pubmed" ) {
+        $id =~ s/(\d+)\.\d+/$1/g;
+      }
+
+      $arg = "db=$dbase&id=$id";
+
+      if ( $type eq "gb" or $type eq "gbc" ) {
+        if ( $style eq "withparts" or $style eq "master" ) {
+          $arg .= "&rettype=$type";
+          $arg .= "&retmode=$mode";
+          $arg .= "&style=$style";
+        } elsif ( $style eq "conwithfeat" or $style eq "withfeat" or $style eq "contigwithfeat" ) {
+          $arg .= "&rettype=$type";
+          $arg .= "&retmode=$mode";
+          $arg .= "&gbconwithfeat=1";
+        } else {
+          $arg .= "&rettype=$type";
+          $arg .= "&retmode=$mode";
+        }
+      } elsif ( $dbase eq "clinvar" and $type eq "variationid" ) {
+        $arg .= "&rettype=vcv&is_variationid";
         $arg .= "&retmode=$mode";
-      } elsif ( $style eq "conwithfeat" or $style eq "withfeat" or $style eq "contigwithfeat" ) {
-        $arg .= "&rettype=$type";
-        $arg .= "&retmode=$mode";
-        $arg .= "&gbconwithfeat=1";
       } else {
         $arg .= "&rettype=$type";
         $arg .= "&retmode=$mode";
       }
-    } else {
-      $arg .= "&rettype=$type";
-      $arg .= "&retmode=$mode";
-    }
 
-    # -chr_start and -chr_stop are for 0-based sequence coordinates from EntrezGene
-    if ( $chr_start > -1 && $chr_stop > -1 ) {
-      $seq_start = $chr_start + 1;
-      $seq_stop = $chr_stop + 1;
-    }
-
-    # if -seq_start > -seq_stop, swap values to normalize, indicate minus strand with -strand 2
-    if ( $seq_start > 0 && $seq_stop > 0 ) {
-      if ( $seq_start > $seq_stop ) {
-        my $tmp = $seq_start;
-        $seq_start = $seq_stop;
-        $seq_stop = $tmp;
-        $strand = "2";
+      # -chr_start and -chr_stop are for 0-based sequence coordinates from EntrezGene
+      if ( $chr_start > -1 && $chr_stop > -1 ) {
+        $seq_start = $chr_start + 1;
+        $seq_stop = $chr_stop + 1;
       }
-    }
 
-    # option to show GI number (undocumented)
-    if ( $showgi ) {
-      $arg .= "&showgi=1";
-    }
-
-    # optionally extend retrieved sequence range in both directions
-    if ( $extend > 0 ) {
-      $seq_start -= $extend;
-      $seq_stop += $extend;
-    }
-
-    if ( $strand ne "" ) {
-      $arg .= "&strand=$strand";
-    }
-    if ( $seq_start > 0 ) {
-      $arg .= "&seq_start=$seq_start";
-    }
-    if ( $seq_stop > 0 ) {
-      $arg .= "&seq_stop=$seq_stop";
-    }
-    if ( $complexity > 0 ) {
-      $arg .= "&complexity=$complexity";
-    }
-    if ( $extrafeat > -1 ) {
-      $arg .= "&extrafeat=$extrafeat";
-    }
-
-    $data = do_post_yielding_ref ($url, $arg, $tool, $email, true);
-
-    if ($$data =~ /<eFetchResult>/i and $$data =~ /<ERROR>(.+?)<\/ERROR>/i) {
-      $err = $1;
-      if ( $err ne "" ) {
-        if ( ! $silent ) {
-          print STDERR "ERROR in efetch: $err\n";
+      # if -seq_start > -seq_stop, swap values to normalize, indicate minus strand with -strand 2
+      if ( $seq_start > 0 && $seq_stop > 0 ) {
+        if ( $seq_start > $seq_stop ) {
+          my $tmp = $seq_start;
+          $seq_start = $seq_stop;
+          $seq_stop = $tmp;
+          $strand = "2";
         }
       }
+
+      # option to show GI number (undocumented)
+      if ( $showgi ) {
+        $arg .= "&showgi=1";
+      }
+
+      # optionally extend retrieved sequence range in both directions
+      if ( $extend > 0 ) {
+        $seq_start -= $extend;
+        $seq_stop += $extend;
+      }
+
+      if ( $strand ne "" ) {
+        $arg .= "&strand=$strand";
+      }
+      if ( $seq_start > 0 ) {
+        $arg .= "&seq_start=$seq_start";
+      }
+      if ( $seq_stop > 0 ) {
+        $arg .= "&seq_stop=$seq_stop";
+      }
+      if ( $complexity > 0 ) {
+        $arg .= "&complexity=$complexity";
+      }
+      if ( $extrafeat > -1 ) {
+        $arg .= "&extrafeat=$extrafeat";
+      }
+
+      $data = do_post_yielding_ref ($url, $arg, $tool, $email, true);
+
+      if ($$data =~ /<eFetchResult>/i and $$data =~ /<ERROR>(.+?)<\/ERROR>/i) {
+        $err = $1;
+        if ( $err ne "" ) {
+          if ( ! $silent ) {
+            print STDERR "ERROR in efetch: $err\n";
+          }
+        }
+      }
+
+      Encode::_utf8_on($$data);
+
+      if (! $raw) {
+
+        if ( $dbase eq "sra" and $type eq "full" and $mode eq "xml" ) {
+          $$data = fix_sra_xml_encoding($$data);
+        }
+
+        if ( $dbase eq "pubmed" and $type eq "full" and $mode eq "xml" ) {
+          $$data = fix_pubmed_xml_encoding($$data);
+        }
+
+        if ( $type eq "fasta" or $type eq "fasta_cds_aa" or $type eq "fasta_cds_na" or $type eq "gene_fasta" ) {
+          # remove blank lines in FASTA format
+          $$data =~ s/\n+/\n/g;
+        }
+      }
+
+      if ( $$data !~ /\n$/ ) {
+        $$data .= "\n";
+      }
+
+      if ( $json ) {
+        $$data = xml_to_json($$data);
+      }
+
+      print $$data;
     }
-
-    Encode::_utf8_on($$data);
-
-    if (! $raw) {
-
-      if ( $dbase eq "sra" and $type eq "full" and $mode eq "xml" ) {
-        $$data = fix_sra_xml_encoding($$data);
-      }
-
-      if ( $dbase eq "pubmed" and $type eq "full" and $mode eq "xml" ) {
-        $$data = fix_pubmed_xml_encoding($$data);
-      }
-
-      if ( $type eq "fasta" or $type eq "fasta_cds_aa" or $type eq "fasta_cds_na" or $type eq "gene_fasta" ) {
-        # remove blank lines in FASTA format
-        $$data =~ s/\n+/\n/g;
-      }
-    }
-
-    print $$data;
 
     return;
   }
@@ -2653,7 +3199,9 @@ sub eftch {
 
   test_edirect ( $dbase, $web, $key, $num, "fetch" );
 
-  $stpminusone = $stp - 1;
+  if ( $stp ne "" ) {
+    $stpminusone = $stp - 1;
+  }
 
   if ( $max == 0 ) {
     if ( $silent ) {
@@ -2661,8 +3209,70 @@ sub eftch {
     }
   }
 
+  if ( $dbase eq "pubmed" and $type eq "bioc" and $id eq "" ) {
+
+    # echo "28483577" | epost -db pubmed -format uid | efetch -format bioc
+
+    # use chunk of 100 for PubTator BioC GET
+    $chunk = 100;
+
+    for ( $start = $min; $start < $max; $start += $chunk ) {
+
+      my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $max, $tool, $email );
+      $id = join (',', @ids);
+
+      $url = "https://www.ncbi.nlm.nih.gov/research/pubtator-api/publications/export/biocxml";
+      $arg = "pmids=$id";
+
+      $output = bioc_do_get ($url, $arg);
+
+      if ( $output !~ /\n$/ ) {
+        $output .= "\n";
+      }
+
+      print $output;
+    }
+
+    return;
+  }
+
+  if ( $dbase eq "pmc" and $type eq "bioc" and $id eq "" ) {
+
+    # echo -e "6207735\n3681088" | epost -db pmc -format uid | efetch -format bioc
+
+    # use chunk of 100 for PubTator BioC GET
+    $chunk = 100;
+
+    for ( $start = $min; $start < $max; $start += $chunk ) {
+
+      my @accum = ();
+      my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $max, $tool, $email );
+      foreach $pmcid (@ids) {
+        if ( $pmcid !~ /^PMC/ ) {
+          # add PMC prefix if not already in argument
+          $pmcid = "PMC" . $pmcid;
+        }
+        push (@accum, $pmcid);
+      }
+      $id = join (',', @accum);
+
+      $url = "https://www.ncbi.nlm.nih.gov/research/pubtator-api/publications/export/biocxml";
+      $arg = "pmcids=$id";
+
+      $output = bioc_do_get ($url, $arg);
+
+      if ( $output !~ /\n$/ ) {
+        $output .= "\n";
+      }
+
+      print $output;
+    }
+
+    return;
+  }
+
   # use small chunk because fetched records could be quite large
-  $chunk = 100;
+  $chunk = 500;
 
   # use larger chunk for accessions
   if ( $dbase eq "nucleotide" or
@@ -2671,7 +3281,15 @@ sub eftch {
        $dbase eq "gss" or
        $dbase eq "protein" ) {
     if ( $type eq "ACCN" or $type eq "accn" or $type eq "ACC" or $type eq "acc" ) {
-      $chunk = 4000;
+      $chunk = 10000;
+    }
+  }
+
+  # use smaller chunk for SNP JSON
+  if ( $dbase eq "snp" ) {
+    if ( $type eq "JSON" or $type eq "json" ) {
+      # $chunk = 100;
+      $chunk = 10;
     }
   }
 
@@ -2685,10 +3303,11 @@ sub eftch {
 
     $arg = "db=$dbase&query_key=$key&WebEnv=$web";
 
-    if ( $type eq "gb" ) {
+    if ( $type eq "gb" or $type eq "gbc" ) {
       if ( $style eq "withparts" or $style eq "master" ) {
-        $arg .= "&rettype=gbwithparts";
+        $arg .= "&rettype=$type";
         $arg .= "&retmode=$mode";
+        $arg .= "&style=$style";
       } elsif ( $style eq "conwithfeat" or $style eq "withfeat" or $style eq "contigwithfeat" ) {
         $arg .= "&rettype=$type";
         $arg .= "&retmode=$mode";
@@ -2815,10 +3434,16 @@ sub eftch {
         }
       }
 
+      if ( $$data !~ /\n$/ ) {
+        $$data .= "\n";
+      }
+
+      if ( $json ) {
+        $$data = xml_to_json($$data);
+      }
+
       print $$data;
     }
-
-    do_sleep ();
   }
 }
 
@@ -2887,7 +3512,11 @@ sub einfo {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -2971,10 +3600,13 @@ sub einfo {
     print STDERR "$url\n";
   }
 
+  do_sleep ();
+
   $output = get ($url);
 
   if ( ! defined $output ) {
     print STDERR "Failure of '$url'\n";
+    $result = 1;
     return;
   }
 
@@ -3001,9 +3633,16 @@ sub einfo {
     $output =~ s/ +/ /g;
     $output =~ s/> +</></g;
 
+    my @unsorted = ();
     my @databases = ($output =~ /<DbName>(.+?)<\/DbName>/g);
     foreach $dtbs (@databases) {
-      print "$dtbs\n";
+      if ( $dtbs ne "" ) {
+        push (@unsorted, "$dtbs\n");
+      }
+    }
+    my @sorted = sort { "\U$a" cmp "\U$b" } @unsorted;
+    foreach $itm (@sorted) {
+      print "$itm";
     }
 
     return;
@@ -3024,6 +3663,7 @@ sub einfo {
     my $menu = "";
 
     if ( $fields ) {
+      my @unsorted = ();
       my @flds = ($output =~ /<Field>(.+?)<\/Field>/g);
       foreach $fld (@flds) {
         $name = "";
@@ -3035,12 +3675,17 @@ sub einfo {
           $full = $1;
         }
         if ( $name ne "" and $full ne "" ) {
-          print "$name\t$full\n";
+          push (@unsorted, "$name\t$full\n");
         }
+      }
+      my @sorted = sort { "\U$a" cmp "\U$b" } @unsorted;
+      foreach $itm (@sorted) {
+        print "$itm";
       }
     }
 
     if ( $links ) {
+      my @unsorted = ();
       my @lnks = ($output =~ /<Link>(.+?)<\/Link>/g);
       foreach $lnk (@lnks) {
         $name = "";
@@ -3052,8 +3697,12 @@ sub einfo {
           $menu = $1;
         }
         if ( $name ne "" and $menu ne "" ) {
-          print "$name\t$menu\n";
+          push (@unsorted, "$name\t$menu\n");
         }
+      }
+      my @sorted = sort { "\U$a" cmp "\U$b" } @unsorted;
+      foreach $itm (@sorted) {
+        print "$itm";
       }
     }
 
@@ -3217,8 +3866,10 @@ sub batch_elink {
     }
   }
 
-  $chunk = 200;
+  $chunk = 500;
   for ( $start = 0; $start < $num; $start += $chunk ) {
+
+    do_sleep ();
 
     my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $num, $tool, $email );
 
@@ -3235,6 +3886,9 @@ sub batch_elink {
     $retry = true;
 
     for ( $tries = 0; $tries < 3 && $retry; $tries++) {
+
+      do_sleep ();
+
       $data = do_post ($url, $arg, $tool, $email, true);
 
       if ($data =~ /<Error>(.+?)<\/Error>/i) {
@@ -3284,8 +3938,6 @@ sub batch_elink {
         }
       }
     }
-
-    do_sleep ();
   }
 
   $dbase = $dbto;
@@ -3295,6 +3947,9 @@ sub batch_elink {
   $num = scalar @uniq;
 
   if ( $num == 0 ) {
+
+    do_sleep ();
+
     acheck_test ( $dbase, $dbto, $name, $web, $key, $num, $stp, $err, $tool, $email );
     write_edirect ( $dbase, $web, $key, "0", $stp, $err, $tool, $email );
     if ( $auto ) {
@@ -3347,7 +4002,7 @@ Destination Database
 
   -related    Neighbors in same database
   -target     Links in different database
-  -name       Link name (e.g., pubmed_protein_refseq)
+  -name       Link name (e.g., pubmed_protein_refseq, pubmed_pubmed_citedin, pubmed_pubmed_refs)
 
 Direct Record Selection
 
@@ -3359,6 +4014,11 @@ Advanced Control
   -cmd        Command type (returns eLinkResult XML)
   -mode       "ref" uses LinkOut provider's web site
   -holding    Name of LinkOut provider
+
+PubMed Citation Lookup
+
+  -cited      References to this paper
+  -cites      Publication reference list
 
 Batch Processing
 
@@ -3409,6 +4069,8 @@ sub elink {
     "neighbor" => \$neighbor,
     "cmd=s" => \$cmd,
     "mode=s" => \$mode,
+    "cited" => \$cited,
+    "cites" => \$cites,
     "batch" => \$batch,
     "holding=s" => \$holding,
     "label=s" => \$lbl,
@@ -3419,7 +4081,11 @@ sub elink {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -3474,7 +4140,7 @@ sub elink {
     }
   }
 
-  if ( $dbto eq "" and (! $related) and (! $neighbor) ) {
+  if ( $dbto eq "" and (! $related) and (! $neighbor) and (! $cited) and (! $cites) ) {
     die "Must supply -target or -related on command line\n";
   }
 
@@ -3500,6 +4166,102 @@ sub elink {
 
   if ( $dbase eq "nlmcatalog" ) {
     die "Entrez Direct does not support links for the nlmcatalog database\n";
+  }
+
+  # experimental access to new icite service
+  # equivalent of (PMC-requiring) -name pubmed_pubmed_citedin or -name pubmed_pubmed_refs
+
+  if ( $dbase eq "pubmed" and ( $cited or $cites ) ) {
+
+    my @unsorted = ();
+
+    if ( $id ne "" and $id ne "0" ) {
+
+      # elink -db pubmed -id 2539356 -cited
+      # elink -db pubmed -id 2539356 -cites
+
+      my @ids = split (',', $id);
+      foreach $pmid (@ids) {
+        push (@unsorted, $pmid);
+      }
+
+    } else {
+
+      # esearch -db pubmed -query "NCBI [AFFL]" | elink -cited
+
+      if ( $web eq "" ) {
+        die "WebEnv value not found in link input\n";
+      }
+
+      $chunk = 5000;
+      for ( $start = 0; $start < $num; $start += $chunk ) {
+
+        my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $num, $tool, $email );
+        foreach $pmid (@ids) {
+          push (@unsorted, $pmid);
+        }
+      }
+    }
+
+    if ( scalar @unsorted < 1 ) {
+      write_edirect ( $dbase, $web, $key, "0", $stp, $err, $tool, $email );
+      return
+    }
+
+    @sorted = sort { $a <=> $b } @unsorted;
+
+    my @uniqued = ();
+
+    my $prev = "";
+    foreach $pmid (@sorted) {
+      if ( $pmid ne $prev ) {
+        push (@uniqued, $pmid);
+        $prev = $pmid;
+      }
+    }
+
+    my @working = ();
+
+    while ( my @chunk = splice @uniqued, 0, 100 ) {
+
+      $id = join (',', @chunk);
+
+      $url = "https://icite.od.nih.gov/api/pubs";
+      $arg = "pmids=$id";
+
+      my @idc = do_icite_link ($url, $arg);
+
+      foreach $pmid (@idc) {
+        push (@working, $pmid);
+      }
+    }
+
+    if ( scalar @working < 1 ) {
+      write_edirect ( $dbase, $web, $key, "0", $stp, $err, $tool, $email );
+      return
+    }
+
+    @combined = sort { $a <=> $b } @working;
+
+    my @resolved = ();
+
+    my $last = "";
+    foreach $pmid (@combined) {
+      if ( $pmid ne $last ) {
+        push (@resolved, $pmid);
+        $last = $pmid;
+      }
+    }
+
+    $idx = join (',', @resolved);
+
+    ( $web, $key ) = post_chunk ( $dbase, $web, $key, $tool, $email, $idx, "" );
+
+    ( $num, $key ) = get_count ( $dbase, $web, $key, $tool, $email );
+
+    write_edirect ( $dbase, $web, $key, $num, $stp, $err, $tool, $email );
+
+    return;
   }
 
   if ( $dbase ne "" and $id ne "" ) {
@@ -3564,8 +4326,10 @@ sub elink {
       }
     }
 
-    $chunk = 200;
+    $chunk = 500;
     for ( $start = 0; $start < $num; $start += $chunk ) {
+
+      do_sleep ();
 
       my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $num, $tool, $email );
 
@@ -3588,8 +4352,6 @@ sub elink {
       $data = do_post ($url, $arg, $tool, $email, true);
 
       print "$data";
-
-      do_sleep ();
     }
 
     return;
@@ -3631,6 +4393,7 @@ sub elink {
   $output = "";
 
   for ( $tries = 0; $tries < 3 && $web eq ""; $tries++) {
+
     $output = do_post ($url, $arg, $tool, $email, true);
 
     $err = $1 if ($output =~ /<Error>(.+?)<\/Error>/i);
@@ -3647,7 +4410,9 @@ sub elink {
 
   # automatically fail over to batch mode under certain failure conditions
 
-  $stpminusone = $stp - 1;
+  if ( $stp ne "" ) {
+    $stpminusone = $stp - 1;
+  }
 
   if ( $err =~ "^Query failed" or
        $err =~ "^Timeout waiting" or
@@ -3677,6 +4442,7 @@ sub elink {
       }
       print STDERR "Automatically switching to -batch mode\n";
     }
+
     batch_elink ( $dbase, $dbto, $name, $wb, $ky, $nm, $stp, "", $lbl, $tool, $email, true );
     return;
   }
@@ -3727,7 +4493,7 @@ sub emmdb {
 
   test_edirect ( $dbase, $web, $key, $num, "mmdb" );
 
-  $chunk = 100;
+  $chunk = 500;
   for ( $start = 0; $start < $num; $start += $chunk ) {
 
     my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $num, $tool, $email );
@@ -3741,8 +4507,6 @@ sub emmdb {
       $mmdb = do_post ($url, $arg, $tool, $email, true);
 
       print "$mmdb\n";
-
-      do_sleep ();
     }
   }
 }
@@ -3770,7 +4534,11 @@ sub entfy {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -3810,7 +4578,7 @@ sub entfy {
   binmode STDOUT, ":utf8";
 
   if ( $num > 0 ) {
-    $chunk = 100;
+    $chunk = 500;
     for ( $start = 0; $start < $num; $start += $chunk ) {
 
       my @ids = get_uids ( $dbase, $web, $key, $start, $chunk, $num, $tool, $email );
@@ -3820,8 +4588,6 @@ sub entfy {
         $str = "mail -s \"A new $dbase record is in Entrez\" $email";
         system "$txt | $str";
       }
-
-      do_sleep ();
     }
   }
 }
@@ -3944,7 +4710,11 @@ sub epost {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -4063,7 +4833,7 @@ sub epost {
     } else {
 
       while ( @rest ) {
-        my @chunk = splice(@rest, 0, 2000);
+        my @chunk = splice(@rest, 0, 50000);
 
         $ids = join (',', @chunk);
 
@@ -4089,8 +4859,6 @@ sub epost {
         $combo .= $pfx . "#" . $key;
         $pfx = " OR ";
         $loops++;
-
-        do_sleep ();
       }
     }
 
@@ -4122,7 +4890,7 @@ sub epost {
     } else {
 
       while ( @rest ) {
-        my @chunk = splice(@rest, 0, 2000);
+        my @chunk = splice(@rest, 0, 50000);
 
         if ( $accession_mode ) {
           $query = join (' [ACCN] OR ', @chunk);
@@ -4155,13 +4923,12 @@ sub epost {
         $combo .= $pfx . "#" . $key;
         $pfx = " OR ";
         $loops++;
-
-        do_sleep ();
       }
     }
   }
 
   if ( $combo eq "" ) {
+    $result = 1;
     die "Failure of post to find data to load\n";
   }
 
@@ -4214,6 +4981,7 @@ sub espel {
     $spell_help,
     "db=s" => \$db,
     "query=s" => \$query,
+    "q=s" => \$query,
     "api_key=s" => \$api_key,
     "email=s" => \$emaddr,
     "tool=s" => \$tuul,
@@ -4221,7 +4989,11 @@ sub espel {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -4316,7 +5088,11 @@ sub ecitmtch {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -4429,7 +5205,11 @@ sub eprxy {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -4663,13 +5443,17 @@ sub esrch {
     $srch_help,
     "db=s" => \$db,
     "query=s" => \$query,
+    "q=s" => \$query,
     "sort=s" => \$sort,
     "days=i" => \$rldate,
     "mindate=s" => \$mndate,
     "maxdate=s" => \$mxdate,
     "datetype=s" => \$dttype,
     "label=s" => \$lbl,
+    "journal=s" => \$journal,
     "pub=s" => \$pub,
+    "released=s" => \$released,
+    "country=s" => \$country,
     "feature=s" => \$feature,
     "location=s" => \$location,
     "molecule=s" => \$molecule,
@@ -4677,6 +5461,9 @@ sub esrch {
     "source=s" => \$source,
     "status=s" => \$status,
     "type=s" => \$gtype,
+    "class=s" => \$class,
+    "kind=s" => \$kind,
+    "pathway=s" => \$pathway,
     "clean" => \$clean,
     "field=s" => \$field,
     "word" => \$word,
@@ -4694,7 +5481,11 @@ sub esrch {
     "silent" => \$silent,
     "verbose" => \$verbose,
     "debug" => \$debug,
+    "internal" => \$internal,
+    "dev" => \$dev,
+    "ext" => \$external,
     "log" => \$log,
+    "compact" => \$compact,
     "http=s" => \$http,
     "https=s" => \$http,
     "alias=s" => \$alias,
@@ -4739,7 +5530,7 @@ sub esrch {
   binmode STDOUT, ":utf8";
 
   # support all efilter shortcut flags in esearch (undocumented)
-  $query = process_extras ( $query, $pub, $feature, $location, $molecule, $organism, $source, $status, $gtype );
+  $query = process_extras ( $query, $pub, $released, $journal, $country, $feature, $location, $molecule, $organism, $source, $status, $gtype, $class, $kind, $pathway );
 
   if ( $query eq "" ) {
     die "Must supply -query search expression on command line\n";
@@ -4865,19 +5656,30 @@ sub esrch {
 
   $wb = $web;
 
-  $output = do_post ($url, $arg, $tool, $email, true);
-
   $web = "";
   $key = "";
   $num = "";
   $err = "";
   my $trn = "";
 
-  $web = $1 if ($output =~ /<WebEnv>(\S+)<\/WebEnv>/);
-  $key = $1 if ($output =~ /<QueryKey>(\S+)<\/QueryKey>/);
-  $num = $1 if ($output =~ /<Count>(\S+)<\/Count>/);
-  $err = $1 if ($output =~ /<Error>(.+?)<\/Error>/i);
-  $trn = $1 if ($output =~ /<QueryTranslation>(.+?)<\/QueryTranslation>/i);
+  $output = "";
+
+  for ( $tries = 0; $tries < 3 && $web eq ""; $tries++) {
+    $output = do_post ($url, $arg, $tool, $email, true);
+
+    $err = $1 if ($output =~ /<Error>(.+?)<\/Error>/i);
+    if ( $err eq "" ) {
+      $web = $1 if ($output =~ /<WebEnv>(\S+)<\/WebEnv>/);
+      $key = $1 if ($output =~ /<QueryKey>(\S+)<\/QueryKey>/);
+      $num = $1 if ($output =~ /<Count>(\S+)<\/Count>/);
+      $trn = $1 if ($output =~ /<QueryTranslation>(.+?)<\/QueryTranslation>/i);
+    } else {
+      if ( ! $silent ) {
+        print STDERR "Retrying esearch, step $stp: $err\n";
+      }
+      sleep 3;
+    }
+  }
 
   if ( $err ne "" ) {
     write_edirect ( "", "", "", "", "", $err, "", "" );
@@ -4937,6 +5739,1533 @@ sub eaddr {
   print "$addr\n";
 }
 
+#  eblst front-end to Blast API must be fed chunks of FASTA sequences from stdin
+
+sub eblst {
+
+  clearflags ();
+
+  $encoded_query = "";
+
+  while ( defined($thisline = <STDIN>) ) {
+    $encoded_query = $encoded_query . uri_escape($thisline);
+  }
+
+  $url = "https://blast.ncbi.nlm.nih.gov/blast/Blast.cgi";
+  $arg = "CMD=Put&PROGRAM=blastp&DATABASE=nr&QUERY=" . $encoded_query;
+
+  $ua = new LWP::UserAgent (timeout => 300);
+  $ua->env_proxy;
+
+  $req = new HTTP::Request POST => "$url";
+  $req->content_type('application/x-www-form-urlencoded');
+  $req->content("$arg");
+
+  do_sleep ();
+
+  $response = $ua->request ( $req );
+
+  # parse out the request id
+  $response->content =~ /^    RID = (.*$)/m;
+  $rid=$1;
+
+  if ( $rid eq "" ) {
+    print STDERR "Unable to create BLAST request.\n";
+    exit 1;
+  }
+
+  print STDERR "RID:  $rid\n";
+
+  # parse out the estimated time to completion
+  $response->content =~ /^    RTOE = (.*$)/m;
+  $rtoe=$1;
+
+  # wait for search to complete
+  if ( $rtoe ne "" ) {
+      sleep $rtoe;
+  }
+
+  # poll for results
+  while (true)
+    {
+    $req = new HTTP::Request GET => "https://blast.ncbi.nlm.nih.gov/blast/Blast.cgi?CMD=Get&FORMAT_OBJECT=SearchInfo&RID=$rid";
+
+    do_sleep ();
+
+    $response = $ua->request($req);
+
+    if ($response->content =~ /\s+Status=WAITING/m)
+        {
+        print STDERR "Searching...\n";
+        sleep 20;
+        next;
+        }
+
+    if ($response->content =~ /\s+Status=FAILED/m)
+        {
+        print STDERR "Search $rid failed; please report to blast-help\@ncbi.nlm.nih.gov.\n";
+        exit 4;
+        }
+
+    if ($response->content =~ /\s+Status=UNKNOWN/m)
+        {
+        print STDERR "Search $rid expired.\n";
+        exit 3;
+        }
+
+    if ($response->content =~ /\s+Status=READY/m)
+        {
+        if ($response->content =~ /\s+ThereAreHits=yes/m)
+            {
+            print STDERR "Search complete, retrieving results...\n";
+            last;
+            }
+        else
+            {
+            print STDERR "No hits found.\n";
+            exit 2;
+            }
+        }
+
+        # if we get here, something unexpected happened.
+        print STDERR "Unexpected situation.\n";
+        exit 5;
+    } # end poll loop
+
+  # retrieve and display results
+  $req = new HTTP::Request GET => "https://blast.ncbi.nlm.nih.gov/blast/Blast.cgi?CMD=Get&FORMAT_TYPE=XML&RID=$rid";
+
+  do_sleep ();
+
+  $response = $ua->request($req);
+
+  print $response->content;
+}
+
+sub ftls {
+
+  @args = @ARGV;
+  $max = scalar @args;
+  if ( $max < 2 ) {
+    die "Needs SERVER and PATH arguments\n";
+  }
+  my $server = $args[0];
+  my $dir    = $args[1];
+
+  if ( $server =~ /^ftp:\/\/(.+)/ ) {
+    $server = $1;
+  }
+
+  my $ftp    = new Net::FTP($server, Passive => 1)
+    or die "Unable to connect to FTP server: $!";
+
+  $ftp->login or die "Unable to log in to FTP server: ", $ftp->message;
+  $ftp->cwd($dir) or die "Unable to change to $dir: ", $ftp->message;
+  my $contents = $ftp->dir;
+  die "Unable to list contents" unless defined $contents;
+
+  for (@$contents) {
+    if (/^-.*?(\S*)$/) {
+        print "$1\n";
+    } elsif (/^d.*?(\S*)$/) {
+        print "$1/\n";
+    } elsif (/^l.*?(\S*) -> \S*$/) {
+        print "$1@\n";
+    }
+  }
+}
+
+sub asls {
+
+  @args = @ARGV;
+  $max = scalar @args;
+  if ( $max < 1 ) {
+    die "Needs PATH argument\n";
+  }
+  my $server = "ftp.ncbi.nlm.nih.gov";
+  my $dir    = $args[0];
+
+  my $ftp    = new Net::FTP($server, Passive => 1)
+    or die "Unable to connect to FTP server: $!";
+
+  $ftp->login or die "Unable to log in to FTP server: ", $ftp->message;
+  $ftp->cwd($dir) or die "Unable to change to $dir: ", $ftp->message;
+  my $contents = $ftp->dir;
+  die "Unable to list contents" unless defined $contents;
+
+  for (@$contents) {
+    if (/^-.*?(\S*)$/) {
+        print "$1\n";
+    } elsif (/^d.*?(\S*)$/) {
+        print "$1/\n";
+    } elsif (/^l.*?(\S*) -> \S*$/) {
+        print "$1@\n";
+    }
+  }
+}
+
+sub ftcp {
+
+  @args = @ARGV;
+  $max = scalar @args;
+  if ( $max < 2 ) {
+    die "Needs SERVER and PATH arguments\n";
+  }
+  my $server = $args[0];
+  my $dir    = $args[1];
+
+  if ( $server =~ /^ftp:\/\/(.+)/ ) {
+    $server = $1;
+  }
+
+  my $ftp    = new Net::FTP($server, Passive => 1)
+    or die "Unable to connect to FTP server: $!";
+
+  my @failed = ();
+
+  $ftp->login or die "Unable to log in to FTP server: ", $ftp->message;
+  $ftp->cwd($dir) or die "Unable to change to $dir: ", $ftp->message;
+  $ftp->binary or warn "Unable to set binary mode: ", $ftp->message;
+
+  if ($max > 2) {
+  # file names on command line
+    for ( $i = 2; $i < $max; $i++) {
+      my $fl = $args[$i];
+      if (! -e $fl) {
+        if (! $ftp->get($fl) ) {
+          my $msg = $ftp->message;
+          chomp $msg;
+          push (@failed, "$fl ($msg)");
+        }
+      }
+    }
+  } elsif ( -t STDIN ) {
+    print STDERR "\nNO INPUT PIPED FROM STDIN\n\n";
+  } else {
+  # read file names from stdin
+    while ( <STDIN> ) {
+      chomp;
+      $_ =~ s/\r$//;
+      print "$_\n";
+      my $fl = $_;
+      if (! -e $fl) {
+        if (! $ftp->get($fl) ) {
+          my $msg = $ftp->message;
+          chomp $msg;
+          push (@failed, "$fl ($msg)");
+        }
+      }
+    }
+  }
+
+  if (@failed) {
+    my $errs = join ("\n", @failed);
+    print STDERR "\nFAILED TO DOWNLOAD:\n\n$errs\n";
+    exit 1;
+  }
+}
+
+# convert_json based on convert_bool from:
+#
+# https://stackoverflow.com/questions/41039792correct-and-easy-way-convert-jsonppboolean-to-0-1-with-perl/41040316#41040316
+#
+# with hash section improvements by Aaron Ucko to convert non-XML-legal element characters to underscore.
+
+sub convert_json {
+  my %unrecognized;
+
+  local *_convert_json = sub {
+    my $ref_type = ref($_[0]);
+    if (!$ref_type) {
+      # Nothing.
+    }
+    elsif ($ref_type eq 'HASH') {
+      my %converted = ();
+      while (my ($k, $v) = each %{ $_[0] }) {
+        $k =~ s/[^[:alnum:]_:.-]|^[0-9.-]/_/g;
+        _convert_json($v);
+        $converted{$k} = $v;
+      }
+      %{ $_[0] } = %converted;
+    }
+    elsif ($ref_type eq 'ARRAY') {
+      _convert_json($_) for @{ $_[0] };
+    }
+    elsif (
+       $ref_type eq 'JSON::PP::Boolean' || $ref_type eq 'Types::Serialiser::Boolean'
+    ) {
+      $_[0] = $_[0] ? 1 : 0;
+    }
+    else {
+      ++$unrecognized{$ref_type};
+    }
+  };
+
+  &_convert_json;
+}
+
+my $transmute_help = qq{
+  [escape|unescape|encode64|decode64|plain|simple|script|pretty|docsum|pubmed]
+
+};
+
+sub tmut {
+
+  @args = @ARGV;
+  $max = scalar @args;
+  if ( $max < 1 ) {
+    die "Must supply conversion type on command line\n";
+  }
+  # read required function argument
+  my $type = $args[0];
+  my $obj = "";
+  my $spt = "";
+  if ( $max > 1 ) {
+    # read optional parent object name
+    $obj = $args[1];
+  }
+  if ( $max > 2 ) {
+    # read optional json tag for splitting
+    $spt = $args[2];
+  }
+
+  if ( $type eq "-help" ) {
+    print "transmute $version\n";
+      print $transmute_help;
+    return;
+  }
+
+  # read entire XML input stream into a single string
+
+  my $holdTerminator = $/;
+  undef $/;
+  my $data = <STDIN>;
+  $/ = $holdTerminator;
+
+  # exit on empty data
+  if ( $data eq "" ) {
+    exit 1;
+  }
+
+  # perform specific conversions
+
+  if ( $type eq "unescape" || $type eq "-unescape" ) {
+
+    $data = uri_unescape($data);
+
+    # convert plus signs to spaces
+    $data =~ s/\+/ /g;
+
+    # compress runs of spaces
+    $data =~ s/ +/ /g;
+
+    print "$data";
+  }
+
+  if ( $type eq "escape" || $type eq "-escape" ) {
+
+    # compress runs of spaces
+    $data =~ s/ +/ /g;
+
+    $data = uri_escape($data);
+
+    print "$data";
+  }
+
+  if ( $type eq "decode64" || $type eq "-decode64" ) {
+
+    $data = decode_base64($data);
+
+    print "$data";
+  }
+
+  if ( $type eq "encode64" || $type eq "-encode64" ) {
+
+    $data = encode_base64($data);
+
+    print "$data";
+  }
+
+  if ( $type eq "plain" || $type eq "-plain" ) {
+
+    # remove embedded mixed-content tags
+    $data =~ s/<[^>]*>//g;
+
+    # compress runs of spaces
+    $data =~ s/ +/ /g;
+
+    print "$data";
+  }
+
+  if ( $type eq "simple" || $type eq "-simple" ) {
+
+    # remove embedded mixed-content tags and everything in between
+    $data =~ s,<[^>]*/>,,g;
+    $data =~ s,<(\S+)[^>]*>.*?</\1>,,g;
+
+    # compress runs of spaces
+    $data =~ s/ +/ /g;
+
+    print "$data";
+  }
+
+  if ( $type eq "script" || $type eq "-script" ) {
+
+    # remove newlines, tabs, space between tokens, compress runs of spaces
+    $data =~ s/\r/ /g;
+    $data =~ s/\n/ /g;
+    $data =~ s/\t//g;
+    $data =~ s/ +/ /g;
+    $data =~ s/> +</></g;
+
+    # remove embedded script tags
+    $data =~ s|<script.*?</script>||g;
+
+    # compress runs of spaces
+    $data =~ s/ +/ /g;
+
+    # restore newlines between objects
+    $data =~ s/> *?</>\n</g;
+
+    print "$data";
+  }
+
+  if ( $type eq "pubmed" || $type eq "-pubmed" ) {
+
+    # remove newlines, tabs, space between tokens, compress runs of spaces
+    $data =~ s/\r/ /g;
+    $data =~ s/\n/ /g;
+    $data =~ s/\t//g;
+    $data =~ s/ +/ /g;
+    $data =~ s/> +</></g;
+
+    # my $markup = '(?:[biu]|su[bp])';
+    # my $attrs = ' ?';
+    my $markup = '(?:[\w.:_-]*:)?[[:lower:]-]+';
+    my $attrs = '(?:\s[\w.:_-]+=[^>]*)?';
+
+    # check for possible newline artifact
+    $data =~ s|</$markup>\n||g;
+    $data =~ s|\n<$markup$attrs>||g;
+
+    # remove mixed content tags
+    $data =~ s|</$markup>||g;
+    $data =~ s|<$markup$attrs/?>||g;
+    $data =~ s|</?DispFormula$attrs>| |g;
+
+    # check for encoded tags
+    if ( $data =~ /\&amp\;/ || $data =~ /\&lt\;/ || $data =~ /\&gt\;/ ) {
+      # remove runs of amp
+      $data =~ s|&amp;(?:amp;)+|&amp;|g;
+      # fix secondary encoding
+      $data =~ s|&amp;lt;|&lt;|g;
+      $data =~ s|&amp;gt;|&gt;|g;
+      $data =~ s|&amp;#(\d+);|&#$1;|g;
+      # temporarily protect encoded scientific symbols, e.g., PMID 9698410 and 21892341
+      $data =~ s|(?<= )(&lt;)(=*$markup&gt;)(?= )|$1=$2|g;
+      # remove encoded markup
+      $data =~ s|&lt;/$markup&gt;||g;
+      $data =~ s|&lt;$markup$attrs/?&gt;||g;
+      # undo temporary protection of scientific symbols adjacent to space
+      $data =~ s|(?<= )(&lt;)=(=*$markup&gt;)(?= )|$1$2|g;
+    }
+
+    # compress runs of horizontal whitespace
+    $data =~ s/\h+/ /g;
+
+    # remove lines with just space
+    $data =~ s/\n \n/\n/g;
+
+    # remove spaces just outside of angle brackets
+    $data =~ s|> |>|g;
+    $data =~ s| <|<|g;
+
+    # remove spaces just inside of parentheses
+    $data =~ s|\( |\(|g;
+    $data =~ s| \)|\)|g;
+
+    # remove newlines flanking spaces
+    $data =~ s|\n ||g;
+    $data =~ s| \n| |g;
+
+    # restore newlines between objects
+    $data =~ s/> *?</>\n</g;
+
+    print "$data\n";
+  }
+
+  if ( $type eq "docsum" || $type eq "-docsum" ) {
+
+    # remove newlines, tabs, space between tokens, compress runs of spaces
+    $data =~ s/\r/ /g;
+    $data =~ s/\n/ /g;
+    $data =~ s/\t//g;
+    $data =~ s/ +/ /g;
+    $data =~ s/> +</></g;
+
+    # move UID from attribute to object
+    if ($data !~ /<Id>\d+<\/Id>/) {
+      $data =~ s/<DocumentSummary uid=\"(\d+)\">/<DocumentSummary><Id>$1<\/Id>/g;
+    }
+    $data =~ s/<DocumentSummary uid=\"\d+\">/<DocumentSummary>/g;
+
+    # fix bad encoding
+    my @accum = ();
+    my @working = ();
+    my $prefix = "";
+    my $suffix = "";
+    my $docsumset_attrs = '';
+
+    if ( $data =~ /(.+?)<DocumentSummarySet(\s+.+?)?>(.+)<\/DocumentSummarySet>(.+)/s ) {
+      $prefix = $1;
+      $docsumset_attrs = $2;
+      my $docset = $3;
+      $suffix = $4;
+
+      my @vals = ($docset =~ /<DocumentSummary>(.+?)<\/DocumentSummary>/sg);
+      foreach $val (@vals) {
+        push (@working, "<DocumentSummary>");
+        if ( $val =~ /<Title>(.+?)<\/Title>/ ) {
+          my $x = $1;
+          if ( $x =~ /\&amp\;/ || $x =~ /\&lt\;/ || $x =~ /\&gt\;/ || $x =~ /\</ || $x =~ /\>/ ) {
+            while ( $x =~ /\&amp\;/ || $x =~ /\&lt\;/ || $x =~ /\&gt\;/ ) {
+              HTML::Entities::decode_entities($x);
+            }
+            # removed mixed content tags
+            $x =~ s|<b>||g;
+            $x =~ s|<i>||g;
+            $x =~ s|<u>||g;
+            $x =~ s|<sup>||g;
+            $x =~ s|<sub>||g;
+            $x =~ s|</b>||g;
+            $x =~ s|</i>||g;
+            $x =~ s|</u>||g;
+            $x =~ s|</sup>||g;
+            $x =~ s|</sub>||g;
+            $x =~ s|<b/>||g;
+            $x =~ s|<i/>||g;
+            $x =~ s|<u/>||g;
+            $x =~ s|<sup/>||g;
+            $x =~ s|<sub/>||g;
+            # Reencode any resulting less-than or greater-than entities to avoid breaking the XML.
+            $x =~ s/</&lt;/g;
+            $x =~ s/>/&gt;/g;
+            $val =~ s/<Title>(.+?)<\/Title>/<Title>$x<\/Title>/;
+          }
+        }
+        if ( $val =~ /<Summary>(.+?)<\/Summary>/ ) {
+          my $x = $1;
+          if ( $x =~ /\&amp\;/ ) {
+            HTML::Entities::decode_entities($x);
+            # Reencode any resulting less-than or greater-than entities to avoid breaking the XML.
+            $x =~ s/</&lt;/g;
+            $x =~ s/>/&gt;/g;
+            $val =~ s/<Summary>(.+?)<\/Summary>/<Summary>$x<\/Summary>/;
+          }
+        }
+        push (@working, $val );
+        push (@working, "</DocumentSummary>");
+      }
+    }
+
+    if ( scalar @working > 0 ) {
+      push (@accum, $prefix);
+      push (@accum, "<DocumentSummarySet$docsumset_attrs>");
+      push (@accum, @working);
+      push (@accum, "</DocumentSummarySet>");
+      push (@accum, $suffix);
+      $data = join ("\n", @accum);
+      $data =~ s/\n\n/\n/g;
+    }
+
+    # restore newlines between objects
+    $data =~ s/> *?</>\n</g;
+
+    print "$data\n";
+  }
+
+  if ( $type eq "pretty" || $type eq "-pretty" ) {
+
+    # remove newlines, tabs, space between tokens, compress runs of spaces
+    $data =~ s/\r/ /g;
+    $data =~ s/\n/ /g;
+    $data =~ s/\t//g;
+    $data =~ s/ +/ /g;
+    $data =~ s/> +</></g;
+
+    # restore newlines between objects
+    $data =~ s/> *?</>\n</g;
+
+    print "$data\n";
+  }
+
+  if ( $type eq "json2xml" || $type eq "-json2xml" || $type eq "j2x" || $type eq "-j2x" ) {
+
+    # convert JSON to XML
+
+    my @item = ();
+
+    if ( defined($spt) && $spt ne "" ) {
+      @items = split(/(?<=\})\s*(?=\{"\Q$spt\E":)/, $data);
+    } else {
+      push (@items, $data);
+    }
+
+    binmode(STDOUT, ":utf8");
+
+    if ( defined($obj) && $obj ne "" ) {
+      print "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+      print "<!DOCTYPE $obj>\n";
+      print "<$obj>\n";
+    }
+
+    foreach $item (@items) {
+      my $jc = JSON::PP->new->ascii->pretty->allow_nonref;
+      my $conv = $jc->decode($item);
+      convert_json($conv);
+      my $result = XMLout($conv, SuppressEmpty => undef);
+
+      # remove newlines, tabs, space between tokens, compress runs of spaces
+      $result =~ s/\r/ /g;
+      $result =~ s/\n/ /g;
+      $result =~ s/\t//g;
+      $result =~ s/ +/ /g;
+      $result =~ s/> +</></g;
+
+      # remove <opt> flanking object
+      if ( $result =~ /<opt>\s*?</ and $result =~ />\s*?<\/opt>/ ) {
+        $result =~ s/<opt>\s*?</</g;
+        $result =~ s/>\s*?<\/opt>/>/g;
+      }
+
+      # restore newlines between objects
+      $result =~ s/> *?</>\n</g;
+
+      print "$result\n";
+    }
+
+    if ( defined($obj) && $obj ne "" ) {
+      print "</$obj>\n";
+    }
+  }
+
+  if ( $type eq "xml2json" || $type eq "-xml2json" || $type eq "x2j" || $type eq "-x2j" ) {
+
+    # convert XML to JSON
+
+    my $xc = new XML::Simple(KeepRoot => 1);
+    my $conv = $xc->XMLin($data);
+    convert_json($conv);
+    my $jc = JSON::PP->new->ascii->pretty->allow_nonref;
+    my $result = $jc->encode($conv);
+
+    $data = "$result";
+
+    print "$data\n";
+  }
+}
+
+# send actual query
+
+sub do_nquire_post {
+
+  $urlx = shift (@_);
+  $argx = shift (@_);
+
+  $rslt = "";
+
+  if ( $debug ) {
+    if ( $argx ne "" ) {
+      print STDERR "URL: $urlx?$argx\n\n";
+    } else {
+      print STDERR "URL: $urlx\n\n";
+    }
+  }
+
+  if ( $http eq "get" or $http eq "GET" ) {
+    if ( $argx ne "" ) {
+      $urlx .= "?";
+      $urlx .= "$argx";
+    }
+
+    $usragnt = new LWP::UserAgent (timeout => 300);
+    $usragnt->agent( "$agent" );
+
+    $res = $usragnt->get ( $urlx );
+
+    if ( $res->is_success) {
+      $rslt = $res->content;
+    } elsif ( $debug ) {
+      print STDERR "STATUS: " . $res->status_line . "\n";
+    }
+
+    if ( $rslt eq "" and $debug ) {
+      print STDERR "No do_get output returned from '$urlx'\n";
+    }
+
+    if ( $debug ) {
+      print STDERR "$rslt\n";
+    }
+
+    return $rslt;
+  }
+
+  $usragnt = new LWP::UserAgent (timeout => 300);
+  $usragnt->agent( "$agent" );
+
+  $req = new HTTP::Request POST => "$urlx";
+  $req->content_type('application/x-www-form-urlencoded');
+  $req->content("$argx");
+
+  $res = $usragnt->request ( $req );
+
+  if ( $res->is_success) {
+    $rslt = $res->content;
+  } elsif ( $debug ) {
+    print STDERR "STATUS: " . $res->status_line . "\n";
+  }
+
+  if ( $rslt eq "" && $debug ) {
+    if ( $argx ne "" ) {
+      $urlx .= "?";
+      $urlx .= "$argx";
+    }
+    print STDERR "No do_post output returned from '$urlx'\n";
+  }
+
+  if ( $debug ) {
+    print STDERR "$rslt\n";
+  }
+
+  return $rslt;
+}
+
+# uri_escape with backslash exceptions
+
+sub do_uri_escape {
+
+  $patx = shift (@_);
+
+  $rslt = "";
+
+  while ( $patx ne "" ) {
+    if ( $patx =~ /^\\\\(.+)/ ) {
+      $rslt .= "\\";
+      $patx = $1;
+    } elsif ( $patx =~ /^\\(.)(.+)/ ) {
+      $rslt .= $1;
+      $patx = $2;
+    } elsif ( $patx =~ /^(.)(.+)/ ) {
+      $rslt .= uri_escape ($1);
+      $patx = $2;
+    } elsif ( $patx =~ /^(.)/ ) {
+      $rslt .= uri_escape ($1);
+      $patx = "";
+    }
+  }
+
+  return $rslt;
+}
+
+# nquire executes an external URL query from command line arguments
+
+my $nquire_help = qq{
+Query Commands
+
+  -ftp         Uses FTP instead of HTTP
+  -get         Uses HTTP GET instead of POST
+  -url         Base URL for external search
+
+Documentation
+
+  -help        Print this document
+  -examples    Examples of advanced queries
+  -version     Print version number
+
+Examples
+
+  nquire -get "http://collections.mnh.si.edu/services/resolver/resolver.php" \\
+    -voucher "Birds:625456" |
+  xtract -pattern Result -element ScientificName Country
+
+  nquire -get http://w1.weather.gov/xml/current_obs/KSFO.xml |
+  xtract -pattern current_observation -tab "\\n" \\
+    -element weather temp_f wind_dir wind_mph
+
+  nquire -url "https://eutils.ncbi.nlm.nih.gov/entrez/eutils" elink.fcgi \\
+    -dbfrom pubmed -db pubmed -cmd neighbor -linkname pubmed_pubmed -id 2539356
+
+  nquire -eutils efetch.fcgi -db pubmed -id 2539356 -rettype medline -retmode text
+
+  nquire -eutils esummary.fcgi -db pubmed -id 2539356 -version 2.0
+
+  nquire -eutils esearch.fcgi -db pubmed -term "tn3 transposition immunity" |
+  xtract -pattern eSearchResult -element QueryTranslation
+
+  nquire -bioc-pubmed 17299597 |
+  xtract -pattern collection -block passage -if infon -equals title -element text
+
+  nquire -bioc-pmc 1790863 |
+  xtract -pattern collection -block passage -if infon -equals abstract -tab "\\n" -element text
+
+  nquire -ftp ftp.ncbi.nlm.nih.gov pub/gdp ideogram_9606_GCF_000001305.14_850_V1 |
+  grep acen | cut -f 1,2,6,7 | grep "^X\\t"
+
+};
+
+my $nquire_examples = qq{
+Medical Subject Headings
+
+  nquire -get "http://id.nlm.nih.gov/mesh/sparql" \\
+    -query "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \\
+      SELECT DISTINCT ?class FROM <http://id.nlm.nih.gov/mesh> \\
+      WHERE { ?s rdf:type ?class } ORDER BY ?class" |
+  xtract -pattern result -pfx "meshv:" -first "uri[http://id.nlm.nih.gov/mesh/vocab#|]"
+
+  meshv:AllowedDescriptorQualifierPair
+  meshv:CheckTag
+  meshv:Concept
+  meshv:DisallowedDescriptorQualifierPair
+  meshv:GeographicalDescriptor
+  meshv:PublicationType
+  meshv:Qualifier
+  meshv:SCR_Chemical
+  meshv:SCR_Disease
+  meshv:SCR_Organism
+  meshv:SCR_Protocol
+  meshv:Term
+  meshv:TopicalDescriptor
+  meshv:TreeNumber
+
+MeSH Predicates
+
+  nquire -get "http://id.nlm.nih.gov/mesh/sparql" \\
+    -query "SELECT DISTINCT ?p FROM <http://id.nlm.nih.gov/mesh> WHERE { ?s ?p ?o } ORDER BY ?p" |
+  xtract -pattern result -pfx "meshv:" -first "uri[http://id.nlm.nih.gov/mesh/vocab#|]"
+
+  meshv:abbreviation
+  meshv:active
+  meshv:allowableQualifier
+  meshv:altLabel
+  meshv:annotation
+  meshv:broaderConcept
+  meshv:broaderDescriptor
+  meshv:broaderQualifier
+  meshv:casn1_label
+  meshv:concept
+  meshv:considerAlso
+  meshv:dateCreated
+  meshv:dateEstablished
+  meshv:dateRevised
+  meshv:entryVersion
+  meshv:frequency
+  meshv:hasDescriptor
+  meshv:hasQualifier
+  meshv:historyNote
+  meshv:identifier
+  meshv:indexerConsiderAlso
+  meshv:lastActiveYear
+  meshv:lexicalTag
+  meshv:mappedTo
+  meshv:narrowerConcept
+  meshv:nlmClassificationNumber
+  meshv:note
+  meshv:onlineNote
+  meshv:parentTreeNumber
+  meshv:pharmacologicalAction
+  meshv:prefLabel
+  meshv:preferredConcept
+  meshv:preferredMappedTo
+  meshv:preferredTerm
+  meshv:previousIndexing
+  meshv:publicMeSHNote
+  meshv:registryNumber
+  meshv:relatedConcept
+  meshv:relatedRegistryNumber
+  meshv:scopeNote
+  meshv:seeAlso
+  meshv:sortVersion
+  meshv:source
+  meshv:term
+  meshv:thesaurusID
+  meshv:treeNumber
+  meshv:useInstead
+
+WikiData Predicate List
+
+  nquire -url "https://query.wikidata.org/sparql" \\
+    -query "SELECT ?property ?propertyType ?propertyLabel \\
+      ?propertyDescription ?propertyAltLabel WHERE { \\
+      ?property wikibase:propertyType ?propertyType . SERVICE wikibase:label \\
+      { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } } \\
+      ORDER BY ASC(xsd:integer(STRAFTER(STR(?property), 'P')))" |
+  xtract -pattern result -first "uri[http://www.wikidata.org/entity/|]" -first literal
+
+Selected WikiData Predicates
+
+  P6       head of government
+  P16      highway system
+  P17      country
+  P19      place of birth
+  P21      sex or gender
+  P22      father
+  P25      mother
+  P26      spouse
+  P30      continent
+  P31      instance of
+  P35      head of state
+  P36      capital
+  P40      child
+  P105     taxon rank
+  P660     EC enzyme classification
+  P672     MeSH Code
+  P680     molecular function
+  P681     cell component
+  P682     biological process
+  P685     NCBI Taxonomy ID
+  P698     PubMed ID
+  P699     Disease Ontology ID
+  P932     PMCID
+  P1340    eye color
+  P2067    mass
+  P2410    WikiPathways ID
+  P2888    exact match
+
+Vitamin Binding Site
+
+  nquire -get "http://www.wikidata.org/entity/Q22679758" |
+  transmute -j2x |
+  xtract -pattern entities -group claims -block P527 -element "value\@id"
+
+Children of JS Bach
+
+  nquire -url "https://query.wikidata.org/sparql" \\
+    -query "SELECT ?child ?childLabel WHERE \\
+      { ?child wdt:P22 wd:Q1339. SERVICE wikibase:label \\
+        { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } }" |
+  xtract -pattern result -block binding -if "\@name" -equals childLabel -element literal
+
+Eye Color Frequency
+
+  nquire -url "https://query.wikidata.org/sparql" \\
+    -query "SELECT ?eyeColorLabel WHERE \\
+      { ?human wdt:P31 wd:Q5. ?human wdt:P1340 ?eyeColor. SERVICE wikibase:label \\
+        { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } }" |
+  xtract -pattern result -element literal |
+  sort-uniq-count-rank
+
+Federated Query
+
+  nquire -url "https://query.wikidata.org/sparql" \\
+    -query " \\
+      PREFIX wp:      <http://vocabularies.wikipathways.org/wp#> \\
+      PREFIX dcterms:  <http://purl.org/dc/terms/> \\
+      PREFIX dc:      <http://purl.org/dc/elements/1.1/> \\
+      SELECT DISTINCT ?metabolite1Label ?metabolite2Label ?mass1 ?mass2 WITH { \\
+        SELECT ?metabolite1 ?metabolite2 WHERE { \\
+          ?pathwayItem wdt:P2410 'WP706'; \\
+                       wdt:P2888 ?pwIri. \\
+          SERVICE <http://sparql.wikipathways.org/> { \\
+            ?pathway dc:identifier ?pwIri. \\
+            ?interaction rdf:type wp:Interaction; \\
+                         wp:participants ?wpmb1, ?wpmb2; \\
+                         dcterms:isPartOf ?pathway. \\
+            FILTER (?wpmb1 != ?wpmb2) \\
+            ?wpmb1 wp:bdbWikidata ?metabolite1. \\
+            ?wpmb2 wp:bdbWikidata ?metabolite2. \\
+          } \\
+        } \\
+      } AS %metabolites WHERE { \\
+        INCLUDE %metabolites. \\
+        ?metabolite1 wdt:P2067 ?mass1. \\
+        ?metabolite2 wdt:P2067 ?mass2. \\
+        SERVICE wikibase:label { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } \\
+      }" |
+  xtract -pattern result -block binding -element "binding\@name" literal
+
+BioThings Queries
+
+  nquire -get -j2x -url "http://mygene.info/v3" query -q "pathway.wikipathways.id:WP455" -fetch_all true |
+  xtract -pattern hits -element \@_id
+
+  nquire -j2x -url "http://mygene.info/v3" query -q "WP455" -scopes "pathway.wikipathways.id" -size 300 |
+  xtract -pattern anon -element \@_id
+
+  nquire -variant variant "chr6:g.26093141G>A" -fields dbsnp.gene |
+  xtract -pattern gene -element \@geneid
+
+  nquire -gene query -q "symbol:OPN1MW" -species 9606 |
+  xtract -pattern hits -element \@_id
+
+  nquire -gene query -q "symbol:OPN1MW AND taxid:9606" |
+  xtract -pattern hits -element \@_id
+
+  nquire -gene gene 2652 -fields pathway.wikipathways |
+  xtract -pattern pathway -element \@id
+
+  nquire -gene query -q "pathway.wikipathways.id:WP455" -size 300 |
+  xtract -pattern hits -element \@_id
+
+  nquire -chem query -q "drugbank.targets.uniprot:P05231 AND drugbank.targets.actions:inhibitor" -fields hgvs |
+  xtract -pattern hits -element \@_id
+
+  nquire -get "http://myvariant.info/v1/variant/chr6:g.26093141G>A" \\
+    -fields clinvar.rcv.conditions.identifiers \\
+    -always_list clinvar.rcv.conditions.identifiers |
+  xtract -j2x |
+  xtract -biopath opt clinvar.rcv.conditions.identifiers.omim
+
+  cat uniprots.xml |
+  xtract -pattern ENTREZ_EXTEND -sep "\n" -element Id |
+  while read uid
+  do
+    echo "UID \$uid"
+    echo "\$uid" | xplore -load uniprot | xplore -link inchikey
+    echo ""
+  done
+
+EDirect Expansion
+
+  ExtractIDs() {
+    xtract -pattern BIO_THINGS -block Id -tab "\\n" -element Id
+  }
+
+  WrapIDs() {
+    xtract -wrp BIO_THINGS -pattern opt -wrp Type -lbl "\$1" \\
+      -wrp Count -num "\$2" -block "\$2" -wrp Id -element "\$3" |
+    xtract -format
+  }
+
+  nquire -gene query -q "symbol:OPN1MW AND taxid:9606" |
+  WrapIDs entrezgene hits "\@entrezgene" |
+
+  ExtractIDs |
+  while read geneid
+  do
+    nquire -gene gene "\$geneid" -fields pathway.wikipathways
+  done |
+  WrapIDs pathway.wikipathways.id pathway "\@id" |
+
+  ExtractIDs |
+  while read pathid
+  do
+    nquire -gene query -q "pathway.wikipathways.id:\$pathid" -size 300
+  done |
+  WrapIDs entrezgene hits "\@entrezgene" |
+
+  ExtractIDs |
+  sort -n
+
+};
+
+my @pubchem_properties = qw(
+  MolecularFormula
+  MolecularWeight
+  CanonicalSMILES
+  IsomericSMILES
+  InChI
+  InChIKey
+  IUPACName
+  XLogP
+  ExactMass
+  MonoisotopicMass
+  TPSA
+  Complexity
+  Charge
+  HBondDonorCount
+  HBondAcceptorCount
+  RotatableBondCount
+  HeavyAtomCount
+  IsotopeAtomCount
+  AtomStereoCount
+  DefinedAtomStereoCount
+  UndefinedAtomStereoCount
+  BondStereoCount
+  DefinedBondStereoCount
+  UndefinedBondStereoCount
+  CovalentUnitCount
+  Volume3D
+  XStericQuadrupole3D
+  YStericQuadrupole3D
+  ZStericQuadrupole3D
+  FeatureCount3D
+  FeatureAcceptorCount3D
+  FeatureDonorCount3D
+  FeatureAnionCount3D
+  FeatureCationCount3D
+  FeatureRingCount3D
+  FeatureHydrophobeCount3D
+  ConformerModelRMSD3D
+  EffectiveRotorCount3D
+  ConformerCount3D
+  Fingerprint2D
+);
+
+sub nqir {
+
+  %macros = ();
+  $agent = "Nquire/1.0";
+  $alias = "";
+  $debug = false;
+  $http = "";
+  $j2x = false;
+  $x2j = false;
+  $output = "";
+
+  # nquire -url http://... -tag value -tag value | ...
+
+  $url = "";
+  $arg = "";
+  $pfx = "";
+  $amp = "";
+  $pat = "";
+  $sfx = "";
+
+  @args = @ARGV;
+  $max = scalar @args;
+
+  %biothingsHash = (
+    '-gene'     =>  'http://mygene.info/v3',
+    '-variant'  =>  'http://myvariant.info/v1',
+    '-chem'     =>  'http://mychem.info/v1',
+  );
+
+  if ( $max < 1 ) {
+    return;
+  }
+
+  if ( $ARGV[0] eq "-version" ) {
+    print "$version\n";
+    return;
+  }
+
+  if ( $ARGV[0] eq "-help" ) {
+    print "nquire $version\n";
+    print $nquire_help;
+    return;
+  }
+
+  # -examples prints advanced sparql queries (undocumented)
+
+  if ( $ARGV[0] eq "-examples" or $ARGV[0] eq "-example" or $ARGV[0] eq "-extras" or $ARGV[0] eq "-extra" ) {
+    print "nquire $version\n";
+    print $nquire_examples;
+    return;
+  }
+
+  if ( $max < 2 ) {
+    return;
+  }
+
+  $i = 0;
+
+  # if present, -debug must be first argument, only prints generated URL (undocumented)
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-debug" ) {
+      $i++;
+      $debug = true;
+    }
+  }
+
+  # if present, -delay must be next (if not using -eutils shortcut)
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-delay" ) {
+      $i++;
+      # add 1/3 second sleep to avoid server limit (undocumented)
+      Time::HiRes::usleep(350000);
+    }
+  }
+
+  # if present, -ftp must be next
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-ftp" ) {
+      $i++;
+      if ( $i < $max ) {
+        my $server = $args[$i];
+        if ( $server =~ /^ftp:\/\/(.+)/ ) {
+          $server = $1;
+        }
+        $i++;
+        if ( $i < $max ) {
+          my $dir = $args[$i];
+          $i++;
+          if ( $i < $max ) {
+            my $fl = $args[$i];
+
+            my $ftp = new Net::FTP($server, Passive => 1)
+              or die "Unable to connect to FTP server: $!";
+
+            $ftp->login or die "Unable to log in to FTP server: ", $ftp->message;
+            $ftp->cwd($dir) or die "Unable to change to $dir: ", $ftp->message;
+            $ftp->binary or warn "Unable to set binary mode: ", $ftp->message;
+
+            if (! $ftp->get($fl, "/dev/stdout") ) {
+              my $msg = $ftp->message;
+              chomp $msg;
+              print STDERR "\nFAILED TO DOWNLOAD:\n\n$fl ($msg\n";
+            }
+          }
+        }
+      }
+      return;
+    }
+  }
+
+  # if present, -http get or -get must be next (now also allow -http post or -post)
+
+  # nquire -get -url "http://collections.mnh.si.edu/services/resolver/resolver.php" -voucher "Birds:625456"
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-http" ) {
+      $i++;
+      if ( $i < $max ) {
+        $http = $args[$i];
+        $i++;
+      }
+    } elsif ( $pat eq "-get" ) {
+      $http = "get";
+      $pat = $args[$i + 1];
+      # allow URL argument immediately after -get
+      if ( $pat =~ /^-(.+)/ ) {
+        $i++;
+      }
+    } elsif ( $pat eq "-post" ) {
+      $http = "post";
+      $pat = $args[$i + 1];
+      # allow URL argument immediately after -post
+      if ( $pat =~ /^-(.+)/ ) {
+        $i++;
+      }
+    }
+  }
+
+  # if present, -agent must be next argument (undocumented)
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-agent" ) {
+      $i++;
+      if ( $i < $max ) {
+        $agent = $args[$i];
+        $i++;
+      }
+    }
+  }
+
+  # if present, -j2x or -x2j must be next argument (undocumented)
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-j2x" ) {
+      $i++;
+      $j2x = true;
+    } elsif ( $pat eq "-x2j" ) {
+      $i++;
+      $x2j = true;
+    }
+  }
+
+  # read file of keyword shortcuts for URL expansion
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-alias" ) {
+      $i++;
+      if ( $i < $max ) {
+        $alias = $args[$i];
+        if ( $alias ne "" ) {
+          read_aliases ();
+        }
+        $i++;
+      }
+    }
+  }
+
+  # read URL
+
+  # -get or -post can now be followed immediately by the URL, without a -url argument
+
+  # nquire -get "http://collections.mnh.si.edu/services/resolver/resolver.php" -voucher "Birds:625456"
+
+  if ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat eq "-url" or $pat eq "-get" or $pat eq "-post" ) {
+      $i++;
+      if ( $i < $max ) {
+        $url = $args[$i];
+        $url = map_macros ($url);
+        $i++;
+      }
+    } elsif ( $pat eq "-ncbi" ) {
+      # shortcut for ncbi base (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $url = "https://www.ncbi.nlm.nih.gov";
+      }
+    } elsif ( $pat eq "-eutils" ) {
+      # shortcut for eutils base (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+        # add 1/3 second sleep to avoid server limit (undocumented)
+        Time::HiRes::usleep(350000);
+      }
+    } elsif ( $pat eq "-test" ) {
+      # shortcut for eutilstest base (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $url = "https://eutilstest.ncbi.nlm.nih.gov/entrez/eutils";
+      }
+    } elsif ( $pat eq "-qa" ) {
+      # shortcut for eutils QA base (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $url = "http://qa.ncbi.nlm.nih.gov/entrez/eutils";
+      }
+
+    } elsif ( $pat eq "-hydra" ) {
+      # internal citation match request (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $url = "https://www.ncbi.nlm.nih.gov/projects/hydra/hydra_search.cgi";
+        $pat = $args[$i];
+        $pat = map_macros ($pat);
+        $enc = do_uri_escape ($pat);
+        $arg="search=pubmed_search_citation_top_20.1&query=$enc";
+        $amp = "&";
+        $i++;
+      }
+
+    } elsif ( $pat eq "-revhist" ) {
+      # internal sequence revision history request (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $url = "https://www.ncbi.nlm.nih.gov/sviewer/girevhist.cgi";
+        $pat = $args[$i];
+        $arg="cmd=seqid&txt=on&seqid=asntext&os=PUBSEQ_OS&val=$pat";
+        $amp = "&";
+        $i++;
+      }
+
+    } elsif ( $pat eq "-pubchem" ) {
+      # shortcut for PubChem Power User Gateway REST service base (undocumented)
+      # nquire -pubchem "compound/name/creatine/property" "IUPACName,MolecularWeight,MolecularFormula" "XML"
+      $i++;
+      if ( $i < $max ) {
+        $url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug";
+        if ( $i + 2 == $max && $args[$i] eq "compound" ) {
+          # even shorter shortcut
+          # nquire -pubchem compound creatine
+          $pat = $args[$i + 1];
+          if ( $pat =~ /^-(.+)/ ) {
+          } elsif ( $pat !~ /\// ) {
+            $i = $i + 2;
+            $url .= "/compound/name/";
+            $pat = map_macros ($pat);
+            $url .= $pat;
+            $url .= "/property/";
+            $sfx = join(",", @pubchem_properties);
+            $url .= $sfx;
+            $url .= "/XML";
+          }
+        }
+      }
+
+    } elsif ( $pat eq "-bioc-pubmed" ) {
+      # shortcut for BioC on PubMed (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $id = $args[$i];
+        $http = "get";
+        $url = "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pubmed.cgi/BioC_xml/$id/unicode";
+        $amp = "&";
+        $i++;
+      }
+    } elsif ( $pat eq "-bioc-pmc" ) {
+      # shortcut for BioC on PMC (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $id = $args[$i];
+        if ( $id !~ /^PMC/ ) {
+          # add PMC prefix if not already in argument
+          $id = "PMC" . $id;
+        }
+        $http = "get";
+        $url = "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_xml/$id/unicode";
+        $amp = "&";
+        $i++;
+      }
+
+    } elsif ( $pat eq "-biocxml-pubmed" ) {
+      # shortcut for annotated PubMed BioC on PubTator (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $id = $args[$i];
+        $http = "get";
+        $url = "https://www.ncbi.nlm.nih.gov/research/pubtator-api/publications/export/biocxml?pmids=$id";
+        $amp = "&";
+        $i++;
+      }
+    } elsif ( $pat eq "-biocxml-pmc" ) {
+      # shortcut for annotated PMC BioC on PubTator (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $id = $args[$i];
+        if ( $id !~ /^PMC/ ) {
+          # add PMC prefix if not already in argument
+          $id = "PMC" . $id;
+        }
+        $http = "get";
+        $url = "https://www.ncbi.nlm.nih.gov/research/pubtator-api/publications/export/biocxml?pmcids=$id";
+        $amp = "&";
+        $i++;
+      }
+
+    } elsif ( defined $biothingsHash{$pat} ) {
+      # shortcuts for biothings services (undocumented)
+      $i++;
+      $url = $biothingsHash{$pat};
+      if ( $http eq "" ) {
+          $http = "get";
+      }
+      $j2x = true;
+
+    } elsif ( $pat eq "-wikipathways" ) {
+      # shortcut for webservice.wikipathways.org (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $url = "http://webservice.wikipathways.org";
+      }
+
+    } elsif ( $pat eq "-biosample" ) {
+      # internal biosample_chk request on live database (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $http = "get";
+        $url = "https://api-int.ncbi.nlm.nih.gov/biosample/fetch";
+        $bid = $args[$i];
+        $arg="format=source&id=$bid";
+        $amp = "&";
+        $i++;
+      }
+    } elsif ( $pat eq "-biosample-dev" ) {
+      # internal biosample_chk request on development database (undocumented)
+      $i++;
+      if ( $i < $max ) {
+        $http = "get";
+        $url = "https://dev-api-int.ncbi.nlm.nih.gov/biosample/fetch";
+        $bid = $args[$i];
+        $arg="format=source&id=$bid";
+        $amp = "&";
+        $i++;
+      }
+    }
+  }
+
+  if ( $url eq "" ) {
+    return;
+  }
+
+  # hard-coded URL aliases for common NCBI web sites
+
+  if ( $url =~ /\(#/ ) {
+
+    $ky = "ncbi_url";
+    if ( $url =~ /\(#$ky\)/ ) {
+      $vl = "https://www.ncbi.nlm.nih.gov";
+      $url =~ s/\((\#$ky)\)/$vl/g;
+    }
+
+    $ky = "eutils_url";
+    if ( $url =~ /\(#$ky\)/ ) {
+      $vl = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+      $url =~ s/\((\#$ky)\)/$vl/g;
+    }
+  }
+
+  # arguments before next minus are added to base URL as /value
+
+  $go_on = true;
+  while ( $i < $max and $go_on ) {
+    $pat = $args[$i];
+    if ( $pat =~ /^-(.+)/ ) {
+      $go_on = false;
+    } else {
+      $pat = map_macros ($pat);
+      $url .= "/" . $pat;
+      $i++;
+    }
+  }
+
+  # now expect tag with minus and value[s] without, add as &tag=value[,value]
+
+  while ( $i < $max ) {
+    $pat = $args[$i];
+    if ( $pat =~ /^-(.+)/ ) {
+      $pat = $1;
+      $pfx = $amp . "$pat=";
+      $amp = "";
+    } else {
+      $pat =~ s/^\\-/-/g;
+      $pat = map_macros ($pat);
+      $enc = do_uri_escape ($pat);
+      $arg .= $pfx . $enc;
+      $pfx = ",";
+      $amp = "&";
+    }
+    $i++;
+  }
+
+  # perform query
+  $output = do_nquire_post ($url, $arg);
+
+  if ( $j2x ) {
+    my $jc = JSON::PP->new->ascii->pretty->allow_nonref;
+    my $conv = $jc->decode($output);
+    convert_json($conv);
+    my $result = XMLout($conv, SuppressEmpty => undef);
+
+    # remove newlines, tabs, space between tokens, compress runs of spaces
+    $result =~ s/\r/ /g;
+    $result =~ s/\n/ /g;
+    $result =~ s/\t//g;
+    $result =~ s/ +/ /g;
+    $result =~ s/> +</></g;
+
+    # remove <opt> flanking object
+    if ( $result =~ /<opt>\s*?</ and $result =~ />\s*?<\/opt>/ ) {
+      $result =~ s/<opt>\s*?</</g;
+      $result =~ s/>\s*?<\/opt>/>/g;
+    }
+
+    $output = "$result";
+
+    # restore newlines between objects
+    $output =~ s/> *?</>\n</g;
+
+    binmode(STDOUT, ":utf8");
+  }
+
+  if ( $x2j ) {
+    my $xc = new XML::Simple(KeepRoot => 1);
+    my $conv = $xc->XMLin($output);
+    convert_json($conv);
+    my $jc = JSON::PP->new->ascii->pretty->allow_nonref;
+    my $result = $jc->encode($conv);
+
+    $output = "$result";
+  }
+
+  print "$output";
+}
+
 #  etest is an unadvertised function for development
 
 sub etest {
@@ -4974,6 +7303,18 @@ if ( scalar @ARGV > 0 and $ARGV[0] eq "-version" ) {
   entfy ();
 } elsif ( $fnc eq "-address" ) {
   eaddr ();
+} elsif ( $fnc eq "-blast" ) {
+  eblst ();
+} elsif ( $fnc eq "-ftpls" ) {
+  ftls ();
+} elsif ( $fnc eq "-aspls" ) {
+  asls ();
+} elsif ( $fnc eq "-ftpcp" ) {
+  ftcp ();
+} elsif ( $fnc eq "-tmute" ) {
+  tmut ();
+} elsif ( $fnc eq "-nquir" ) {
+  nqir ();
 } elsif ( $fnc eq "-test" ) {
   etest ();
 } else {
@@ -4985,3 +7326,5 @@ if ( scalar @ARGV > 0 and $ARGV[0] eq "-version" ) {
 close (STDIN);
 close (STDOUT);
 close (STDERR);
+
+exit $result;

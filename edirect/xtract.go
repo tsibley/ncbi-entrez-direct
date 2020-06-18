@@ -32,11 +32,20 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"github.com/fatih/color"
+	"github.com/gedex/inflector"
+	"github.com/klauspost/cpuid"
+	"github.com/pbnjay/memory"
 	"github.com/surgebase/porter2"
 	"html"
+	"io"
 	"math"
 	"os"
+	"path"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
@@ -50,7 +59,7 @@ import (
 
 // XTRACT VERSION AND HELP MESSAGE TEXT
 
-const xtractVersion = "8.70"
+const xtractVersion = "13.7"
 
 const xtractHelp = `
 Overview
@@ -66,7 +75,7 @@ Overview
 Processing Flags
 
   -strict          Remove HTML and MathML tags
-  -mixed           Allow PubMed mixed content
+  -mixed           Allow mixed content XML
 
   -accent          Excise Unicode accents and diacritical marks
   -ascii           Unicode to numeric HTML character entities
@@ -77,6 +86,7 @@ Processing Flags
 Data Source
 
   -input           Read XML from file instead of stdin
+  -transform       File of substitutions for -translate
 
 Exploration Argument Hierarchy
 
@@ -85,11 +95,17 @@ Exploration Argument Hierarchy
   -block               names allows command-line
   -subset                control of nested looping
 
+Path Navigation
+
+  -path            Explore by list of adjacent object names
+
 Exploration Constructs
 
   Object           DateRevised
   Parent/Child     Book/AuthorList
+  Path             MedlineCitation/Article/Journal/JournalIssue/PubDate
   Heterogeneous    "PubmedArticleSet/*"
+  Exhaustive       "History/**"
   Nested           "*/Taxon"
   Recursive        "**/Gene-commentary"
 
@@ -100,16 +116,25 @@ Conditional Execution
   -and             All tests must pass
   -or              Any passing test suffices
   -else            Execute if conditional test failed
-  -position        [first|last|outer|inner|all]
-  -select          Select record subset by conditions
+  -position        [first|last|outer|inner|even|odd|all]
 
 String Constraints
 
   -equals          String must match exactly
   -contains        Substring must be present
+  -is-within       String must be present
   -starts-with     Substring must be at beginning
   -ends-with       Substring must be at end
   -is-not          String must not match
+  -is-before       First string < second string
+  -is-after        First string > second string
+  -matches         Matches without commas or semicolons
+  -resembles       Requires all words, but in any order
+
+Object Constraints
+
+  -is-equal-to     Object values must match
+  -differs-from    Object values must differ
 
 Numeric Constraints
 
@@ -127,14 +152,20 @@ Format Customization
   -sep             Separator between group members
   -pfx             Prefix to print before group
   -sfx             Suffix to print after group
+  -rst             Reset -sep through -elg
   -clr             Clear queued tab separator
   -pfc             Preface combines -clr and -pfx
-  -plg             Prologue to print once before elements
-  -elg             Epilogue to print once after elements
-  -wrp             Wrap elements in XML object
-  -rst             Reset -sep, -pfx, -sfx, -plg, and -elg
+  -deq             Delete and replace queued tab separator
   -def             Default placeholder for missing fields
   -lbl             Insert arbitrary text
+
+XML Generation
+
+  -wrp             Wrap elements in XML object
+  -plg             Prologue to print before elements
+  -elg             Epilogue to print after elements
+  -fwd             Foreword to print before set
+  -awd             Afterword to print after set
 
 Element Selection
 
@@ -148,10 +179,11 @@ Element Selection
   Tag              Caption
   Group            Initials,LastName
   Parent/Child     MedlineCitation/PMID
+  Recursive        "**/Gene-commentary_accession"
+  Unrestricted     "PubDate/*"
   Attribute        DescriptorName@MajorTopicYN
   Range            MedlineDate[1:4]
   Substring        "Title[phospholipase | rattlesnake]"
-  Recursive        "**/Gene-commentary_accession"
   Object Count     "#Author"
   Item Length      "%Title"
   Element Depth    "^PMID"
@@ -160,6 +192,7 @@ Element Selection
 Special -element Operations
 
   Parent Index     "+"
+  Object Name      "?"
   XML Subtree      "*"
   Children         "$"
   Attributes       "@"
@@ -177,28 +210,39 @@ Numeric Processing
   -avg             Average
   -dev             Deviation
   -med             Median
+  -mul             Product
+  -div             Quotient
+  -mod             Remainder
   -bin             Binary
   -bit             Bit Count
 
 String Processing
 
   -encode          URL-encode <, >, &, ", and ' characters
+  -decode          Base64 decoding
+  -plain           Remove embedded mixed-content markup tags
   -upper           Convert text to upper-case
   -lower           Convert text to lower-case
+  -chain           Change_spaces_to_underscores
   -title           Capitalize initial letters of words
+  -order           Rearrange words in sorted order
+  -year            Extract first 4-digit year from string
+  -translate       Substitute values with -transform table
 
-Phrase Processing
+Text Processing
 
-  -terms           Partition phrase at spaces
+  -terms           Partition text at spaces
   -words           Split at punctuation marks
   -pairs           Adjacent informative words
+  -reverse         Reverse words in string
   -letters         Separate individual letters
-  -indices         Index normalized words
-  -e2index         Entrez index generation
+  -clauses         Break at phrase separators
 
 Sequence Processing
 
   -revcomp         Reverse-complement nucleotide sequence
+  -nucleic         Subrange determines forward or revcomp
+  -molwt           Calculate molecular weight of peptide
 
 Sequence Coordinates
 
@@ -215,7 +259,16 @@ Command Generator
   Descriptors      INSDSeq_sequence INSDSeq_definition INSDSeq_division
   Flags            [complete|partial]
   Feature(s)       CDS,mRNA
-  Qualifiers       INSDFeature_key "#INSDInterval" gene product
+  Qualifiers       INSDFeature_key "#INSDInterval" gene product sub_sequence
+
+Frequency Table
+
+  -histogram       Collects data for sort-uniq-count on entire set of records
+
+Entrez Indexing
+
+  -e2index         Create Entrez index XML
+  -indices         Index normalized words
 
 Miscellaneous
 
@@ -237,6 +290,10 @@ Modification
                      [retain|remove|encode|decode|shrink|expand|accent]
                        [content|cdata|comment|object|attributes|container]
 
+Efetch Normalization
+
+  -normalize      [database]
+
 Validation
 
   -verify          Report XML data integrity problems
@@ -244,7 +301,35 @@ Validation
 Summary
 
   -outline         Display outline of XML structure
-  -synopsis        Display count of unique XML paths
+  -synopsis        Display individual XML paths
+  -contour         Display XML paths to leaf nodes
+                     [delimiter]
+
+Record Selection
+
+  -select          Select record subset by conditions
+  -retaining       File of identifiers to use for selection
+  -excluding       Exclude records listed in identifier file
+  -appending       Identifier-tab-metadata must be in record order
+
+Record Rearrangement
+
+  -sort            Element to use as sort key
+
+Data Conversion
+
+  -j2x             Convert JSON stream to XML suitable for -path navigation
+                     [-set setWrapper]
+                     [-rec recordWrapper]
+                     [-nest flat|recurse|plural|depth]
+
+  -t2x             Convert tab-delimited table to XML
+                     [-set setWrapper]
+                     [-rec recordWrapper]
+                     [-skip linesToSkip]
+                     [-lower | -upper]
+                     [-indent | -flush]
+                     XML object names per column
 
 Documentation
 
@@ -260,7 +345,7 @@ Notes
 
   -num and -len selections are synonyms for Object Count (#) and Item Length (%).
 
-  -words, -pairs, and -indices convert to lower case.
+  -words, -pairs, -reverse, and -indices convert to lower case.
 
 Examples
 
@@ -294,11 +379,13 @@ Examples
 
   -if MapLocation -element MapLocation -else -lbl "\-"
 
+  -if inserted_sequence -differs-from deleted_sequence
+
   -min ChrStart,ChrStop
 
   -max ExonCount
 
-  -inc @aaPosition -element @residue
+  -inc position -element inserted_sequence
 
   -1-based ChrStart
 
@@ -310,6 +397,18 @@ Examples
 
   -pattern PubmedArticle -select PubDate/Year -eq 2015
 
+  -pattern PubmedArticle -select MedlineCitation/PMID -retaining file_of_pmids.txt
+
+  -wrp PubmedArticleSet -pattern PubmedArticle -sort MedlineCitation/PMID
+
+  -pattern PubmedArticle -split 5000 -prefix "subset" -suffix "xml"
+
+  -head "<PubmedArticleSet>" -tail "</PubmedArticleSet>" -pattern PubmedArticle -format
+
+  -pattern PubmedBookArticle -path BookDocument.Book.AuthorList.Author -element LastName
+
+  -pattern PubmedArticle -group MedlineCitation/Article/Journal/JournalIssue/PubDate -year "PubDate/*"
+
   -filter ExpXml decode content
 
   -filter LocationHist remove object
@@ -318,7 +417,7 @@ Examples
 `
 
 const xtractInternal = `
-ReadBlocks -> SplitPattern => StreamTokens => ParseXML => ProcessQuery -> MergeResults
+StreamBlocks -> SplitPattern => StreamTokens => ParseXML => ProcessQuery -> MergeResults
 
 Performance Default Overrides
 
@@ -329,6 +428,12 @@ Performance Default Overrides
   -heap     Order restoration heap size
   -farm     Node allocation buffer length
   -gogc     Garbage collection tuning knob
+
+Internal Component Performance
+
+  -chunk    StreamBlocks
+  -split    StreamBlocks -> SplitPattern
+  -token    StreamBlocks -> StreamTokens
 
 Debugging
 
@@ -372,937 +477,39 @@ Processor Titration Results
   7    87467    1030
   8    82448    2651
 
+Entrez Index Performance Measurement
+
+  IndexTrials() {
+    echo -e "<Trials>"
+    for tries in {1..5}
+    do
+      cat "$1" | xtract -debug -proc "$2" -e2index
+    done
+    echo -e "</Trials>"
+  }
+
+  for proc in {1..8}
+  do
+    IndexTrials "carotene.xml" "$proc" |
+    xtract -pattern Trials -lbl "$proc" -avg Rate -dev Rate
+  done
+
+MeSH Tree Index Preparation
+
+  ftp-cp nlmpubs.nlm.nih.gov online/mesh/MESH_FILES/xmlmesh desc2020.zip
+  unzip desc2020.zip
+  rm desc2020.zip
+
+  cat desc2020.xml |
+  xtract -pattern DescriptorRecord -element "DescriptorRecord/DescriptorUI" \
+    -sep "," -element TreeNumber > meshtree.txt
+
 Execution Profiling
 
   cat carotene.xml > /dev/null
   ./xtract -profile -timer -input carotene.xml -pattern PubmedArticle -element LastName > /dev/null
-  go tool pprof --pdf ./xtract ./cpu.pprof > ~/Desktop/callgraph.pdf
+  go tool pprof --pdf ./cpu.pprof > ~/Desktop/callgraph.pdf
   rm cpu.pprof
-`
-
-const xtractExamples = `
-Author Frequency
-
-  esearch -db pubmed -query "rattlesnake phospholipase" |
-  efetch -format docsum |
-  xtract -pattern DocumentSummary -sep "\n" -element Name |
-  sort-uniq-count-rank
-
-  40    Marangoni S
-  32    Toyama MH
-  28    Soares AM
-  25    Bon C
-  ...
-
-Publications
-
-  efetch -db pubmed -id 6271474,5685784,4882854,6243420 -format xml |
-  xtract -pattern PubmedArticle -element MedlineCitation/PMID "#Author" \
-    -block Author -position first -sep " " -element Initials,LastName \
-    -block Article -element ArticleTitle
-
-  6271474    5    MJ Casadaban     Tn3: transposition and control.
-  5685784    2    RK Mortimer      Suppressors and suppressible mutations in yeast.
-  4882854    2    ED Garber        Proteins and enzymes as taxonomic tools.
-  6243420    1    NR Cozzarelli    DNA gyrase and the supercoiling of DNA.
-
-Formatted Authors
-
-  efetch -db pubmed -id 1413997,6301692,781293 -format xml |
-  xtract -pattern PubmedArticle -element MedlineCitation/PMID \
-    -block PubDate -sep "-" -element Year,Month,MedlineDate \
-    -block Author -sep " " -tab "" \
-      -element "&COM" Initials,LastName -COM "(, )"
-
-  1413997    1992-Oct    RK Mortimer, CR Contopoulou, JS King
-  6301692    1983-Apr    MA Krasnow, NR Cozzarelli
-  781293     1976-Jul    MJ Casadaban
-
-Medical Subject Headings
-
-  efetch -db pubmed -id 6092233,2539356,1937004 -format xml |
-  xtract -pattern PubmedArticle -element MedlineCitation/PMID \
-    -block MeshHeading \
-      -subset DescriptorName -pfc "\n" -sep "|" -element @MajorTopicYN,DescriptorName \
-      -subset QualifierName -pfc " / " -sep "|" -element @MajorTopicYN,QualifierName |
-  sed -e 's/N|//g' -e 's/Y|/*/g'
-
-  6092233
-  Base Sequence
-  DNA Restriction Enzymes
-  DNA, Fungal / genetics / *isolation & purification
-  *Genes, Fungal
-  ...
-
-Peptide Sequences
-
-  esearch -db protein -query "conotoxin AND mat_peptide [FKEY]" |
-  efetch -format gpc |
-  xtract -insd complete mat_peptide "%peptide" product peptide |
-  grep -i conotoxin | sort -t $'\t' -u -k 2,2n | head -n 8
-
-  ADB43131.1    15    conotoxin Cal 1b      LCCKRHHGCHPCGRT
-  ADB43128.1    16    conotoxin Cal 5.1     DPAPCCQHPIETCCRR
-  AIC77105.1    17    conotoxin Lt1.4       GCCSHPACDVNNPDICG
-  ADB43129.1    18    conotoxin Cal 5.2     MIQRSQCCAVKKNCCHVG
-  ADD97803.1    20    conotoxin Cal 1.2     AGCCPTIMYKTGACRTNRCR
-  AIC77085.1    21    conotoxin Bt14.8      NECDNCMRSFCSMIYEKCRLK
-  ADB43125.1    22    conotoxin Cal 14.2    GCPADCPNTCDSSNKCSPGFPG
-  AIC77154.1    23    conotoxin Bt14.19     VREKDCPPHPVPGMHKCVCLKTC
-
-Chromosome Locations
-
-  esearch -db gene -query "calmodulin [PFN] AND mammalia [ORGN]" |
-  efetch -format docsum |
-  xtract -pattern DocumentSummary \
-    -def "-" -element Id Name MapLocation ScientificName
-
-  801       CALM1    14q32.11     Homo sapiens
-  808       CALM3    19q13.32     Homo sapiens
-  805       CALM2    2p21         Homo sapiens
-  24242     Calm1    6q32         Rattus norvegicus
-  12313     Calm1    12 E         Mus musculus
-  326597    CALM     -            Bos taurus
-  50663     Calm2    6q12         Rattus norvegicus
-  24244     Calm3    1q21         Rattus norvegicus
-  12315     Calm3    7 9.15 cM    Mus musculus
-  12314     Calm2    17 E4        Mus musculus
-  617095    CALM1    -            Bos taurus
-  396838    CALM3    6            Sus scrofa
-  ...
-
-Gene Regions
-
-  esearch -db gene -query "DDT [GENE] AND mouse [ORGN]" |
-  efetch -format docsum |
-  xtract -pattern GenomicInfoType -element ChrAccVer ChrStart ChrStop |
-  xargs -n 3 sh -c 'efetch -db nuccore -format gb \
-    -id "$0" -chr_start "$1" -chr_stop "$2"'
-
-  LOCUS       NC_000076               2142 bp    DNA     linear   CON 09-FEB-2015
-  DEFINITION  Mus musculus strain C57BL/6J chromosome 10, GRCm38.p3 C57BL/6J.
-  ACCESSION   NC_000076 REGION: complement(75771233..75773374) GPC_000000783
-  VERSION     NC_000076.6
-  ...
-  FEATURES             Location/Qualifiers
-       source          1..2142
-                       /organism="Mus musculus"
-                       /mol_type="genomic DNA"
-                       /strain="C57BL/6J"
-                       /db_xref="taxon:10090"
-                       /chromosome="10"
-       gene            1..2142
-                       /gene="Ddt"
-       mRNA            join(1..159,462..637,1869..2142)
-                       /gene="Ddt"
-                       /product="D-dopachrome tautomerase"
-                       /transcript_id="NM_010027.1"
-       CDS             join(52..159,462..637,1869..1941)
-                       /gene="Ddt"
-                       /codon_start=1
-                       /product="D-dopachrome decarboxylase"
-                       /protein_id="NP_034157.1"
-                       /translation="MPFVELETNLPASRIPAGLENRLCAATATILDKPEDRVSVTIRP
-                       GMTLLMNKSTEPCAHLLVSSIGVVGTAEQNRTHSASFFKFLTEELSLDQDRIVIRFFP
-                       ...
-
-Taxonomic Names
-
-  esearch -db taxonomy -query "txid10090 [SBTR] OR camel [COMN]" |
-  efetch -format docsum |
-  xtract -pattern DocumentSummary -if CommonName \
-    -element Id ScientificName CommonName
-
-  57486    Mus musculus molossinus    Japanese wild mouse
-  39442    Mus musculus musculus      eastern European house mouse
-  35531    Mus musculus bactrianus    southwestern Asian house mouse
-  10092    Mus musculus domesticus    western European house mouse
-  10091    Mus musculus castaneus     southeastern Asian house mouse
-  10090    Mus musculus               house mouse
-  9838     Camelus dromedarius        Arabian camel
-  9837     Camelus bactrianus         Bactrian camel
-
-Structural Similarity
-
-  esearch -db structure -query "crotalus [ORGN] AND phospholipase A2" |
-  elink -related |
-  efilter -query "archaea [ORGN]" |
-  efetch -format docsum |
-  xtract -pattern DocumentSummary \
-    -if PdbClass -equals Hydrolase \
-      -element PdbAcc PdbDescr
-
-  3VV2    Crystal Structure Of Complex Form Between S324a-subtilisin And Mutant Tkpro
-  3VHQ    Crystal Structure Of The Ca6 Site Mutant Of Pro-Sa-Subtilisin
-  2ZWP    Crystal Structure Of Ca3 Site Mutant Of Pro-S324a
-  2ZWO    Crystal Structure Of Ca2 Site Mutant Of Pro-S324a
-  ...
-
-Multiple Links
-
-  esearch -db pubmed -query "conotoxin AND dopamine [MAJR]" |
-  elink -target protein -cmd neighbor |
-  xtract -pattern LinkSet -if Link/Id -element IdList/Id Link/Id
-
-  23624852    17105332
-  14657161    27532980    27532978
-  12944511    31542395
-  11222635    144922602
-
-Gene Comments
-
-  esearch -db gene -query "rbcL [GENE] AND maize [ORGN]" |
-  efetch -format xml |
-  xtract -pattern Entrezgene -block "**/Gene-commentary" \
-    -if Gene-commentary_type@value -equals genomic \
-      -tab "\n" -element Gene-commentary_accession |
-  sort | uniq
-
-  NC_001666
-  X86563
-  Z11973
-
-Vitamin Biosynthesis
-
-  esearch -db pubmed -query "lycopene cyclase" |
-  elink -related |
-  elink -target protein |
-  efilter -organism rodents -source refseq |
-  efetch -format docsum |
-  xtract -pattern DocumentSummary -element AccessionVersion Title |
-  grep -i carotene
-
-  NP_001346539.1    beta,beta-carotene 9',10'-oxygenase isoform 2 [Mus musculus]
-  NP_573480.1       beta,beta-carotene 9',10'-oxygenase isoform 1 [Mus musculus]
-  NP_446100.2       beta,beta-carotene 15,15'-dioxygenase [Rattus norvegicus]
-  NP_001121184.1    beta,beta-carotene 9',10'-oxygenase [Rattus norvegicus]
-  NP_001156500.1    beta,beta-carotene 15,15'-dioxygenase isoform 2 [Mus musculus]
-  NP_067461.2       beta,beta-carotene 15,15'-dioxygenase isoform 1 [Mus musculus]
-
-Indexed Fields
-
-  einfo -db pubmed |
-  xtract -pattern Field \
-    -if IsDate -equals Y -and IsHidden -equals N \
-      -pfx "[" -sep "]\t" -element Name,FullName |
-  sort -t $'\t' -k 2f
-
-  [CDAT]    Date - Completion
-  [CRDT]    Date - Create
-  [EDAT]    Date - Entrez
-  [MHDA]    Date - MeSH
-  [MDAT]    Date - Modification
-  [PDAT]    Date - Publication
-
-Author Numbers
-
-  esearch -db pubmed -query "conotoxin" |
-  efetch -format xml |
-  xtract -pattern PubmedArticle -num Author |
-  sort-uniq-count -n |
-  reorder-columns 2 1 |
-  head -n 15 |
-  xy-plot auth.png
-
-  0     11
-  1     193
-  2     854
-  3     844
-  4     699
-  5     588
-  6     439
-  7     291
-  8     187
-  9     124
-  10    122
-  11    58
-  12    33
-  13    18
-
-  900 +
-      |           ********
-  800 +           *       **
-      |          *          *
-  700 +          *          ***
-      |          *             **
-  600 +         *                *
-      |         *                ***
-  500 +         *                   **
-      |        *                      ***
-  400 +       *                          **
-      |       *                            *
-  300 +       *                            ***
-      |      *                                *
-  200 +      *                                 ******
-      |     *                                        *********
-  100 +   **                                                  *
-      |  *                                                     **********
-    0 + *                                                                ******
-        +---------+---------+---------+---------+---------+---------+---------+
-        0         2         4         6         8        10        12        14
-
-Title and Abstract Word Counts
-
-  esearch -db pubmed -query "conotoxin" -pub structured | efetch -format xml |
-  xtract -stops -wrp "Set,Rec" \
-    -pattern PubmedArticle -wrp "PMID" -element MedlineCitation/PMID \
-      -wrp "Titl" -words ArticleTitle \
-      -block Abstract/AbstractText -wrp "Grp,Abst" -words AbstractText |
-  xtract -pattern Rec -element PMID -num Titl -block Grp -tab ", " -num Abst
-
-  29194563    21    63, 84, 89, 26
-  28882644    23    87, 34, 115, 25
-  28877214    10    12, 42, 315, 94
-  28825343    15    169
-  28482835    9     75, 123, 42, 37
-  28479398    15    170, 130
-  ...
-
-Record Counts
-
-  echo "diphtheria measles pertussis polio tuberculosis" |
-  xargs -n 1 sh -c 'esearch -db pubmed -query "$0 [MESH]" |
-  efilter -days 365 -datetype PDAT |
-  xtract -pattern ENTREZ_DIRECT -lbl "$0" -element Count'
-
-  diphtheria      18
-  measles         166
-  pertussis       98
-  polio           75
-  tuberculosis    1386
-
-Gene Products
-
-  for sym in HBB DMD TTN ATP7B HFE BRCA2 CFTR PAH PRNP RAG1
-  do
-    esearch -db gene -query "$sym [GENE] AND human [ORGN]" |
-    efilter -query "alive [PROP]" | efetch -format docsum |
-    xtract -pattern GenomicInfoType \
-      -element ChrAccVer ChrStart ChrStop |
-    while read acc str stp
-    do
-      efetch -db nuccore -format gbc \
-        -id "$acc" -chr_start "$str" -chr_stop "$stp" |
-      xtract -insd CDS,mRNA INSDFeature_key "#INSDInterval" \
-        gene "%transcription" "%translation" \
-        product transcription translation |
-      grep -i $'\t'"$sym"$'\t'
-    done
-  done
-
-  NC_000011.10    mRNA    3     HBB    626      hemoglobin, beta                     ACATTTGCTT...
-  NC_000011.10    CDS     3     HBB    147      hemoglobin subunit beta              MVHLTPEEKS...
-  NC_000023.11    mRNA    78    DMD    13805    dystrophin, transcript variant X2    AGGAAGATGA...
-  NC_000023.11    mRNA    77    DMD    13794    dystrophin, transcript variant X6    ACTTTCCCCC...
-  NC_000023.11    mRNA    77    DMD    13800    dystrophin, transcript variant X5    ACTTTCCCCC...
-  NC_000023.11    mRNA    77    DMD    13785    dystrophin, transcript variant X7    ACTTTCCCCC...
-  NC_000023.11    mRNA    74    DMD    13593    dystrophin, transcript variant X8    ACTTTCCCCC...
-  NC_000023.11    mRNA    75    DMD    13625    dystrophin, transcript variant X9    ACTTTCCCCC...
-  ...
-
-Genome Range
-
-  esearch -db gene -query "Homo sapiens [ORGN] AND Y [CHR]" |
-  efilter -status alive | efetch -format docsum |
-  xtract -pattern DocumentSummary -NAME Name -DESC Description \
-    -block GenomicInfoType -if ChrLoc -equals Y \
-      -min ChrStart,ChrStop -element "&NAME" "&DESC" |
-  sort -k 1,1n | cut -f 2- | grep -v uncharacterized |
-  between-two-genes ASMT IL3RA
-
-  IL3RA        interleukin 3 receptor subunit alpha
-  SLC25A6      solute carrier family 25 member 6
-  LINC00106    long intergenic non-protein coding RNA 106
-  ASMTL-AS1    ASMTL antisense RNA 1
-  ASMTL        acetylserotonin O-methyltransferase-like
-  P2RY8        purinergic receptor P2Y8
-  AKAP17A      A-kinase anchoring protein 17A
-  ASMT         acetylserotonin O-methyltransferase
-
-3'UTR Sequences
-
-  ThreePrimeUTRs() {
-    xtract -pattern INSDSeq -ACC INSDSeq_accession-version -SEQ INSDSeq_sequence \
-      -block INSDFeature -if INSDFeature_key -equals CDS \
-        -pfc "\n" -element "&ACC" -rst -last INSDInterval_to -element "&SEQ" |
-    while read acc pos seq
-    do
-      if [ $pos -lt ${#seq} ]
-      then
-        echo -e ">$acc 3'UTR: $((pos+1))..${#seq}"
-        echo "${seq:$pos}" | fold -w 50
-      elif [ $pos -ge ${#seq} ]
-      then
-        echo -e ">$acc NO 3'UTR"
-      fi
-    done
-  }
-
-  esearch -db nuccore -query "5.5.1.19 [ECNO]" |
-  efilter -molecule mrna -source refseq |
-  efetch -format gbc | ThreePrimeUTRs
-
-  >NM_001328461.1 3'UTR: 1737..1871
-  gatgaatatagagttactgtgttgtaagctaatcatcatactgatgcaag
-  tgcattatcacatttacttctgctgatgattgttcataagattatgagtt
-  agccatttatcaaaaaaaaaaaaaaaaaaaaaaaa
-  >NM_001316759.1 3'UTR: 1628..1690
-  atccgagtaattcggaatcttgtccaattttatatagcctatattaatac
-  ...
-
-Amino Acid Substitutions
-
-  ApplySNPs() {
-    seq=""
-    last=""
-
-    while read rsid accn pos res
-    do
-      if [ "$accn" != "$last" ]
-      then
-        insd=$(efetch -db protein -id "$accn" -format gbc < /dev/null)
-        seq=$(echo $insd | xtract -pattern INSDSeq -element INSDSeq_sequence)
-        last=$accn
-      fi
-
-      pos=$((pos+1))
-      pfx=""
-      sfx=""
-      echo ">rs$rsid [$accn $res@$pos]"
-      if [ $pos -gt 1 ]
-      then
-        pfx=$(echo ${seq:0:$pos-1})
-      fi
-      if [ $pos -lt ${#seq} ]
-      then
-        sfx=$(echo ${seq:$pos})
-      fi
-      echo "$pfx$res$sfx" | fold -w 50
-    done
-  }
-
-  esearch -db gene -query "OPN1MW [GENE] AND human [ORGN]" |
-  elink -target snp | efetch -format xml |
-  xtract -pattern Rs -RSID Rs@rsId \
-    -block FxnSet -if @fxnClass -equals missense \
-      -sep "." -element "&RSID" @protAcc,@protVer @aaPosition \
-      -tab "\n" -element @residue |
-  sort -t $'\t' -k 2,2 -k 3,3n -k 4,4 | uniq |
-  ApplySNPs
-
-  >rs104894915 [NP_000504.1 K@94]
-  maqqwslqrlagrhpqdsyedstqssiftytnsnstrgpfegpnyhiapr
-  wvyhltsvwmifvviasvftnglvlaatmkfkklrhplnwilvKlavadl
-  aetviastisvvnqvygyfvlghpmcvlegytvslcgitglwslaiiswe
-  ...
-
-Amino Acid Composition
-
-  #!/bin/bash -norc
-
-  abbrev=( Ala Asx Cys Asp Glu Phe Gly His Ile \
-           Xle Lys Leu Met Asn Pyl Pro Gln Arg \
-           Ser Thr Sec Val Trp Xxx Tyr Glx )
-
-  AminoAcidComp() {
-    local count
-    while read num lttr
-    do
-      idx=$(printf %i "'$lttr'")
-      ofs=$((idx-97))
-      count[$ofs]="$num"
-    done <<< "$1"
-    for i in {0..25}
-    do
-      echo -e "${abbrev[$i]}\t${count[$i]-0}"
-    done |
-    sort
-  }
-
-  AminoAcidJoin() {
-    result=""
-    while read acc seq gene
-    do
-      comp="$(echo "$seq" | tr A-Z a-z | sed 's/[^a-z]//g' | fold -w 1 | sort-uniq-count)"
-      current=$(AminoAcidComp "$comp")
-      current=$(echo -e "GENE\t$gene\n$current")
-      if [ -n "$result" ]
-      then
-        result=$(join -t $'\t' <(echo "$result") <(echo "$current"))
-      else
-        result=$current
-      fi
-    done
-    echo "$result" |
-    grep -e "GENE" -e "[1-9]"
-  }
-
-  ids="NP_001172026,NP_000509,NP_004001,NP_001243779"
-  efetch -db protein -id "$ids" -format gpc |
-  xtract -insd INSDSeq_sequence CDS gene |
-  AminoAcidJoin
-
-  GENE    INS    HBB    DMD    TTN
-  Ala     10     15     210    2084
-  Arg     5      3      193    1640
-  Asn     3      6      153    1111
-  Asp     2      7      185    1720
-  Cys     6      2      35     513
-  Gln     7      3      301    942
-  Glu     8      8      379    3193
-  Gly     12     13     104    2066
-  His     2      9      84     478
-  Ile     2      0      165    2062
-  Leu     20     18     438    2117
-  Lys     2      11     282    2943
-  Met     2      2      79     398
-  Phe     3      8      77     908
-  Pro     6      7      130    2517
-  Ser     5      5      239    2463
-  Thr     3      7      194    2546
-  Trp     2      2      67     466
-  Tyr     4      3      61     999
-  Val     6      18     186    3184
-
-Markup Correction
-
-  for id in 9698410 16271163 17282049 20968289 21892341 22785267 25435818 27672066 28635620 28976125 29547395
-  do
-    efetch -db pubmed -format xml -id "$id" |
-    xtract -pattern PubmedArticle -plg "\n\n" -sep "\n\n" -tab "\n\n" \
-      -element MedlineCitation/PMID ArticleTitle AbstractText
-  done
-
-Processing in Groups
-
-  ...
-  efetch -format acc |
-  join-into-groups-of 200 |
-  xargs -n 1 sh -c 'epost -db nuccore -format acc -id "$0" |
-  efetch -format gb'
-
-Local Indexing
-
-  efetch -db pubmed -id 12857958,2981625 -format xml |
-  xtract -e2index |
-  xtract -pattern IdxDocument -UID IdxUid \
-    -block NORM -pfc "\n" -element "&UID",NORM,"@pos"
-
-  12857958    allow       207
-  12857958    assays      148
-  12857958    binding     147
-  12857958    braid       189,217
-  12857958    braiding    154
-  ...
-
-Phrase Searching
-
-  PhraseSearch() {
-    entrez-phrase-search -db pubmed -field WORD "$@" |
-    efetch -format xml |
-    xtract -pattern PubmedArticle -phrase "$*"
-  }
-
-  PhraseSearch selective serotonin reuptake inhibitor + monoamine oxidase inhibitor |
-  xtract -pattern PubmedArticle -element MedlineCitation/PMID \
-    -block Keyword -pfc "\n  " -element Keyword
-
-  24657329
-    Antidepressant
-    Organic cation transporter 2
-    Piperine
-    Uptake 2
-  24280122
-    5-HIAA
-    5-HT
-    5-HTP
-    5-hydroxyindoleacetic acid
-    5-hydroxytryptophan
-    ...
-`
-
-const pubMedArtSample = `
-<PubmedArticle>
-<MedlineCitation Status="MEDLINE" Owner="NLM">
-<PMID Version="1">6301692</PMID>
-<DateCompleted>
-<Year>1983</Year>
-<Month>06</Month>
-<Day>17</Day>
-</DateCompleted>
-<DateRevised>
-<Year>2007</Year>
-<Month>11</Month>
-<Day>14</Day>
-</DateRevised>
-<Article PubModel="Print">
-<Journal>
-<ISSN IssnType="Print">0092-8674</ISSN>
-<JournalIssue CitedMedium="Print">
-<Volume>32</Volume>
-<Issue>4</Issue>
-<PubDate>
-<Year>1983</Year>
-<Month>Apr</Month>
-</PubDate>
-</JournalIssue>
-<Title>Cell</Title>
-<ISOAbbreviation>Cell</ISOAbbreviation>
-</Journal>
-<ArticleTitle>Site-specific relaxation and recombination by the Tn3 resolvase: recognition of the DNA path between oriented res sites.</ArticleTitle>
-<Pagination>
-<MedlinePgn>1313-24</MedlinePgn>
-</Pagination>
-<Abstract>
-<AbstractText Label="RESULTS>We studied the dynamics of site-specific recombination by the resolvase encoded by the Escherichia coli transposon Tn3.
-The pure enzyme recombined supercoiled plasmids containing two directly repeated recombination sites, called res sites.
-Resolvase is the first strictly site-specific topoisomerase.
-It relaxed only plasmids containing directly repeated res sites; substrates with zero, one or two inverted sites were inert.
-Even when the proximity of res sites was ensured by catenation of plasmids with a single site, neither relaxation nor recombination occurred.
-The two circular products of recombination were catenanes interlinked only once.
-These properties of resolvase require that the path of the DNA between res sites be clearly defined and that strand exchange occur with a unique geometry.</AbstractText>
-<AbstractText Label="SUMMARY">A model in which one subunit of a dimeric resolvase is bound at one res site,
-while the other searches along adjacent DNA until it encounters the second site,
-would account for the ability of resolvase to distinguish intramolecular from intermolecular sites,
-to sense the relative orientation of sites and to produce singly interlinked catenanes.
-Because resolvase is a type 1 topoisomerase, we infer that it makes the required duplex bDNA breaks of recombination one strand at a time.</AbstractText>
-</Abstract>
-<AuthorList CompleteYN="Y">
-<Author ValidYN="Y">
-<LastName>Krasnow</LastName>
-<ForeName>Mark A</ForeName>
-<Initials>MA</Initials>
-</Author>
-<Author ValidYN="Y">
-<LastName>Cozzarelli</LastName>
-<ForeName>Nicholas R</ForeName>
-<Initials>NR</Initials>
-</Author>
-</AuthorList>
-<Language>eng</Language>
-<GrantList CompleteYN="Y">
-<Grant>
-<GrantID>GM-07281</GrantID>
-<Acronym>GM</Acronym>
-<Agency>NIGMS NIH HHS</Agency>
-<Country>United States</Country>
-</Grant>
-</GrantList>
-<PublicationTypeList>
-<PublicationType UI="D016428">Journal Article</PublicationType>
-<PublicationType UI="D013487">Research Support, U.S. Gov't, P.H.S.</PublicationType>
-</PublicationTypeList>
-</Article>
-<MedlineJournalInfo>
-<Country>United States</Country>
-<MedlineTA>Cell</MedlineTA>
-<NlmUniqueID>0413066</NlmUniqueID>
-<ISSNLinking>0092-8674</ISSNLinking>
-</MedlineJournalInfo>
-<ChemicalList>
-<Chemical>
-<RegistryNumber>0</RegistryNumber>
-<NameOfSubstance UI="D004269">DNA, Bacterial</NameOfSubstance>
-</Chemical>
-<Chemical>
-<RegistryNumber>0</RegistryNumber>
-<NameOfSubstance UI="D004278">DNA, Superhelical</NameOfSubstance>
-</Chemical>
-<Chemical>
-<RegistryNumber>0</RegistryNumber>
-<NameOfSubstance UI="D004279">DNA, Viral</NameOfSubstance>
-</Chemical>
-<Chemical>
-<RegistryNumber>EC 2.7.7.-</RegistryNumber>
-<NameOfSubstance UI="D009713">Nucleotidyltransferases</NameOfSubstance>
-</Chemical>
-<Chemical>
-<RegistryNumber>EC 2.7.7.-</RegistryNumber>
-<NameOfSubstance UI="D019895">Transposases</NameOfSubstance>
-</Chemical>
-<Chemical>
-<RegistryNumber>EC 5.99.1.2</RegistryNumber>
-<NameOfSubstance UI="D004264">DNA Topoisomerases, Type I</NameOfSubstance>
-</Chemical>
-</ChemicalList>
-<CitationSubset>IM</CitationSubset>
-<MeshHeadingList>
-<MeshHeading>
-<DescriptorName UI="D004264" MajorTopicYN="N">DNA Topoisomerases, Type I</DescriptorName>
-<QualifierName UI="Q000378" MajorTopicYN="N">metabolism</QualifierName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D004269" MajorTopicYN="N">DNA, Bacterial</DescriptorName>
-<QualifierName UI="Q000378" MajorTopicYN="Y">metabolism</QualifierName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D004278" MajorTopicYN="N">DNA, Superhelical</DescriptorName>
-<QualifierName UI="Q000378" MajorTopicYN="N">metabolism</QualifierName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D004279" MajorTopicYN="N">DNA, Viral</DescriptorName>
-<QualifierName UI="Q000378" MajorTopicYN="Y">metabolism</QualifierName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D008957" MajorTopicYN="N">Models, Genetic</DescriptorName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D009690" MajorTopicYN="Y">Nucleic Acid Conformation</DescriptorName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D009713" MajorTopicYN="N">Nucleotidyltransferases</DescriptorName>
-<QualifierName UI="Q000302" MajorTopicYN="N">isolation &amp; purification</QualifierName>
-<QualifierName UI="Q000378" MajorTopicYN="Y">metabolism</QualifierName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D010957" MajorTopicYN="N">Plasmids</DescriptorName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D011995" MajorTopicYN="Y">Recombination, Genetic</DescriptorName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D012091" MajorTopicYN="N">Repetitive Sequences, Nucleic Acid</DescriptorName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D013539" MajorTopicYN="N">Simian virus 40</DescriptorName>
-</MeshHeading>
-<MeshHeading>
-<DescriptorName UI="D019895" MajorTopicYN="N">Transposases</DescriptorName>
-</MeshHeading>
-</MeshHeadingList>
-</MedlineCitation>
-<PubmedData>
-<History>
-<PubMedPubDate PubStatus="pubmed">
-<Year>1983</Year>
-<Month>4</Month>
-<Day>1</Day>
-</PubMedPubDate>
-<PubMedPubDate PubStatus="medline">
-<Year>1983</Year>
-<Month>4</Month>
-<Day>1</Day>
-<Hour>0</Hour>
-<Minute>1</Minute>
-</PubMedPubDate>
-<PubMedPubDate PubStatus="entrez">
-<Year>1983</Year>
-<Month>4</Month>
-<Day>1</Day>
-<Hour>0</Hour>
-<Minute>0</Minute>
-</PubMedPubDate>
-</History>
-<PublicationStatus>ppublish</PublicationStatus>
-<ArticleIdList>
-<ArticleId IdType="pubmed">6301692</ArticleId>
-<ArticleId IdType="pii">0092-8674(83)90312-4</ArticleId>
-</ArticleIdList>
-</PubmedData>
-</PubmedArticle>
-`
-
-const insdSeqSample = `
-<INSDSeq>
-<INSDSeq_locus>AF480315_1</INSDSeq_locus>
-<INSDSeq_length>67</INSDSeq_length>
-<INSDSeq_moltype>AA</INSDSeq_moltype>
-<INSDSeq_topology>linear</INSDSeq_topology>
-<INSDSeq_division>INV</INSDSeq_division>
-<INSDSeq_update-date>25-JUL-2016</INSDSeq_update-date>
-<INSDSeq_create-date>31-DEC-2003</INSDSeq_create-date>
-<INSDSeq_definition>four-loop conotoxin preproprotein, partial [Conus purpurascens]</INSDSeq_definition>
-<INSDSeq_primary-accession>AAQ05867</INSDSeq_primary-accession>
-<INSDSeq_accession-version>AAQ05867.1</INSDSeq_accession-version>
-<INSDSeq_other-seqids>
-<INSDSeqid>gb|AAQ05867.1|AF480315_1</INSDSeqid>
-<INSDSeqid>gi|33320307</INSDSeqid>
-</INSDSeq_other-seqids>
-<INSDSeq_source>Conus purpurascens</INSDSeq_source>
-<INSDSeq_organism>Conus purpurascens</INSDSeq_organism>
-<INSDSeq_taxonomy>Eukaryota; Metazoa; Lophotrochozoa; Mollusca; Gastropoda; Caenogastropoda; Hypsogastropoda; Neogastropoda; Conoidea; Conidae; Conus</INSDSeq_taxonomy>
-<INSDSeq_references>
-<INSDReference>
-<INSDReference_reference>1</INSDReference_reference>
-<INSDReference_position>1..67</INSDReference_position>
-<INSDReference_authors>
-<INSDAuthor>Duda,T.F. Jr.</INSDAuthor>
-<INSDAuthor>Palumbi,S.R.</INSDAuthor>
-</INSDReference_authors>
-<INSDReference_title>Convergent evolution of venoms and feeding ecologies among polyphyletic piscivorous Conus species</INSDReference_title>
-<INSDReference_journal>Unpublished</INSDReference_journal>
-</INSDReference>
-<INSDReference>
-<INSDReference_reference>2</INSDReference_reference>
-<INSDReference_position>1..67</INSDReference_position>
-<INSDReference_authors>
-<INSDAuthor>Duda,T.F. Jr.</INSDAuthor>
-<INSDAuthor>Palumbi,S.R.</INSDAuthor>
-</INSDReference_authors>
-<INSDReference_title>Direct Submission</INSDReference_title>
-<INSDReference_journal>Submitted (04-FEB-2002) Naos Marine Lab, Smithsonian Tropical Research Institute, Apartado 2072, Balboa, Ancon, Panama, Republic of Panama</INSDReference_journal>
-</INSDReference>
-</INSDSeq_references>
-<INSDSeq_comment>Method: conceptual translation supplied by author.</INSDSeq_comment>
-<INSDSeq_source-db>accession AF480315.1</INSDSeq_source-db>
-<INSDSeq_feature-table>
-<INSDFeature>
-<INSDFeature_key>source</INSDFeature_key>
-<INSDFeature_location>1..67</INSDFeature_location>
-<INSDFeature_intervals>
-<INSDInterval>
-<INSDInterval_from>1</INSDInterval_from>
-<INSDInterval_to>67</INSDInterval_to>
-<INSDInterval_accession>AAQ05867.1</INSDInterval_accession>
-</INSDInterval>
-</INSDFeature_intervals>
-<INSDFeature_quals>
-<INSDQualifier>
-<INSDQualifier_name>organism</INSDQualifier_name>
-<INSDQualifier_value>Conus purpurascens</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>isolate</INSDQualifier_name>
-<INSDQualifier_value>purpurascens-2c</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>db_xref</INSDQualifier_name>
-<INSDQualifier_value>taxon:41690</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>clone_lib</INSDQualifier_name>
-<INSDQualifier_value>venom duct cDNA library</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>country</INSDQualifier_name>
-<INSDQualifier_value>Panama</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>note</INSDQualifier_name>
-<INSDQualifier_value>isolated from the Bay of Panama</INSDQualifier_value>
-</INSDQualifier>
-</INSDFeature_quals>
-</INSDFeature>
-<INSDFeature>
-<INSDFeature_key>Protein</INSDFeature_key>
-<INSDFeature_location>&lt;1..67</INSDFeature_location>
-<INSDFeature_intervals>
-<INSDInterval>
-<INSDInterval_from>1</INSDInterval_from>
-<INSDInterval_to>67</INSDInterval_to>
-<INSDInterval_accession>AAQ05867.1</INSDInterval_accession>
-</INSDInterval>
-</INSDFeature_intervals>
-<INSDFeature_partial5 value="true"/>
-<INSDFeature_quals>
-<INSDQualifier>
-<INSDQualifier_name>product</INSDQualifier_name>
-<INSDQualifier_value>four-loop conotoxin preproprotein</INSDQualifier_value>
-</INSDQualifier>
-</INSDFeature_quals>
-</INSDFeature>
-<INSDFeature>
-<INSDFeature_key>mat_peptide</INSDFeature_key>
-<INSDFeature_location>41..67</INSDFeature_location>
-<INSDFeature_intervals>
-<INSDInterval>
-<INSDInterval_from>41</INSDInterval_from>
-<INSDInterval_to>67</INSDInterval_to>
-<INSDInterval_accession>AAQ05867.1</INSDInterval_accession>
-</INSDInterval>
-</INSDFeature_intervals>
-<INSDFeature_quals>
-<INSDQualifier>
-<INSDQualifier_name>product</INSDQualifier_name>
-<INSDQualifier_value>four-loop conotoxin</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>calculated_mol_wt</INSDQualifier_name>
-<INSDQualifier_value>3008</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>peptide</INSDQualifier_name>
-<INSDQualifier_value>PCKKTGRKCFPHQKDCCGRACIITICP</INSDQualifier_value>
-</INSDQualifier>
-</INSDFeature_quals>
-</INSDFeature>
-<INSDFeature>
-<INSDFeature_key>CDS</INSDFeature_key>
-<INSDFeature_location>1..67</INSDFeature_location>
-<INSDFeature_intervals>
-<INSDInterval>
-<INSDInterval_from>1</INSDInterval_from>
-<INSDInterval_to>67</INSDInterval_to>
-<INSDInterval_accession>AAQ05867.1</INSDInterval_accession>
-</INSDInterval>
-</INSDFeature_intervals>
-<INSDFeature_partial5 value="true"/>
-<INSDFeature_quals>
-<INSDQualifier>
-<INSDQualifier_name>coded_by</INSDQualifier_name>
-<INSDQualifier_value>AF480315.1:&lt;1..205</INSDQualifier_value>
-</INSDQualifier>
-<INSDQualifier>
-<INSDQualifier_name>codon_start</INSDQualifier_name>
-<INSDQualifier_value>2</INSDQualifier_value>
-</INSDQualifier>
-</INSDFeature_quals>
-</INSDFeature>
-</INSDSeq_feature-table>
-<INSDSeq_sequence>vvivavlfltacqlitaddsrrtqkhralrsttkratsnrpckktgrkcfphqkdccgraciiticp</INSDSeq_sequence>
-</INSDSeq>
-`
-
-const geneDocSumSample = `
-<DocumentSummary>
-<Id>3581</Id>
-<Name>IL9R</Name>
-<Description>interleukin 9 receptor</Description>
-<Status>0</Status>
-<CurrentID>0</CurrentID>
-<Chromosome>X, Y</Chromosome>
-<GeneticSource>genomic</GeneticSource>
-<MapLocation>Xq28 and Yq12</MapLocation>
-<OtherAliases>CD129, IL-9R</OtherAliases>
-<OtherDesignations>interleukin-9 receptor|IL-9 receptor</OtherDesignations>
-<NomenclatureSymbol>IL9R</NomenclatureSymbol>
-<NomenclatureName>interleukin 9 receptor</NomenclatureName>
-<NomenclatureStatus>Official</NomenclatureStatus>
-<Mim>
-<int>300007</int>
-</Mim>
-<GenomicInfo>
-<GenomicInfoType>
-<ChrLoc>X</ChrLoc>
-<ChrAccVer>NC_000023.11</ChrAccVer>
-<ChrStart>155997580</ChrStart>
-<ChrStop>156013016</ChrStop>
-<ExonCount>14</ExonCount>
-</GenomicInfoType>
-<GenomicInfoType>
-<ChrLoc>Y</ChrLoc>
-<ChrAccVer>NC_000024.10</ChrAccVer>
-<ChrStart>57184100</ChrStart>
-<ChrStop>57199536</ChrStop>
-<ExonCount>14</ExonCount>
-</GenomicInfoType>
-</GenomicInfo>
-<GeneWeight>5425</GeneWeight>
-<Summary>The protein encoded by this gene is a cytokine receptor that specifically mediates the biological effects of interleukin 9 (IL9).
-The functional IL9 receptor complex requires this protein as well as the interleukin 2 receptor, gamma (IL2RG), a common gamma subunit shared by the receptors of many different cytokines.
-The ligand binding of this receptor leads to the activation of various JAK kinases and STAT proteins, which connect to different biologic responses.
-This gene is located at the pseudoautosomal regions of X and Y chromosomes.
-Genetic studies suggested an association of this gene with the development of asthma.
-Multiple pseudogenes on chromosome 9, 10, 16, and 18 have been described.
-Alternatively spliced transcript variants have been found for this gene.</Summary>
-<ChrSort>X</ChrSort>
-<ChrStart>155997580</ChrStart>
-<Organism>
-<ScientificName>Homo sapiens</ScientificName>
-<CommonName>human</CommonName>
-<TaxID>9606</TaxID>
-</Organism>
-</DocumentSummary>
 `
 
 const keyboardShortcuts = `
@@ -1417,6 +624,10 @@ Modify Contents
  sed       Replaces text strings
 
   -e       Specify individual expression
+  s///     Substitute
+     /g    Global
+     /I    Case-insensitive
+     /p    Print
 
  tr        Translates characters
 
@@ -1438,6 +649,7 @@ Format Contents
  fold      Wraps lines at a specific width
 
   -w       Line width
+  -s       Fold at spaces
 
 Filter by Position
 
@@ -1508,7 +720,7 @@ Directory and File Navigation
   .*       Current and parent directory
 
  pwd       Prints working directory path
- 
+
 File Redirection
 
   <        Read stdin from file
@@ -1518,7 +730,7 @@ File Redirection
   2>&1     Merge stderr into stdout
   |        Pipe between programs
   <(cmd)   Execute command, read results as file
- 
+
 Shell Script Variables
 
   $0       Name of script
@@ -1527,14 +739,35 @@ Shell Script Variables
   "$*"     Argument list as one argument
   "$@"     Argument list as separate arguments
   $?       Exit status of previous command
- 
+
 Shell Script Tests
 
   -d       Directory exists
   -f       File exists
   -s       File is not empty
   -n       Length of string is non-zero
+  -x       File is executable
   -z       Variable is empty or not set
+
+File and Directory Extraction
+
+           BAS=$(printf pubmed%03d $n)
+           DIR=$(dirname "$0")
+           FIL=$(basename "$0")
+
+Remove Prefix
+
+           FILE="example.tar.gz"
+  #        ${FILE#.*}  -> tar.gz
+  ##       ${FILE##.*} -> gz
+
+Remove Suffix
+
+           FILE="example.tar.gz"
+           TYPE="http://identifiers.org/uniprot_enzymes/"
+  %        ${FILE%.*}  -> example.tar
+           ${TYPE%/}   -> http://identifiers.org/uniprot_enzymes
+  %%       ${FILE%%.*} -> example
 `
 
 // TYPED CONSTANTS
@@ -1550,6 +783,7 @@ const (
 	BRANCH
 	GROUP
 	DIVISION
+	PATH
 	PATTERN
 )
 
@@ -1572,14 +806,26 @@ const (
 	FIRST
 	LAST
 	ENCODE
+	DECODE
+	PLAIN
 	UPPER
 	LOWER
+	CHAIN
 	TITLE
+	ORDER
+	YEAR
+	TRANSLATE
 	TERMS
 	WORDS
 	PAIRS
+	REVERSE
 	LETTERS
+	CLAUSES
 	INDICES
+	MESHCODE
+	MATRIX
+	HISTOGRAM
+	ACCENTED
 	PFX
 	SFX
 	SEP
@@ -1588,11 +834,15 @@ const (
 	LBL
 	CLR
 	PFC
+	DEQ
 	PLG
 	ELG
+	FWD
+	AWD
 	WRP
 	RST
 	DEF
+	COLOR
 	POSITION
 	SELECT
 	IF
@@ -1603,9 +853,16 @@ const (
 	OR
 	EQUALS
 	CONTAINS
+	ISWITHIN
 	STARTSWITH
 	ENDSWITH
 	ISNOT
+	ISBEFORE
+	ISAFTER
+	MATCHES
+	RESEMBLES
+	ISEQUALTO
+	DIFFERSFROM
 	GT
 	GE
 	LT
@@ -1623,15 +880,21 @@ const (
 	AVG
 	DEV
 	MED
+	MUL
+	DIV
+	MOD
 	BIN
 	BIT
 	ZEROBASED
 	ONEBASED
 	UCSCBASED
 	REVCOMP
+	NUCLEIC
+	MOLWT
 	ELSE
 	VARIABLE
 	VALUE
+	QUESTION
 	STAR
 	DOLLAR
 	ATSIGN
@@ -1675,167 +938,229 @@ type SequenceType struct {
 	Which SeqEndType
 }
 
+// MUTEXES
+
+var hlock sync.Mutex
+
+var slock sync.RWMutex
+
 // ARGUMENT MAPS
 
 var argTypeIs = map[string]ArgumentType{
-	"-unit":        EXPLORATION,
-	"-Unit":        EXPLORATION,
-	"-subset":      EXPLORATION,
-	"-Subset":      EXPLORATION,
-	"-section":     EXPLORATION,
-	"-Section":     EXPLORATION,
-	"-block":       EXPLORATION,
-	"-Block":       EXPLORATION,
-	"-branch":      EXPLORATION,
-	"-Branch":      EXPLORATION,
-	"-group":       EXPLORATION,
-	"-Group":       EXPLORATION,
-	"-division":    EXPLORATION,
-	"-Division":    EXPLORATION,
-	"-pattern":     EXPLORATION,
-	"-Pattern":     EXPLORATION,
-	"-position":    CONDITIONAL,
-	"-select":      CONDITIONAL,
-	"-if":          CONDITIONAL,
-	"-unless":      CONDITIONAL,
-	"-match":       CONDITIONAL,
-	"-avoid":       CONDITIONAL,
-	"-and":         CONDITIONAL,
-	"-or":          CONDITIONAL,
-	"-equals":      CONDITIONAL,
-	"-contains":    CONDITIONAL,
-	"-starts-with": CONDITIONAL,
-	"-ends-with":   CONDITIONAL,
-	"-is-not":      CONDITIONAL,
-	"-gt":          CONDITIONAL,
-	"-ge":          CONDITIONAL,
-	"-lt":          CONDITIONAL,
-	"-le":          CONDITIONAL,
-	"-eq":          CONDITIONAL,
-	"-ne":          CONDITIONAL,
-	"-element":     EXTRACTION,
-	"-first":       EXTRACTION,
-	"-last":        EXTRACTION,
-	"-encode":      EXTRACTION,
-	"-upper":       EXTRACTION,
-	"-lower":       EXTRACTION,
-	"-title":       EXTRACTION,
-	"-terms":       EXTRACTION,
-	"-words":       EXTRACTION,
-	"-pairs":       EXTRACTION,
-	"-letters":     EXTRACTION,
-	"-indices":     EXTRACTION,
-	"-num":         EXTRACTION,
-	"-len":         EXTRACTION,
-	"-sum":         EXTRACTION,
-	"-min":         EXTRACTION,
-	"-max":         EXTRACTION,
-	"-inc":         EXTRACTION,
-	"-dec":         EXTRACTION,
-	"-sub":         EXTRACTION,
-	"-avg":         EXTRACTION,
-	"-dev":         EXTRACTION,
-	"-med":         EXTRACTION,
-	"-bin":         EXTRACTION,
-	"-bit":         EXTRACTION,
-	"-0-based":     EXTRACTION,
-	"-zero-based":  EXTRACTION,
-	"-1-based":     EXTRACTION,
-	"-one-based":   EXTRACTION,
-	"-ucsc":        EXTRACTION,
-	"-ucsc-based":  EXTRACTION,
-	"-ucsc-coords": EXTRACTION,
-	"-bed-based":   EXTRACTION,
-	"-bed-coords":  EXTRACTION,
-	"-revcomp":     EXTRACTION,
-	"-else":        EXTRACTION,
-	"-pfx":         CUSTOMIZATION,
-	"-sfx":         CUSTOMIZATION,
-	"-sep":         CUSTOMIZATION,
-	"-tab":         CUSTOMIZATION,
-	"-ret":         CUSTOMIZATION,
-	"-lbl":         CUSTOMIZATION,
-	"-clr":         CUSTOMIZATION,
-	"-pfc":         CUSTOMIZATION,
-	"-plg":         CUSTOMIZATION,
-	"-elg":         CUSTOMIZATION,
-	"-wrp":         CUSTOMIZATION,
-	"-rst":         CUSTOMIZATION,
-	"-def":         CUSTOMIZATION,
+	"-unit":         EXPLORATION,
+	"-Unit":         EXPLORATION,
+	"-subset":       EXPLORATION,
+	"-Subset":       EXPLORATION,
+	"-section":      EXPLORATION,
+	"-Section":      EXPLORATION,
+	"-block":        EXPLORATION,
+	"-Block":        EXPLORATION,
+	"-branch":       EXPLORATION,
+	"-Branch":       EXPLORATION,
+	"-group":        EXPLORATION,
+	"-Group":        EXPLORATION,
+	"-division":     EXPLORATION,
+	"-Division":     EXPLORATION,
+	"-path":         EXPLORATION,
+	"-Path":         EXPLORATION,
+	"-pattern":      EXPLORATION,
+	"-Pattern":      EXPLORATION,
+	"-position":     CONDITIONAL,
+	"-select":       CONDITIONAL,
+	"-if":           CONDITIONAL,
+	"-unless":       CONDITIONAL,
+	"-match":        CONDITIONAL,
+	"-avoid":        CONDITIONAL,
+	"-and":          CONDITIONAL,
+	"-or":           CONDITIONAL,
+	"-equals":       CONDITIONAL,
+	"-contains":     CONDITIONAL,
+	"-is-within":    CONDITIONAL,
+	"-starts-with":  CONDITIONAL,
+	"-ends-with":    CONDITIONAL,
+	"-is-not":       CONDITIONAL,
+	"-is-before":    CONDITIONAL,
+	"-is-after":     CONDITIONAL,
+	"-matches":      CONDITIONAL,
+	"-resembles":    CONDITIONAL,
+	"-is-equal-to":  CONDITIONAL,
+	"-differs-from": CONDITIONAL,
+	"-gt":           CONDITIONAL,
+	"-ge":           CONDITIONAL,
+	"-lt":           CONDITIONAL,
+	"-le":           CONDITIONAL,
+	"-eq":           CONDITIONAL,
+	"-ne":           CONDITIONAL,
+	"-element":      EXTRACTION,
+	"-first":        EXTRACTION,
+	"-last":         EXTRACTION,
+	"-encode":       EXTRACTION,
+	"-decode":       EXTRACTION,
+	"-plain":        EXTRACTION,
+	"-upper":        EXTRACTION,
+	"-lower":        EXTRACTION,
+	"-chain":        EXTRACTION,
+	"-title":        EXTRACTION,
+	"-order":        EXTRACTION,
+	"-year":         EXTRACTION,
+	"-translate":    EXTRACTION,
+	"-terms":        EXTRACTION,
+	"-words":        EXTRACTION,
+	"-pairs":        EXTRACTION,
+	"-reverse":      EXTRACTION,
+	"-letters":      EXTRACTION,
+	"-clauses":      EXTRACTION,
+	"-indices":      EXTRACTION,
+	"-meshcode":     EXTRACTION,
+	"-matrix":       EXTRACTION,
+	"-histogram":    EXTRACTION,
+	"-accented":     EXTRACTION,
+	"-num":          EXTRACTION,
+	"-len":          EXTRACTION,
+	"-sum":          EXTRACTION,
+	"-min":          EXTRACTION,
+	"-max":          EXTRACTION,
+	"-inc":          EXTRACTION,
+	"-dec":          EXTRACTION,
+	"-sub":          EXTRACTION,
+	"-avg":          EXTRACTION,
+	"-dev":          EXTRACTION,
+	"-med":          EXTRACTION,
+	"-mul":          EXTRACTION,
+	"-div":          EXTRACTION,
+	"-mod":          EXTRACTION,
+	"-bin":          EXTRACTION,
+	"-bit":          EXTRACTION,
+	"-0-based":      EXTRACTION,
+	"-zero-based":   EXTRACTION,
+	"-1-based":      EXTRACTION,
+	"-one-based":    EXTRACTION,
+	"-ucsc":         EXTRACTION,
+	"-ucsc-based":   EXTRACTION,
+	"-ucsc-coords":  EXTRACTION,
+	"-bed-based":    EXTRACTION,
+	"-bed-coords":   EXTRACTION,
+	"-revcomp":      EXTRACTION,
+	"-nucleic":      EXTRACTION,
+	"-molwt":        EXTRACTION,
+	"-else":         EXTRACTION,
+	"-pfx":          CUSTOMIZATION,
+	"-sfx":          CUSTOMIZATION,
+	"-sep":          CUSTOMIZATION,
+	"-tab":          CUSTOMIZATION,
+	"-ret":          CUSTOMIZATION,
+	"-lbl":          CUSTOMIZATION,
+	"-clr":          CUSTOMIZATION,
+	"-pfc":          CUSTOMIZATION,
+	"-deq":          CUSTOMIZATION,
+	"-plg":          CUSTOMIZATION,
+	"-elg":          CUSTOMIZATION,
+	"-fwd":          CUSTOMIZATION,
+	"-awd":          CUSTOMIZATION,
+	"-wrp":          CUSTOMIZATION,
+	"-rst":          CUSTOMIZATION,
+	"-def":          CUSTOMIZATION,
+	"-color":        CUSTOMIZATION,
 }
 
 var opTypeIs = map[string]OpType{
-	"-element":     ELEMENT,
-	"-first":       FIRST,
-	"-last":        LAST,
-	"-encode":      ENCODE,
-	"-upper":       UPPER,
-	"-lower":       LOWER,
-	"-title":       TITLE,
-	"-terms":       TERMS,
-	"-words":       WORDS,
-	"-pairs":       PAIRS,
-	"-letters":     LETTERS,
-	"-indices":     INDICES,
-	"-pfx":         PFX,
-	"-sfx":         SFX,
-	"-sep":         SEP,
-	"-tab":         TAB,
-	"-ret":         RET,
-	"-lbl":         LBL,
-	"-clr":         CLR,
-	"-pfc":         PFC,
-	"-plg":         PLG,
-	"-elg":         ELG,
-	"-wrp":         WRP,
-	"-rst":         RST,
-	"-def":         DEF,
-	"-position":    POSITION,
-	"-select":      SELECT,
-	"-if":          IF,
-	"-unless":      UNLESS,
-	"-match":       MATCH,
-	"-avoid":       AVOID,
-	"-and":         AND,
-	"-or":          OR,
-	"-equals":      EQUALS,
-	"-contains":    CONTAINS,
-	"-starts-with": STARTSWITH,
-	"-ends-with":   ENDSWITH,
-	"-is-not":      ISNOT,
-	"-gt":          GT,
-	"-ge":          GE,
-	"-lt":          LT,
-	"-le":          LE,
-	"-eq":          EQ,
-	"-ne":          NE,
-	"-num":         NUM,
-	"-len":         LEN,
-	"-sum":         SUM,
-	"-min":         MIN,
-	"-max":         MAX,
-	"-inc":         INC,
-	"-dec":         DEC,
-	"-sub":         SUB,
-	"-avg":         AVG,
-	"-dev":         DEV,
-	"-med":         MED,
-	"-bin":         BIN,
-	"-bit":         BIT,
-	"-0-based":     ZEROBASED,
-	"-zero-based":  ZEROBASED,
-	"-1-based":     ONEBASED,
-	"-one-based":   ONEBASED,
-	"-ucsc":        UCSCBASED,
-	"-ucsc-based":  UCSCBASED,
-	"-ucsc-coords": UCSCBASED,
-	"-bed-based":   UCSCBASED,
-	"-bed-coords":  UCSCBASED,
-	"-revcomp":     REVCOMP,
-	"-else":        ELSE,
+	"-element":      ELEMENT,
+	"-first":        FIRST,
+	"-last":         LAST,
+	"-encode":       ENCODE,
+	"-decode":       DECODE,
+	"-plain":        PLAIN,
+	"-upper":        UPPER,
+	"-lower":        LOWER,
+	"-chain":        CHAIN,
+	"-title":        TITLE,
+	"-order":        ORDER,
+	"-year":         YEAR,
+	"-translate":    TRANSLATE,
+	"-terms":        TERMS,
+	"-words":        WORDS,
+	"-pairs":        PAIRS,
+	"-reverse":      REVERSE,
+	"-letters":      LETTERS,
+	"-clauses":      CLAUSES,
+	"-indices":      INDICES,
+	"-meshcode":     MESHCODE,
+	"-matrix":       MATRIX,
+	"-histogram":    HISTOGRAM,
+	"-accented":     ACCENTED,
+	"-pfx":          PFX,
+	"-sfx":          SFX,
+	"-sep":          SEP,
+	"-tab":          TAB,
+	"-ret":          RET,
+	"-lbl":          LBL,
+	"-clr":          CLR,
+	"-pfc":          PFC,
+	"-deq":          DEQ,
+	"-plg":          PLG,
+	"-elg":          ELG,
+	"-fwd":          FWD,
+	"-awd":          AWD,
+	"-wrp":          WRP,
+	"-rst":          RST,
+	"-def":          DEF,
+	"-color":        COLOR,
+	"-position":     POSITION,
+	"-select":       SELECT,
+	"-if":           IF,
+	"-unless":       UNLESS,
+	"-match":        MATCH,
+	"-avoid":        AVOID,
+	"-and":          AND,
+	"-or":           OR,
+	"-equals":       EQUALS,
+	"-contains":     CONTAINS,
+	"-is-within":    ISWITHIN,
+	"-starts-with":  STARTSWITH,
+	"-ends-with":    ENDSWITH,
+	"-is-not":       ISNOT,
+	"-is-before":    ISBEFORE,
+	"-is-after":     ISAFTER,
+	"-matches":      MATCHES,
+	"-resembles":    RESEMBLES,
+	"-is-equal-to":  ISEQUALTO,
+	"-differs-from": DIFFERSFROM,
+	"-gt":           GT,
+	"-ge":           GE,
+	"-lt":           LT,
+	"-le":           LE,
+	"-eq":           EQ,
+	"-ne":           NE,
+	"-num":          NUM,
+	"-len":          LEN,
+	"-sum":          SUM,
+	"-min":          MIN,
+	"-max":          MAX,
+	"-inc":          INC,
+	"-dec":          DEC,
+	"-sub":          SUB,
+	"-avg":          AVG,
+	"-dev":          DEV,
+	"-med":          MED,
+	"-mul":          MUL,
+	"-div":          DIV,
+	"-mod":          MOD,
+	"-bin":          BIN,
+	"-bit":          BIT,
+	"-0-based":      ZEROBASED,
+	"-zero-based":   ZEROBASED,
+	"-1-based":      ONEBASED,
+	"-one-based":    ONEBASED,
+	"-ucsc":         UCSCBASED,
+	"-ucsc-based":   UCSCBASED,
+	"-ucsc-coords":  UCSCBASED,
+	"-bed-based":    UCSCBASED,
+	"-bed-coords":   UCSCBASED,
+	"-revcomp":      REVCOMP,
+	"-nucleic":      NUCLEIC,
+	"-molwt":        MOLWT,
+	"-else":         ELSE,
 }
-
-var slock sync.RWMutex
 
 var sequenceTypeIs = map[string]SequenceType{
 	"INSDSeq:INSDInterval_from":       {1, ISSTART},
@@ -1856,16 +1181,16 @@ var sequenceTypeIs = map[string]SequenceType{
 	"Entrezgene:Seq-interval_to":      {0, ISSTOP},
 	"GenomicInfoType:ChrStart":        {0, ISSTART},
 	"GenomicInfoType:ChrStop":         {0, ISSTOP},
-	"Rs:@aaPosition":                  {0, ISPOS},
-	"Rs:@asnFrom":                     {0, ISSTART},
-	"Rs:@asnTo":                       {0, ISSTOP},
-	"Rs:@end":                         {0, ISSTOP},
-	"Rs:@leftContigNeighborPos":       {0, ISSTART},
-	"Rs:@physMapInt":                  {0, ISPOS},
-	"Rs:@protLoc":                     {0, ISPOS},
-	"Rs:@rightContigNeighborPos":      {0, ISSTOP},
-	"Rs:@start":                       {0, ISSTART},
-	"Rs:@structLoc":                   {0, ISPOS},
+	"RS:position":                     {0, ISPOS},
+	"RS:@asnFrom":                     {0, ISSTART},
+	"RS:@asnTo":                       {0, ISSTOP},
+	"RS:@end":                         {0, ISSTOP},
+	"RS:@leftContigNeighborPos":       {0, ISSTART},
+	"RS:@physMapInt":                  {0, ISPOS},
+	"RS:@protLoc":                     {0, ISPOS},
+	"RS:@rightContigNeighborPos":      {0, ISSTOP},
+	"RS:@start":                       {0, ISSTART},
+	"RS:@structLoc":                   {0, ISPOS},
 }
 
 var revComp = map[rune]rune{
@@ -1905,6 +1230,180 @@ var revComp = map[rune]rune{
 	'y': 'r',
 }
 
+var numC = map[rune]int{
+	'A': 3,
+	'B': 4,
+	'C': 3,
+	'D': 4,
+	'E': 5,
+	'F': 9,
+	'G': 2,
+	'H': 6,
+	'I': 6,
+	'J': 6,
+	'K': 6,
+	'L': 6,
+	'M': 5,
+	'N': 4,
+	'O': 12,
+	'P': 5,
+	'Q': 5,
+	'R': 6,
+	'S': 3,
+	'T': 4,
+	'U': 3,
+	'V': 5,
+	'W': 11,
+	'X': 0,
+	'Y': 9,
+	'Z': 5,
+}
+
+var numH = map[rune]int{
+	'A': 5,
+	'B': 5,
+	'C': 5,
+	'D': 5,
+	'E': 7,
+	'F': 9,
+	'G': 3,
+	'H': 7,
+	'I': 11,
+	'J': 11,
+	'K': 12,
+	'L': 11,
+	'M': 9,
+	'N': 6,
+	'O': 19,
+	'P': 7,
+	'Q': 8,
+	'R': 12,
+	'S': 5,
+	'T': 7,
+	'U': 5,
+	'V': 9,
+	'W': 10,
+	'X': 0,
+	'Y': 9,
+	'Z': 7,
+}
+
+var numN = map[rune]int{
+	'A': 1,
+	'B': 1,
+	'C': 1,
+	'D': 1,
+	'E': 1,
+	'F': 1,
+	'G': 1,
+	'H': 3,
+	'I': 1,
+	'J': 1,
+	'K': 2,
+	'L': 1,
+	'M': 1,
+	'N': 2,
+	'O': 3,
+	'P': 1,
+	'Q': 2,
+	'R': 4,
+	'S': 1,
+	'T': 1,
+	'U': 1,
+	'V': 1,
+	'W': 2,
+	'X': 0,
+	'Y': 1,
+	'Z': 1,
+}
+
+var numO = map[rune]int{
+	'A': 1,
+	'B': 3,
+	'C': 1,
+	'D': 3,
+	'E': 3,
+	'F': 1,
+	'G': 1,
+	'H': 1,
+	'I': 1,
+	'J': 1,
+	'K': 1,
+	'L': 1,
+	'M': 1,
+	'N': 2,
+	'O': 2,
+	'P': 1,
+	'Q': 2,
+	'R': 1,
+	'S': 2,
+	'T': 2,
+	'U': 1,
+	'V': 1,
+	'W': 1,
+	'X': 0,
+	'Y': 2,
+	'Z': 3,
+}
+
+var numS = map[rune]int{
+	'A': 0,
+	'B': 0,
+	'C': 1,
+	'D': 0,
+	'E': 0,
+	'F': 0,
+	'G': 0,
+	'H': 0,
+	'I': 0,
+	'J': 0,
+	'K': 0,
+	'L': 0,
+	'M': 1,
+	'N': 0,
+	'O': 0,
+	'P': 0,
+	'Q': 0,
+	'R': 0,
+	'S': 0,
+	'T': 0,
+	'U': 0,
+	'V': 0,
+	'W': 0,
+	'X': 0,
+	'Y': 0,
+	'Z': 0,
+}
+
+var numSe = map[rune]int{
+	'A': 0,
+	'B': 0,
+	'C': 0,
+	'D': 0,
+	'E': 0,
+	'F': 0,
+	'G': 0,
+	'H': 0,
+	'I': 0,
+	'J': 0,
+	'K': 0,
+	'L': 0,
+	'M': 0,
+	'N': 0,
+	'O': 0,
+	'P': 0,
+	'Q': 0,
+	'R': 0,
+	'S': 0,
+	'T': 0,
+	'U': 1,
+	'V': 0,
+	'W': 0,
+	'X': 0,
+	'Y': 0,
+	'Z': 0,
+}
+
 // DATA OBJECTS
 
 type Step struct {
@@ -1933,9 +1432,12 @@ type Block struct {
 	Visit      string
 	Parent     string
 	Match      string
+	Path       []string
 	Working    []string
 	Parsed     []string
 	Position   string
+	Foreword   string
+	Afterword  string
 	Conditions []*Operation
 	Commands   []*Operation
 	Failure    []*Operation
@@ -1996,10 +1498,43 @@ func ParseMarkup(str, cmd string) MarkupPolicy {
 	return NOMARKUP
 }
 
+// DebugBlock examines structure of parsed arguments (undocumented)
+/*
+func DebugBlock(blk *Block, depth int) {
+
+	doIndent := func(indt int) {
+		for i := 1; i < indt; i++ {
+			fmt.Fprintf(os.Stderr, "  ")
+		}
+	}
+
+	doIndent(depth)
+
+	if blk.Visit != "" {
+		doIndent(depth + 1)
+		fmt.Fprintf(os.Stderr, "<Visit> %s </Visit>\n", blk.Visit)
+	}
+	if len(blk.Parsed) > 0 {
+		doIndent(depth + 1)
+		fmt.Fprintf(os.Stderr, "<Parsed>")
+		for _, str := range blk.Parsed {
+			fmt.Fprintf(os.Stderr, " %s", str)
+		}
+		fmt.Fprintf(os.Stderr, " </Parsed>\n")
+	}
+
+	if len(blk.Subtasks) > 0 {
+		for _, sub := range blk.Subtasks {
+			DebugBlock(sub, depth+1)
+		}
+	}
+}
+*/
+
 // PARSE COMMAND-LINE ARGUMENTS
 
 // ParseArguments parses nested exploration instruction from command-line arguments
-func ParseArguments(args []string, pttrn string) *Block {
+func ParseArguments(cmdargs []string, pttrn string) *Block {
 
 	// different names of exploration control arguments allow multiple levels of nested "for" loops in a linear command line
 	// (capitalized versions for backward-compatibility with original Perl implementation handling of recursive definitions)
@@ -2013,6 +1548,7 @@ func ParseArguments(args []string, pttrn string) *Block {
 			"-branch",
 			"-group",
 			"-division",
+			"-path",
 			"-pattern",
 		}
 
@@ -2025,6 +1561,7 @@ func ParseArguments(args []string, pttrn string) *Block {
 			"-Branch",
 			"-Group",
 			"-Division",
+			"-Path",
 			"-Pattern",
 		}
 	)
@@ -2103,9 +1640,26 @@ func ParseArguments(args []string, pttrn string) *Block {
 				}
 			}
 
-			// parse parent/child construct
+			// convert slashes (e.g., parent/child construct) to periods (e.g., dotted exploration path)
+			if strings.Contains(visit, "/") {
+				if !strings.Contains(visit, ".") {
+					visit = strings.Replace(visit, "/", ".", -1)
+				}
+			}
+
+			// parse parent.child or dotted path construct
 			// colon indicates a namespace prefix in any or all of the components
-			prnt, match := SplitInTwoAt(visit, "/", RIGHT)
+			prnt, rmdr := SplitInTwoAt(visit, ".", RIGHT)
+			match, rest := SplitInTwoAt(rmdr, ".", LEFT)
+
+			if rest != "" {
+
+				// exploration match on first component, then search remainder one level at a time with subsequent components
+				dirs := strings.Split(rmdr, ".")
+
+				// signal with "path" position
+				return &Block{Visit: visit, Parent: "", Match: prnt, Path: dirs, Position: "path", Parsed: args[0:partition], Working: args[partition:]}
+			}
 
 			// promote arguments parsed at this level
 			return &Block{Visit: visit, Parent: prnt, Match: match, Parsed: args[0:partition], Working: args[partition:]}
@@ -2154,15 +1708,13 @@ func ParseArguments(args []string, pttrn string) *Block {
 			return
 		}
 
-		ln := len(rnge)
-
 		// check if last character is right square bracket
-		if ln < 1 || rnge[ln-1] != ']' {
+		if !strings.HasSuffix(rnge, "]") {
 			fmt.Fprintf(os.Stderr, "\nERROR: Unrecognized range %s\n", rnge)
 			os.Exit(1)
 		}
 
-		rnge = rnge[:ln-1]
+		rnge = strings.TrimSuffix(rnge, "]")
 
 		if rnge == "" {
 			fmt.Fprintf(os.Stderr, "\nERROR: Empty range %s[]\n", item)
@@ -2318,8 +1870,6 @@ func ParseArguments(args []string, pttrn string) *Block {
 
 		cond := make([]*Operation, 0, max)
 
-		status := UNSET
-
 		// parse conditional clause into execution step
 		parseStep := func(op *Operation, elementColonValue bool) {
 
@@ -2424,6 +1974,8 @@ func ParseArguments(args []string, pttrn string) *Block {
 		// flag to allow element-colon-value for deprecated -match and -avoid commands, otherwise colon is for namespace prefixes
 		elementColonValue := false
 
+		status := UNSET
+
 		// parse command strings into operation structure
 		for idx < max {
 			str := arguments[idx]
@@ -2449,6 +2001,10 @@ func ParseArguments(args []string, pttrn string) *Block {
 			case UNSET:
 				status = ParseFlag(str)
 			case POSITION:
+				if cmds.Position != "" {
+					fmt.Fprintf(os.Stderr, "\nERROR: -position '%s' conflicts with existing '%s'\n", str, cmds.Position)
+					os.Exit(1)
+				}
 				cmds.Position = str
 				status = UNSET
 			case MATCH, AVOID:
@@ -2459,7 +2015,7 @@ func ParseArguments(args []string, pttrn string) *Block {
 				cond = append(cond, op)
 				parseStep(op, elementColonValue)
 				status = UNSET
-			case EQUALS, CONTAINS, STARTSWITH, ENDSWITH, ISNOT:
+			case EQUALS, CONTAINS, ISWITHIN, STARTSWITH, ENDSWITH, ISNOT, ISBEFORE, ISAFTER:
 				if op != nil {
 					if len(str) > 1 && str[0] == '\\' {
 						// first character may be backslash protecting dash (undocumented)
@@ -2471,6 +2027,70 @@ func ParseArguments(args []string, pttrn string) *Block {
 				} else {
 					fmt.Fprintf(os.Stderr, "\nERROR: Unexpected adjacent string match constraints\n")
 					os.Exit(1)
+				}
+				status = UNSET
+			case MATCHES:
+				if op != nil {
+					if len(str) > 1 && str[0] == '\\' {
+						// first character may be backslash protecting dash (undocumented)
+						str = str[1:]
+					}
+					str = RemoveCommaOrSemicolon(str)
+					tsk := &Step{Type: status, Value: str}
+					op.Stages = append(op.Stages, tsk)
+					op = nil
+				} else {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unexpected adjacent string match constraints\n")
+					os.Exit(1)
+				}
+				status = UNSET
+			case RESEMBLES:
+				if op != nil {
+					if len(str) > 1 && str[0] == '\\' {
+						// first character may be backslash protecting dash (undocumented)
+						str = str[1:]
+					}
+					str = SortStringByWords(str)
+					tsk := &Step{Type: status, Value: str}
+					op.Stages = append(op.Stages, tsk)
+					op = nil
+				} else {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unexpected adjacent string match constraints\n")
+					os.Exit(1)
+				}
+				status = UNSET
+			case ISEQUALTO, DIFFERSFROM:
+				if op != nil {
+					if len(str) < 1 {
+						fmt.Fprintf(os.Stderr, "\nERROR: Empty conditional argument\n")
+						os.Exit(1)
+					}
+					ch := str[0]
+					// uses element as second argument
+					orig := str
+					if ch == '#' || ch == '%' || ch == '^' {
+						// check for pound, percent, or caret character at beginning of element (undocumented)
+						str = str[1:]
+						if len(str) < 1 {
+							fmt.Fprintf(os.Stderr, "\nERROR: Unexpected conditional constraints\n")
+							os.Exit(1)
+						}
+						ch = str[0]
+					}
+					if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') {
+						prnt, match := SplitInTwoAt(str, "/", RIGHT)
+						match, attrib := SplitInTwoAt(match, "@", LEFT)
+						wildcard := false
+						if strings.HasPrefix(prnt, ":") || strings.HasPrefix(match, ":") || strings.HasPrefix(attrib, ":") {
+							wildcard = true
+						}
+						tsk := &Step{Type: status, Value: orig, Parent: prnt, Match: match, Attrib: attrib, Wild: wildcard}
+						op.Stages = append(op.Stages, tsk)
+					} else {
+						fmt.Fprintf(os.Stderr, "\nERROR: Unexpected conditional constraints\n")
+						os.Exit(1)
+					}
+					op = nil
 				}
 				status = UNSET
 			case GT, GE, LT, LE, EQ, NE:
@@ -2552,6 +2172,9 @@ func ParseArguments(args []string, pttrn string) *Block {
 				fmt.Fprintf(os.Stderr, "\nERROR: Unexpected position for %s command\n", txt)
 				os.Exit(1)
 			} else if txt == "-clr" {
+				// main loop runs out after trailing -clr, add another so this one will be executed
+				arguments = append(arguments, "-clr")
+				max++
 			} else if max < 2 || arguments[max-2] != "-lbl" {
 				fmt.Fprintf(os.Stderr, "\nERROR: Item missing after %s command\n", txt)
 				os.Exit(1)
@@ -2560,12 +2183,10 @@ func ParseArguments(args []string, pttrn string) *Block {
 
 		comm := make([]*Operation, 0, max)
 
-		status := UNSET
-
 		// parse next argument
 		nextStatus := func(str string) OpType {
 
-			status = ParseFlag(str)
+			status := ParseFlag(str)
 
 			switch status {
 			case VARIABLE:
@@ -2576,9 +2197,10 @@ func ParseArguments(args []string, pttrn string) *Block {
 				op := &Operation{Type: status, Value: ""}
 				comm = append(comm, op)
 				status = UNSET
-			case ELEMENT, FIRST, LAST, ENCODE, UPPER, LOWER, TITLE, TERMS, WORDS, PAIRS, LETTERS, INDICES:
-			case NUM, LEN, SUM, MIN, MAX, INC, DEC, SUB, AVG, DEV, MED, BIN, BIT, ZEROBASED, ONEBASED, UCSCBASED, REVCOMP:
-			case TAB, RET, PFX, SFX, SEP, LBL, PFC, PLG, ELG, WRP, DEF:
+			case ELEMENT, FIRST, LAST, ENCODE, DECODE, PLAIN, UPPER, LOWER, CHAIN, TITLE, ORDER, YEAR, TRANSLATE, TERMS, WORDS, PAIRS, REVERSE, LETTERS, CLAUSES, INDICES, MESHCODE, MATRIX, HISTOGRAM, ACCENTED:
+			case NUM, LEN, SUM, MIN, MAX, INC, DEC, SUB, AVG, DEV, MED, MUL, DIV, MOD, BIN, BIT, ZEROBASED, ONEBASED, UCSCBASED, REVCOMP, NUCLEIC, MOLWT:
+			case TAB, RET, PFX, SFX, SEP, LBL, PFC, DEQ, PLG, ELG, WRP, DEF, COLOR:
+			case FWD, AWD:
 			case UNSET:
 				fmt.Fprintf(os.Stderr, "\nERROR: No -element before '%s'\n", str)
 				os.Exit(1)
@@ -2606,11 +2228,12 @@ func ParseArguments(args []string, pttrn string) *Block {
 			// element names combined with commas are treated as a prefix-separator-suffix group
 			comma := strings.Split(str, ",")
 
+			rnge := ""
 			for _, item := range comma {
 				status := stat
 
 				// isolate and parse optional [min:max], [&VAR:&VAR], or [after|before] range specification
-				item, rnge := SplitInTwoAt(item, "[", LEFT)
+				item, rnge = SplitInTwoAt(item, "[", LEFT)
 
 				item = strings.TrimSpace(item)
 				rnge = strings.TrimSpace(rnge)
@@ -2653,14 +2276,16 @@ func ParseArguments(args []string, pttrn string) *Block {
 					}
 				} else {
 					switch item {
+					case "?":
+						status = QUESTION
 					case "*":
 						status = STAR
-					case "+":
-						status = INDEX
 					case "$":
 						status = DOLLAR
 					case "@":
 						status = ATSIGN
+					case "+":
+						status = INDEX
 					default:
 					}
 				}
@@ -2738,6 +2363,8 @@ func ParseArguments(args []string, pttrn string) *Block {
 
 		idx := 0
 
+		status := UNSET
+
 		// parse command strings into operation structure
 		for idx < max {
 			str := arguments[idx]
@@ -2751,8 +2378,8 @@ func ParseArguments(args []string, pttrn string) *Block {
 			switch status {
 			case UNSET:
 				status = nextStatus(str)
-			case ELEMENT, FIRST, LAST, ENCODE, UPPER, LOWER, TITLE, TERMS, WORDS, PAIRS, LETTERS, INDICES,
-				NUM, LEN, SUM, MIN, MAX, INC, DEC, SUB, AVG, DEV, MED, BIN, BIT, ZEROBASED, ONEBASED, UCSCBASED, REVCOMP:
+			case ELEMENT, FIRST, LAST, ENCODE, DECODE, PLAIN, UPPER, LOWER, CHAIN, TITLE, ORDER, YEAR, TRANSLATE, TERMS, WORDS, PAIRS, REVERSE, LETTERS, CLAUSES, INDICES, MESHCODE, MATRIX, HISTOGRAM, ACCENTED,
+				NUM, LEN, SUM, MIN, MAX, INC, DEC, SUB, AVG, DEV, MED, MUL, DIV, MOD, BIN, BIT, ZEROBASED, ONEBASED, UCSCBASED, REVCOMP, NUCLEIC, MOLWT:
 				for !strings.HasPrefix(str, "-") {
 					// create one operation per argument, even if under a single -element statement
 					op := &Operation{Type: status, Value: str}
@@ -2768,9 +2395,15 @@ func ParseArguments(args []string, pttrn string) *Block {
 				if idx < max {
 					status = nextStatus(str)
 				}
-			case TAB, RET, PFX, SFX, SEP, LBL, PFC, PLG, ELG, WRP, DEF:
+			case TAB, RET, PFX, SFX, SEP, LBL, PFC, DEQ, PLG, ELG, WRP, DEF, COLOR:
 				op := &Operation{Type: status, Value: ConvertSlash(str)}
 				comm = append(comm, op)
+				status = UNSET
+			case FWD:
+				cmds.Foreword = ConvertSlash(str)
+				status = UNSET
+			case AWD:
+				cmds.Afterword = ConvertSlash(str)
 				status = UNSET
 			case VARIABLE:
 				op := &Operation{Type: status, Value: str[1:]}
@@ -2876,7 +2509,7 @@ func ParseArguments(args []string, pttrn string) *Block {
 
 	head := &Block{}
 
-	for _, txt := range args {
+	for _, txt := range cmdargs {
 		head.Working = append(head.Working, txt)
 	}
 
@@ -2896,7 +2529,7 @@ func ParseArguments(args []string, pttrn string) *Block {
 	// check for no -element or multiple -pattern commands
 	noElement := true
 	numPatterns := 0
-	for _, txt := range args {
+	for _, txt := range cmdargs {
 		if argTypeIs[txt] == EXTRACTION {
 			noElement = false
 		}
@@ -2940,6 +2573,24 @@ func ExploreElements(curr *Node, mask, prnt, match, attrib string, wildcard, une
 		deep = true
 	}
 
+	var exploreChildren func(curr *Node, acc func(string))
+
+	exploreChildren = func(curr *Node, acc func(string)) {
+
+		if curr.Contents != "" {
+			acc(curr.Contents)
+		}
+		for chld := curr.Children; chld != nil; chld = chld.Next {
+			if chld.Name != "" {
+				acc("<" + chld.Name + ">")
+			}
+			exploreChildren(chld, acc)
+			if chld.Name != "" {
+				acc("</" + chld.Name + ">")
+			}
+		}
+	}
+
 	// exploreElements recursive definition
 	var exploreElements func(curr *Node, skip string, lev int)
 
@@ -2950,8 +2601,10 @@ func ExploreElements(curr *Node, mask, prnt, match, attrib string, wildcard, une
 			return
 		}
 
-		// wildcard matches any namespace prefix
 		if curr.Name == match ||
+			// parent/* matches any subfield
+			(match == "*" && prnt != "") ||
+			// wildcard (internal colon) matches any namespace prefix
 			(wildcard && strings.HasPrefix(match, ":") && strings.HasSuffix(curr.Name, match)) ||
 			(match == "" && attrib != "") {
 
@@ -2986,6 +2639,35 @@ func ExploreElements(curr *Node, mask, prnt, match, attrib string, wildcard, une
 					return
 
 				} else if curr.Children != nil {
+
+					if DoMixed {
+						// match with mixed contents - send all child strings
+						var buffer strings.Builder
+						exploreChildren(curr, func(str string) {
+							if str != "" {
+								buffer.WriteString(str)
+							}
+						})
+						str := buffer.String()
+
+						// clean up reconstructed mixed content
+						str = DoTrimFlankingHTML(str)
+						if HasBadSpace(str) {
+							str = CleanupBadSpaces(str)
+						}
+						if HasAdjacentSpaces(str) {
+							str = CompressRunsOfSpaces(str)
+						}
+						if NeedsTightening(str) {
+							str = TightenParentheses(str)
+						}
+						if unescape && HasAmpOrNotASCII(str) {
+							str = html.UnescapeString(str)
+						}
+
+						proc(str, level)
+						return
+					}
 
 					// for XML container object, send empty string to callback to increment count
 					proc("", level)
@@ -3071,68 +2753,70 @@ func PrintSubtree(node *Node, style IndentType, printAttrs bool, proc func(strin
 			doIndent(depth)
 		}
 
-		proc("<")
-		proc(curr.Name)
+		if curr.Name != "" {
+			proc("<")
+			proc(curr.Name)
 
-		if printAttrs {
+			if printAttrs {
 
-			attr := strings.TrimSpace(curr.Attributes)
-			attr = CompressRunsOfSpaces(attr)
+				attr := strings.TrimSpace(curr.Attributes)
+				attr = CompressRunsOfSpaces(attr)
 
-			if attr != "" {
+				if attr != "" {
 
-				if wrapped {
+					if wrapped {
 
-					start := 0
-					idx := 0
+						start := 0
+						idx := 0
 
-					attlen := len(attr)
+						attlen := len(attr)
 
-					for idx < attlen {
-						ch := attr[idx]
-						if ch == '=' {
-							str := attr[start:idx]
-							proc("\n")
-							doIndent(depth)
-							proc(" ")
-							proc(str)
-							// skip past equal sign and leading double quote
-							idx += 2
-							start = idx
-						} else if ch == '"' {
-							str := attr[start:idx]
-							proc("=\"")
-							proc(str)
-							proc("\"")
-							// skip past trailing double quote and (possible) space
-							idx += 2
-							start = idx
-						} else {
-							idx++
+						for idx < attlen {
+							ch := attr[idx]
+							if ch == '=' {
+								str := attr[start:idx]
+								proc("\n")
+								doIndent(depth)
+								proc(" ")
+								proc(str)
+								// skip past equal sign and leading double quote
+								idx += 2
+								start = idx
+							} else if ch == '"' || ch == '\'' {
+								str := attr[start:idx]
+								proc("=\"")
+								proc(str)
+								proc("\"")
+								// skip past trailing double quote and (possible) space
+								idx += 2
+								start = idx
+							} else {
+								idx++
+							}
 						}
+
+						proc("\n")
+						doIndent(depth)
+
+					} else {
+
+						proc(" ")
+						proc(attr)
 					}
-
-					proc("\n")
-					doIndent(depth)
-
-				} else {
-
-					proc(" ")
-					proc(attr)
 				}
 			}
-		}
 
-		// see if suitable for for self-closing tag
-		if curr.Contents == "" && curr.Children == nil {
-			proc("/>")
-			if style != COMPACT {
-				proc("\n")
+			// see if suitable for for self-closing tag
+			if curr.Contents == "" && curr.Children == nil {
+				proc("/>")
+				if style != COMPACT {
+					proc("\n")
+				}
+				return
 			}
-			return
-		}
 
-		proc(">")
+			proc(">")
+		}
 
 		if curr.Contents != "" {
 
@@ -3158,10 +2842,12 @@ func PrintSubtree(node *Node, style IndentType, printAttrs bool, proc func(strin
 			}
 		}
 
-		proc("<")
-		proc("/")
-		proc(curr.Name)
-		proc(">")
+		if curr.Name != "" {
+			proc("<")
+			proc("/")
+			proc(curr.Name)
+			proc(">")
+		}
 
 		if style != COMPACT {
 			proc("\n")
@@ -3172,10 +2858,65 @@ func PrintSubtree(node *Node, style IndentType, printAttrs bool, proc func(strin
 }
 
 // ProcessClause handles comma-separated -element arguments
-func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, def string, status OpType, index, level int, variables map[string]string) (string, bool) {
+func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, def string, status OpType, index, level int, variables map[string]string, transform map[string]string, histogram map[string]int) (string, bool) {
 
 	if curr == nil || stages == nil {
 		return "", false
+	}
+
+	// reverseComplement reverse-complements a nucleotide sequence
+	reverseComplement := func(str string) string {
+
+		runes := []rune(str)
+		// reverse sequence letters - middle base in odd-length sequence is not touched, so cannot also complement here
+		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+			runes[i], runes[j] = runes[j], runes[i]
+		}
+		found := false
+		// now complement every base, also handling uracil, leaving case intact
+		for i, ch := range runes {
+			runes[i], found = revComp[ch]
+			if !found {
+				runes[i] = 'X'
+			}
+		}
+		str = string(runes)
+
+		return str
+	}
+
+	// proteinWeight adds the molecular weight of each amino acid
+	proteinWeight := func(str string) string {
+
+		// Start with water (H2O)
+		c := 0
+		h := 2
+		n := 0
+		o := 1
+		s := 0
+		se := 0
+
+		// remove leading methionine
+		str = strings.ToUpper(str)
+		str = strings.TrimPrefix(str, "M")
+
+		runes := []rune(str)
+		// add number of carbon, hydrogen, nitrogen, oxygen, sulfur, and selenium atoms per amino acid
+		for _, ch := range runes {
+			c += numC[ch]
+			h += numH[ch]
+			n += numN[ch]
+			o += numO[ch]
+			s += numS[ch]
+			se += numSe[ch]
+		}
+
+		// calculate molecular weight
+		wt := 12.01115*float64(c) + 1.0079*float64(h) + 14.0067*float64(n) + 15.9994*float64(o) + 32.064*float64(s) + 78.96*float64(se)
+
+		str = strconv.Itoa(int(wt + 0.5))
+
+		return str
 	}
 
 	// processElement handles individual -element constructs
@@ -3296,13 +3037,36 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 					}
 				}
 
+				doRevComp := false
+				doUpCase := false
+				if status == NUCLEIC {
+					// -nucleic uses direction of range to decide between forward strand or reverse complement
+					if min+1 > max {
+						min, max = max-1, min+1
+						doRevComp = true
+					}
+					doUpCase = true
+				}
+
 				// numeric range now calculated, apply slice to string
 				if min == 0 && max == 0 {
+					if doRevComp {
+						str = reverseComplement(str)
+					}
+					if doUpCase {
+						str = strings.ToUpper(str)
+					}
 					acc(str)
 				} else if max == 0 {
 					if min > 0 && min < len(str) {
 						str = str[min:]
 						if str != "" {
+							if doRevComp {
+								str = reverseComplement(str)
+							}
+							if doUpCase {
+								str = strings.ToUpper(str)
+							}
 							acc(str)
 						}
 					}
@@ -3310,6 +3074,12 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 					if max > 0 && max <= len(str) {
 						str = str[:max]
 						if str != "" {
+							if doRevComp {
+								str = reverseComplement(str)
+							}
+							if doUpCase {
+								str = strings.ToUpper(str)
+							}
 							acc(str)
 						}
 					}
@@ -3317,6 +3087,12 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 					if min < max && min > 0 && max <= len(str) {
 						str = str[min:max]
 						if str != "" {
+							if doRevComp {
+								str = reverseComplement(str)
+							}
+							if doUpCase {
+								str = strings.ToUpper(str)
+							}
 							acc(str)
 						}
 					}
@@ -3324,7 +3100,14 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 			}
 
 			switch stat {
-			case ELEMENT, TERMS, WORDS, PAIRS, LETTERS, INDICES, VALUE, LEN, SUM, MIN, MAX, SUB, AVG, DEV, MED, BIN, BIT, REVCOMP:
+			case ELEMENT:
+				exploreElements(func(str string, lvl int) {
+					if str != "" {
+						sendSlice(str)
+					}
+				})
+			case TERMS, WORDS, PAIRS, REVERSE, LETTERS, CLAUSES, INDICES, MESHCODE, MATRIX, HISTOGRAM, ACCENTED,
+				VALUE, LEN, SUM, MIN, MAX, SUB, AVG, DEV, MED, MUL, DIV, MOD, BIN, BIT, REVCOMP, NUCLEIC, MOLWT:
 				exploreElements(func(str string, lvl int) {
 					if str != "" {
 						sendSlice(str)
@@ -3359,6 +3142,35 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 						sendSlice(str)
 					}
 				})
+			case DECODE:
+				exploreElements(func(str string, lvl int) {
+					if str != "" {
+						txt, err := base64.StdEncoding.DecodeString(str)
+						if err == nil {
+							sendSlice(string(txt))
+						}
+					}
+				})
+			case PLAIN:
+				exploreElements(func(str string, lvl int) {
+					if str != "" {
+						if IsNotASCII(str) {
+							str = DoAccentTransform(str)
+							if HasUnicodeMarkup(str) {
+								str = RepairUnicodeMarkup(str, SPACE)
+							}
+						}
+						if HasBadSpace(str) {
+							str = CleanupBadSpaces(str)
+						}
+						if HasAngleBracket(str) {
+							str = RepairTableMarkup(str, SPACE)
+							str = RemoveEmbeddedMarkup(str)
+							str = CompressRunsOfSpaces(str)
+						}
+						sendSlice(str)
+					}
+				})
 			case UPPER:
 				exploreElements(func(str string, lvl int) {
 					if str != "" {
@@ -3373,12 +3185,51 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 						sendSlice(str)
 					}
 				})
+			case CHAIN:
+				exploreElements(func(str string, lvl int) {
+					if str != "" {
+						str = strings.Replace(str, " ", "_", -1)
+						sendSlice(str)
+					}
+				})
 			case TITLE:
 				exploreElements(func(str string, lvl int) {
 					if str != "" {
 						str = strings.ToLower(str)
 						str = strings.Title(str)
 						sendSlice(str)
+					}
+				})
+			case ORDER:
+				exploreElements(func(str string, lvl int) {
+					if str != "" {
+						str = SortStringByWords(str)
+						sendSlice(str)
+					}
+				})
+			case YEAR:
+				exploreElements(func(str string, lvl int) {
+					if str != "" {
+						words := strings.FieldsFunc(str, func(c rune) bool {
+							return !unicode.IsDigit(c)
+						})
+						for _, item := range words {
+							if len(item) == 4 {
+								sendSlice(item)
+								// only print first year, e.g., PubDate/MedlineDate "2008 Dec-2009 Jan"
+								return
+							}
+						}
+					}
+				})
+			case TRANSLATE:
+				exploreElements(func(str string, lvl int) {
+					if str != "" {
+						txt, found := transform[str]
+						if found {
+							// require successful mapping
+							sendSlice(txt)
+						}
 					}
 				})
 			case VARIABLE:
@@ -3443,6 +3294,8 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 						}
 					}
 				})
+			case QUESTION:
+				acc(curr.Name)
 			case STAR:
 				// -element "*" prints current XML subtree on a single line
 				style := SINGULARITY
@@ -3502,7 +3355,7 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 	between := ""
 
 	switch status {
-	case ELEMENT, ENCODE, UPPER, LOWER, TITLE, VALUE, NUM, INC, DEC, ZEROBASED, ONEBASED, UCSCBASED:
+	case ELEMENT:
 		processElement(func(str string) {
 			if str != "" {
 				ok = true
@@ -3539,321 +3392,30 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 			buffer.WriteString(single)
 			between = sep
 		}
-	case TERMS:
+	case ENCODE, DECODE, PLAIN, UPPER, LOWER, CHAIN, TITLE, ORDER, YEAR, TRANSLATE, VALUE, NUM, INC, DEC, ZEROBASED, ONEBASED, UCSCBASED, NUCLEIC:
 		processElement(func(str string) {
 			if str != "" {
-
-				terms := strings.Fields(str)
-				for _, item := range terms {
-					max := len(item)
-					for max > 1 {
-						ch := item[max-1]
-						if ch != '.' && ch != ',' && ch != ':' && ch != ';' {
-							break
-						}
-						// trim trailing period, comma, colon, and semicolon
-						item = item[:max-1]
-						// continue checking for runs of punctuation at end
-						max--
-					}
-					if item == "" {
-						continue
-					}
-					ok = true
-					buffer.WriteString(between)
-					buffer.WriteString(item)
-					between = sep
-				}
-			}
-		})
-	case WORDS:
-
-		processElement(func(str string) {
-			if str != "" {
-
-				words := strings.FieldsFunc(str, func(c rune) bool {
-					return !unicode.IsLetter(c) && !unicode.IsDigit(c)
-				})
-				for _, item := range words {
-					item = strings.ToLower(item)
-					if DoStem {
-						item = porter2.Stem(item)
-					}
-					if DeStop {
-						if IsStopWord(item) {
-							continue
-						}
-					}
-					if item == "" {
-						continue
-					}
-					ok = true
-					buffer.WriteString(between)
-					buffer.WriteString(item)
-					between = sep
-				}
-			}
-		})
-	case PAIRS:
-
-		processElement(func(str string) {
-			if str != "" {
-
-				// break clauses at punctuation other than space or underscore, and at non-ASCII characters
-				clauses := strings.FieldsFunc(str, func(c rune) bool {
-					return (!unicode.IsLetter(c) && !unicode.IsDigit(c)) && c != ' ' || c > 127
-				})
-
-				// plus sign separates runs of unpunctuated words
-				phrases := strings.Join(clauses, " + ")
-
-				// break phrases into individual words
-				words := strings.Fields(phrases)
-
-				if len(words) > 1 {
-					past := ""
-					for _, item := range words {
-						if item == "+" {
-							past = ""
-							continue
-						}
-						item = strings.ToLower(item)
-						if DoStem {
-							item = porter2.Stem(item)
-						}
-						if DeStop {
-							if IsStopWord(item) {
-								past = ""
-								continue
-							}
-						}
-						if item == "" {
-							past = ""
-							continue
-						}
-						if past != "" {
-							ok = true
-							buffer.WriteString(between)
-							buffer.WriteString(past + " " + item)
-							between = sep
-						}
-						past = item
-					}
-				}
-			}
-		})
-	case LETTERS:
-		processElement(func(str string) {
-			if str != "" {
-				for _, ch := range str {
-					ok = true
-					buffer.WriteString(between)
-					buffer.WriteRune(ch)
-					between = sep
-				}
-			}
-		})
-	case INDICES:
-
-		norm := make(map[string][]string)
-
-		cumulative := 0
-
-		// mutex for inverted index
-		var ilock sync.Mutex
-
-		addItem := func(field map[string][]string, term string, position int) {
-
-			// protect with mutex
-			ilock.Lock()
-
-			defer ilock.Unlock()
-
-			arry, found := field[term]
-			if !found {
-				arry = make([]string, 0, 1)
-			}
-			arry = append(arry, strconv.Itoa(position))
-			field[term] = arry
-		}
-
-		processElement(func(str string) {
-
-			if str == "" {
-				return
-			}
-
-			// expand Greek letters, anglicize characters in other alphabets
-			if IsNotASCII(str) {
-				if HasGreek(str) {
-					str = SpellGreek(str)
-					str = CompressRunsOfSpaces(str)
-				}
-				str = DoAccentTransform(str)
-				if HasUnicodeMarkup(str) {
-					str = RepairUnicodeMarkup(str, SPACE)
-				}
-			}
-
-			str = strings.ToLower(str)
-
-			if HasBadSpace(str) {
-				str = CleanupBadSpaces(str)
-			}
-			if HasAngleBracket(str) {
-				str = RepairEncodedMarkup(str)
-				str = RepairScriptMarkup(str, SPACE)
-				str = RepairMathMLMarkup(str, SPACE)
-				// RemoveEmbeddedMarkup must be called before UnescapeString, which was suppressed in ExploreElements
-				str = RemoveEmbeddedMarkup(str)
-			}
-
-			if HasAmpOrNotASCII(str) {
-				str = html.UnescapeString(str)
-			}
-
-			str = strings.Replace(str, "_", " ", -1)
-
-			// must do after lower casing and removing underscores, but before removing hyphens
-			str = ProtectSpecialTerms(str)
-
-			str = RemoveAllPrefixHyphens(str)
-
-			str = strings.Replace(str, "-", " ", -1)
-
-			str = strings.Replace(str, " (", " ", -1)
-			str = strings.Replace(str, ") ", " ", -1)
-
-			// remove trailing punctuation from each word
-			var arry []string
-
-			terms := strings.Fields(str)
-			for _, item := range terms {
-				max := len(item)
-				for max > 1 {
-					ch := item[max-1]
-					if ch != '.' && ch != ',' && ch != ':' && ch != ';' {
-						break
-					}
-					// trim trailing period, comma, colon, and semicolon
-					item = item[:max-1]
-					// continue checking for runs of punctuation at end
-					max--
-				}
-				if item == "" {
-					continue
-				}
-				arry = append(arry, item)
-			}
-
-			// rejoin into string
-			cleaned := strings.Join(arry, " ")
-
-			// break clauses at punctuation other than space or underscore, and at non-ASCII characters
-			clauses := strings.FieldsFunc(cleaned, func(c rune) bool {
-				return (!unicode.IsLetter(c) && !unicode.IsDigit(c)) && c != ' ' && c != '_' || c > 127
-			})
-
-			// plus sign separates runs of unpunctuated words
-			phrases := strings.Join(clauses, " + ")
-
-			// break phrases into individual words
-			words := strings.Fields(phrases)
-
-			for _, item := range words {
-
-				cumulative++
-
-				// skip at site of punctuation break
-				if item == "+" {
-					continue
-				}
-
-				// skip a single character
-				if len(item) < 2 {
-					continue
-				}
-
-				// skip terms that are all digits
-				if IsAllDigitsOrPeriod(item) {
-					continue
-				}
-
-				// optional stop word removal
-				if DeStop && IsStopWord(item) {
-					continue
-				}
-
-				// index single normalized term
-				addItem(norm, item, cumulative)
 				ok = true
+				buffer.WriteString(between)
+				buffer.WriteString(str)
+				between = sep
 			}
-
-			// pad to avoid false positive proximity match of words in adjacent paragraphs
-			rounded := ((cumulative + 99) / 100) * 100
-			if rounded-cumulative < 20 {
-				rounded += 100
-			}
-			cumulative = rounded
 		})
-
-		prepareIndices := func(field map[string][]string, label string) {
-
-			if len(field) < 1 {
-				return
-			}
-
-			var arry []string
-
-			for item := range field {
-				arry = append(arry, item)
-			}
-
-			sort.Slice(arry, func(i, j int) bool { return arry[i] < arry[j] })
-
-			last := ""
-			for _, item := range arry {
-				item = strings.TrimSpace(item)
-				if item == "" {
-					continue
-				}
-				if item == last {
-					// skip duplicate entry
-					continue
-				}
-				buffer.WriteString("      <")
-				buffer.WriteString(label)
-				if len(field[item]) > 0 {
-					buffer.WriteString(" pos=\"")
-					attr := strings.Join(field[item], ",")
-					buffer.WriteString(attr)
-					buffer.WriteString("\"")
-				}
-				buffer.WriteString(">")
-				buffer.WriteString(item)
-				buffer.WriteString("</")
-				buffer.WriteString(label)
-				buffer.WriteString(">\n")
-				last = item
-			}
-		}
-
-		if ok {
-			prepareIndices(norm, "NORM")
-		}
 	case LEN:
 		length := 0
 
 		processElement(func(str string) {
-			ok = true
 			length += len(str)
+			ok = true
 		})
 
-		// length of element strings
-		val := strconv.Itoa(length)
-		buffer.WriteString(between)
-		buffer.WriteString(val)
-		between = sep
+		if ok {
+			// length of element strings
+			val := strconv.Itoa(length)
+			buffer.WriteString(between)
+			buffer.WriteString(val)
+			between = sep
+		}
 	case SUM:
 		sum := 0
 
@@ -4009,6 +3571,84 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 			buffer.WriteString(val)
 			between = sep
 		}
+	case MUL:
+		first := 0
+		second := 0
+		count := 0
+
+		processElement(func(str string) {
+			value, err := strconv.Atoi(str)
+			if err == nil {
+				count++
+				if count == 1 {
+					first = value
+				} else if count == 2 {
+					second = value
+				}
+			}
+		})
+
+		if count == 2 {
+			// must have exactly 2 elements
+			ok = true
+			// product of element values
+			val := strconv.Itoa(first * second)
+			buffer.WriteString(between)
+			buffer.WriteString(val)
+			between = sep
+		}
+	case DIV:
+		first := 0
+		second := 0
+		count := 0
+
+		processElement(func(str string) {
+			value, err := strconv.Atoi(str)
+			if err == nil {
+				count++
+				if count == 1 {
+					first = value
+				} else if count == 2 {
+					second = value
+				}
+			}
+		})
+
+		if count == 2 {
+			// must have exactly 2 elements
+			ok = true
+			// quotient of element values
+			val := strconv.Itoa(first / second)
+			buffer.WriteString(between)
+			buffer.WriteString(val)
+			between = sep
+		}
+	case MOD:
+		first := 0
+		second := 0
+		count := 0
+
+		processElement(func(str string) {
+			value, err := strconv.Atoi(str)
+			if err == nil {
+				count++
+				if count == 1 {
+					first = value
+				} else if count == 2 {
+					second = value
+				}
+			}
+		})
+
+		if count == 2 {
+			// must have exactly 2 elements
+			ok = true
+			// modulus of element values
+			val := strconv.Itoa(first % second)
+			buffer.WriteString(between)
+			buffer.WriteString(val)
+			between = sep
+		}
 	case BIN:
 		processElement(func(str string) {
 			num, err := strconv.Atoi(str)
@@ -4043,22 +3683,507 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 			if str != "" {
 				ok = true
 				buffer.WriteString(between)
-				runes := []rune(str)
-				// reverse sequence letters - middle base in odd-length sequence is not touched, so cannot also complement here
-				for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
-					runes[i], runes[j] = runes[j], runes[i]
-				}
-				var ok bool
-				// now complement every base, also handling uracil, leaving case intact
-				for i, ch := range runes {
-					runes[i], ok = revComp[ch]
-					if !ok {
-						runes[i] = 'X'
-					}
-				}
-				str = string(runes)
+				str = reverseComplement(str)
 				buffer.WriteString(str)
 				between = sep
+			}
+		})
+	case MOLWT:
+		processElement(func(str string) {
+			if str != "" {
+				ok = true
+				buffer.WriteString(between)
+				str = proteinWeight(str)
+				buffer.WriteString(str)
+				between = sep
+			}
+		})
+	case INDICES:
+		norm := make(map[string][]string)
+		stem := make(map[string][]string)
+
+		cumulative := 0
+
+		// mutex for inverted index
+		var ilock sync.Mutex
+
+		addItem := func(field map[string][]string, term string, position int) {
+
+			// protect with mutex
+			ilock.Lock()
+
+			arry, found := field[term]
+			if !found {
+				arry = make([]string, 0, 1)
+			}
+			arry = append(arry, strconv.Itoa(position))
+			field[term] = arry
+
+			ilock.Unlock()
+		}
+
+		processElement(func(str string) {
+
+			if str == "" {
+				return
+			}
+
+			if str == "[Not Available]." {
+				return
+			}
+
+			if IsNotASCII(str) {
+				str = DoAccentTransform(str)
+				if HasUnicodeMarkup(str) {
+					str = RepairUnicodeMarkup(str, SPACE)
+				}
+			}
+
+			str = strings.ToLower(str)
+
+			if HasBadSpace(str) {
+				str = CleanupBadSpaces(str)
+			}
+			if HasAngleBracket(str) {
+				str = RepairEncodedMarkup(str)
+				str = RepairTableMarkup(str, SPACE)
+				str = RepairScriptMarkup(str, SPACE)
+				str = RepairMathMLMarkup(str, SPACE)
+				// RemoveEmbeddedMarkup must be called before UnescapeString, which was suppressed in ExploreElements
+				str = RemoveEmbeddedMarkup(str)
+			}
+
+			if HasAmpOrNotASCII(str) {
+				str = html.UnescapeString(str)
+				str = strings.ToLower(str)
+			}
+
+			if IsNotASCII(str) {
+				if HasGreek(str) {
+					str = SpellGreek(str)
+					str = CompressRunsOfSpaces(str)
+				}
+			}
+
+			str = strings.Replace(str, "(", " ", -1)
+			str = strings.Replace(str, ")", " ", -1)
+
+			str = strings.Replace(str, "_", " ", -1)
+
+			if HasHyphenOrApostrophe(str) {
+				str = FixSpecialCases(str)
+			}
+
+			str = strings.Replace(str, "-", " ", -1)
+
+			// remove trailing punctuation from each word
+			var arry []string
+
+			terms := strings.Fields(str)
+			for _, item := range terms {
+				max := len(item)
+				for max > 1 {
+					ch := item[max-1]
+					if ch != '.' && ch != ',' && ch != ':' && ch != ';' {
+						break
+					}
+					// trim trailing period, comma, colon, and semicolon
+					item = item[:max-1]
+					// continue checking for runs of punctuation at end
+					max--
+				}
+				if item == "" {
+					continue
+				}
+				arry = append(arry, item)
+			}
+
+			// rejoin into string
+			cleaned := strings.Join(arry, " ")
+
+			// break clauses at punctuation other than space or underscore, and at non-ASCII characters
+			clauses := strings.FieldsFunc(cleaned, func(c rune) bool {
+				return (!unicode.IsLetter(c) && !unicode.IsDigit(c)) && c != ' ' && c != '_' || c > 127
+			})
+
+			// space replaces plus sign to separate runs of unpunctuated words
+			phrases := strings.Join(clauses, " ")
+
+			// break phrases into individual words
+			words := strings.Fields(phrases)
+
+			for _, item := range words {
+
+				cumulative++
+
+				// skip at site of punctuation break
+				if item == "+" {
+					continue
+				}
+
+				// skip terms that are all digits
+				if IsAllDigitsOrPeriod(item) {
+					continue
+				}
+
+				// optional stop word removal
+				if DeStop && IsStopWord(item) {
+					continue
+				}
+
+				// index single normalized term
+				addItem(norm, item, cumulative)
+				ok = true
+
+				// apply stemming algorithm
+				item = porter2.Stem(item)
+				item = strings.TrimSpace(item)
+				addItem(stem, item, cumulative)
+			}
+
+			// pad to avoid false positive proximity match of words in adjacent paragraphs
+			rounded := ((cumulative + 99) / 100) * 100
+			if rounded-cumulative < 20 {
+				rounded += 100
+			}
+			cumulative = rounded
+		})
+
+		prepareIndices := func(field map[string][]string, label string) {
+
+			if len(field) < 1 {
+				return
+			}
+
+			var arry []string
+
+			for item := range field {
+				arry = append(arry, item)
+			}
+
+			sort.Slice(arry, func(i, j int) bool { return arry[i] < arry[j] })
+
+			last := ""
+			for _, item := range arry {
+				item = strings.TrimSpace(item)
+				if item == "" {
+					continue
+				}
+				if item == last {
+					// skip duplicate entry
+					continue
+				}
+				buffer.WriteString("      <")
+				buffer.WriteString(label)
+				if len(field[item]) > 0 {
+					buffer.WriteString(" pos=\"")
+					attr := strings.Join(field[item], ",")
+					buffer.WriteString(attr)
+					buffer.WriteString("\"")
+				}
+				buffer.WriteString(">")
+				buffer.WriteString(item)
+				buffer.WriteString("</")
+				buffer.WriteString(label)
+				buffer.WriteString(">\n")
+				last = item
+			}
+		}
+
+		if ok {
+			prepareIndices(norm, "NORM")
+			prepareIndices(stem, "STEM")
+		}
+	case TERMS:
+		processElement(func(str string) {
+			if str != "" {
+
+				terms := strings.Fields(str)
+				for _, item := range terms {
+					max := len(item)
+					for max > 1 {
+						ch := item[max-1]
+						if ch != '.' && ch != ',' && ch != ':' && ch != ';' {
+							break
+						}
+						// trim trailing period, comma, colon, and semicolon
+						item = item[:max-1]
+						// continue checking for runs of punctuation at end
+						max--
+					}
+					if item == "" {
+						continue
+					}
+					ok = true
+					buffer.WriteString(between)
+					buffer.WriteString(item)
+					between = sep
+				}
+			}
+		})
+	case WORDS:
+		processElement(func(str string) {
+			if str != "" {
+
+				words := strings.FieldsFunc(str, func(c rune) bool {
+					return !unicode.IsLetter(c) && !unicode.IsDigit(c)
+				})
+				for _, item := range words {
+					item = strings.ToLower(item)
+					if DeStop {
+						if IsStopWord(item) {
+							continue
+						}
+					}
+					if DoStem {
+						item = porter2.Stem(item)
+						item = strings.TrimSpace(item)
+					}
+					if item == "" {
+						continue
+					}
+					ok = true
+					buffer.WriteString(between)
+					buffer.WriteString(item)
+					between = sep
+				}
+			}
+		})
+	case PAIRS:
+		processElement(func(str string) {
+			if str != "" {
+
+				// break clauses at punctuation other than space or underscore, and at non-ASCII characters
+				clauses := strings.FieldsFunc(str, func(c rune) bool {
+					return (!unicode.IsLetter(c) && !unicode.IsDigit(c)) && c != ' ' || c > 127
+				})
+
+				// plus sign separates runs of unpunctuated words
+				phrases := strings.Join(clauses, " + ")
+
+				// break phrases into individual words
+				words := strings.FieldsFunc(phrases, func(c rune) bool {
+					return !unicode.IsLetter(c) && !unicode.IsDigit(c)
+				})
+
+				if len(words) > 1 {
+					past := ""
+					for _, item := range words {
+						if item == "+" {
+							past = ""
+							continue
+						}
+						item = strings.ToLower(item)
+						if DeStop {
+							if IsStopWord(item) {
+								past = ""
+								continue
+							}
+						}
+						if DoStem {
+							item = porter2.Stem(item)
+							item = strings.TrimSpace(item)
+						}
+						if item == "" {
+							past = ""
+							continue
+						}
+						if past != "" {
+							ok = true
+							buffer.WriteString(between)
+							buffer.WriteString(past + " " + item)
+							between = sep
+						}
+						past = item
+					}
+				}
+			}
+		})
+	case REVERSE:
+		processElement(func(str string) {
+			if str != "" {
+
+				words := strings.FieldsFunc(str, func(c rune) bool {
+					return !unicode.IsLetter(c) && !unicode.IsDigit(c)
+				})
+				for lf, rt := 0, len(words)-1; lf < rt; lf, rt = lf+1, rt-1 {
+					words[lf], words[rt] = words[rt], words[lf]
+				}
+				for _, item := range words {
+					item = strings.ToLower(item)
+					if DeStop {
+						if IsStopWord(item) {
+							continue
+						}
+					}
+					if DoStem {
+						item = porter2.Stem(item)
+						item = strings.TrimSpace(item)
+					}
+					if item == "" {
+						continue
+					}
+					ok = true
+					buffer.WriteString(between)
+					buffer.WriteString(item)
+					between = sep
+				}
+			}
+		})
+	case LETTERS:
+		processElement(func(str string) {
+			if str != "" {
+				for _, ch := range str {
+					ok = true
+					buffer.WriteString(between)
+					buffer.WriteRune(ch)
+					between = sep
+				}
+			}
+		})
+	case CLAUSES:
+		processElement(func(str string) {
+			if str != "" {
+
+				clauses := strings.FieldsFunc(str, func(c rune) bool {
+					return c == '.' || c == ',' || c == ';' || c == ':'
+				})
+				for _, item := range clauses {
+					item = strings.ToLower(item)
+					item = strings.TrimSpace(item)
+					if item == "" {
+						continue
+					}
+					ok = true
+					buffer.WriteString(between)
+					buffer.WriteString(item)
+					between = sep
+				}
+			}
+		})
+	case MESHCODE:
+		var code []string
+		var tree []string
+
+		processElement(func(str string) {
+			if str != "" {
+				txt, found := transform[str]
+				str = strings.ToLower(str)
+				code = append(code, str)
+				ok = true
+
+				if !found {
+					return
+				}
+				txt = strings.ToLower(txt)
+				txt = strings.Replace(txt, ".", "_", -1)
+				codes := strings.FieldsFunc(txt, func(c rune) bool {
+					return c == ','
+				})
+				for _, item := range codes {
+					ch := item[0]
+					if item == "" {
+						continue
+					}
+					switch ch {
+					case 'a', 'c', 'd', 'e', 'f', 'g', 'z':
+						tree = append(tree, item)
+					default:
+					}
+				}
+			}
+		})
+
+		if len(code) > 1 {
+			sort.Slice(code, func(i, j int) bool { return code[i] < code[j] })
+		}
+		if len(tree) > 1 {
+			sort.Slice(tree, func(i, j int) bool { return tree[i] < tree[j] })
+		}
+
+		last := ""
+		for _, item := range code {
+			if item == last {
+				// skip duplicate entry
+				continue
+			}
+			buffer.WriteString("      <CODE>")
+			buffer.WriteString(item)
+			buffer.WriteString("</CODE>\n")
+			last = item
+		}
+
+		last = ""
+		for _, item := range tree {
+			if item == last {
+				// skip duplicate entry
+				continue
+			}
+			buffer.WriteString("      <TREE>")
+			buffer.WriteString(item)
+			buffer.WriteString("</TREE>\n")
+			last = item
+		}
+	case MATRIX:
+		var arry []string
+
+		processElement(func(str string) {
+			if str != "" {
+				txt, found := transform[str]
+				if found {
+					str = txt
+				}
+				arry = append(arry, str)
+				ok = true
+			}
+		})
+
+		if len(arry) > 1 {
+			sort.Slice(arry, func(i, j int) bool { return arry[i] < arry[j] })
+
+			for i, frst := range arry {
+				for j, scnd := range arry {
+					if i == j {
+						continue
+					}
+					buffer.WriteString(between)
+					buffer.WriteString(frst)
+					buffer.WriteString("\t")
+					buffer.WriteString(scnd)
+					between = "\n"
+				}
+			}
+		}
+	case HISTOGRAM:
+		processElement(func(str string) {
+			if str != "" {
+				ok = true
+
+				hlock.Lock()
+
+				val := histogram[str]
+				val++
+				histogram[str] = val
+
+				hlock.Unlock()
+			}
+		})
+	case ACCENTED:
+		processElement(func(str string) {
+			if str != "" {
+				found := false
+				for _, ch := range str {
+					if ch > 127 {
+						found = true
+						break
+					}
+				}
+				if found {
+					ok = true
+					buffer.WriteString(between)
+					buffer.WriteString(str)
+					between = sep
+				}
 			}
 		})
 	default:
@@ -4082,7 +4207,7 @@ func ProcessClause(curr *Node, stages []*Step, mask, prev, pfx, sfx, plg, sep, d
 }
 
 // ProcessInstructions performs extraction commands on a subset of XML
-func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret string, index, level int, variables map[string]string, accum func(string)) (string, string) {
+func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret string, index, level int, variables map[string]string, transform map[string]string, histogram map[string]int, accum func(string)) (string, string) {
 
 	if accum == nil {
 		return tab, ret
@@ -4102,20 +4227,43 @@ func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret strin
 
 	varname := ""
 
+	plain := true
+	var currColor *color.Color
+
+	// handles color, e.g., -color "red,bold", reset to plain by -color "-" (undocumented)
+	printInColor := func(str string) {
+		if plain || currColor == nil {
+			accum(str)
+		} else {
+			tx := currColor.SprintFunc()
+			tmp := fmt.Sprintf("%s", tx(str))
+			accum(tmp)
+		}
+	}
+
 	// process commands
 	for _, op := range commands {
 
 		str := op.Value
 
 		switch op.Type {
-		case ELEMENT, FIRST, LAST, ENCODE, UPPER, LOWER, TITLE, TERMS, WORDS, PAIRS, LETTERS, INDICES,
-			NUM, LEN, SUM, MIN, MAX, INC, DEC, SUB, AVG, DEV, MED, BIN, BIT, ZEROBASED, ONEBASED, UCSCBASED, REVCOMP:
-			txt, ok := ProcessClause(curr, op.Stages, mask, tab, pfx, sfx, plg, sep, def, op.Type, index, level, variables)
+		case ELEMENT, FIRST, LAST, ENCODE, DECODE, PLAIN, UPPER, LOWER, CHAIN, TITLE, ORDER, YEAR, TRANSLATE, TERMS, WORDS, PAIRS, REVERSE, LETTERS, CLAUSES, INDICES, MESHCODE, MATRIX, ACCENTED,
+			NUM, LEN, SUM, MIN, MAX, INC, DEC, SUB, AVG, DEV, MED, MUL, DIV, MOD, BIN, BIT, ZEROBASED, ONEBASED, UCSCBASED, REVCOMP, NUCLEIC, MOLWT:
+			txt, ok := ProcessClause(curr, op.Stages, mask, tab, pfx, sfx, plg, sep, def, op.Type, index, level, variables, transform, histogram)
 			if ok {
 				plg = ""
 				lst = elg
 				tab = col
 				ret = lin
+				if plain {
+					accum(txt)
+				} else {
+					printInColor(txt)
+				}
+			}
+		case HISTOGRAM:
+			txt, ok := ProcessClause(curr, op.Stages, mask, "", "", "", "", "", "", op.Type, index, level, variables, transform, histogram)
+			if ok {
 				accum(txt)
 			}
 		case TAB:
@@ -4131,7 +4279,16 @@ func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret strin
 		case LBL:
 			lbl := str
 			accum(tab)
-			accum(lbl)
+			accum(plg)
+			accum(pfx)
+			if plain {
+				accum(lbl)
+			} else {
+				printInColor(lbl)
+			}
+			accum(sfx)
+			plg = ""
+			lst = elg
 			tab = col
 			ret = lin
 		case PFC:
@@ -4141,21 +4298,32 @@ func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret strin
 		case CLR:
 			// clear previous tab after the fact
 			tab = ""
+		case DEQ:
+			// set queued tab after the fact
+			tab = str
 		case PLG:
 			plg = str
 		case ELG:
 			elg = str
 		case WRP:
 			// shortcut to wrap elements in XML tags
+			if str == "" || str == "-" {
+				sep = "\t"
+				pfx = ""
+				sfx = ""
+				plg = ""
+				elg = ""
+				break
+			}
 			lft, rgt := SplitInTwoAt(str, ",", RIGHT)
 			if lft != "" {
 				plg = "<" + lft + ">"
 				elg = "</" + lft + ">"
 			}
-			if rgt != "" {
+			if rgt != "" && rgt != "-" {
 				pfx = "<" + rgt + ">"
 				sfx = "</" + rgt + ">"
-				sep = "</" + rgt + "> <" + rgt + ">"
+				sep = "</" + rgt + "><" + rgt + ">"
 			}
 		case RST:
 			pfx = ""
@@ -4166,6 +4334,35 @@ func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret strin
 			def = ""
 		case DEF:
 			def = str
+		case COLOR:
+			currColor = color.New()
+			if str == "-" || str == "reset" || str == "clear" {
+				plain = true
+				break
+			}
+			plain = false
+			items := strings.Split(str, ",")
+			for _, itm := range items {
+				switch itm {
+				case "red":
+					currColor.Add(color.FgRed)
+				case "grn", "green":
+					currColor.Add(color.FgGreen)
+				case "blu", "blue":
+					currColor.Add(color.FgBlue)
+				case "blk", "black":
+					currColor.Add(color.FgBlack)
+				case "bld", "bold":
+					currColor.Add(color.Bold)
+				case "ital", "italic", "italics":
+					currColor.Add(color.Italic)
+				case "blink", "flash":
+					currColor.Add(color.BlinkSlow)
+				default:
+					fmt.Fprintf(os.Stderr, "\nERROR: Unrecognized color argument '%s'\n", itm)
+					os.Exit(1)
+				}
+			}
 		case VARIABLE:
 			varname = str
 		case VALUE:
@@ -4178,7 +4375,7 @@ func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret strin
 				// -if "&VARIABLE" will fail if initialized with empty string ""
 				delete(variables, varname)
 			} else {
-				txt, ok := ProcessClause(curr, op.Stages, mask, "", pfx, sfx, plg, sep, def, op.Type, index, level, variables)
+				txt, ok := ProcessClause(curr, op.Stages, mask, "", pfx, sfx, plg, sep, def, op.Type, index, level, variables, transform, histogram)
 				if ok {
 					plg = ""
 					lst = elg
@@ -4190,7 +4387,11 @@ func ProcessInstructions(commands []*Operation, curr *Node, mask, tab, ret strin
 		}
 	}
 
-	accum(lst)
+	if plain {
+		accum(lst)
+	} else {
+		printInColor(lst)
+	}
 
 	return tab, ret
 }
@@ -4258,7 +4459,7 @@ func ConditionsAreSatisfied(conditions []*Operation, curr *Node, mask string, in
 			stat := constraint.Type
 
 			switch stat {
-			case EQUALS, CONTAINS, STARTSWITH, ENDSWITH, ISNOT:
+			case EQUALS, CONTAINS, ISWITHIN, STARTSWITH, ENDSWITH, ISNOT, ISBEFORE, ISAFTER, MATCHES, RESEMBLES:
 				// substring test on element values
 				str = strings.ToUpper(str)
 				val = strings.ToUpper(val)
@@ -4272,6 +4473,10 @@ func ConditionsAreSatisfied(conditions []*Operation, curr *Node, mask string, in
 					if strings.Contains(str, val) {
 						return true
 					}
+				case ISWITHIN:
+					if strings.Contains(val, str) {
+						return true
+					}
 				case STARTSWITH:
 					if strings.HasPrefix(str, val) {
 						return true
@@ -4281,6 +4486,70 @@ func ConditionsAreSatisfied(conditions []*Operation, curr *Node, mask string, in
 						return true
 					}
 				case ISNOT:
+					if str != val {
+						return true
+					}
+				case ISBEFORE:
+					if str < val {
+						return true
+					}
+				case ISAFTER:
+					if str > val {
+						return true
+					}
+				case MATCHES:
+					if RemoveCommaOrSemicolon(str) == strings.ToLower(val) {
+						return true
+					}
+				case RESEMBLES:
+					if SortStringByWords(str) == strings.ToLower(val) {
+						return true
+					}
+				default:
+				}
+			case ISEQUALTO, DIFFERSFROM:
+				// conditional argument is element specifier
+				if constraint.Parent != "" || constraint.Match != "" || constraint.Attrib != "" {
+					ch := val[0]
+					// pound, percent, and caret prefixes supported (undocumented)
+					switch ch {
+					case '#':
+						count := 0
+						ExploreElements(curr, mask, constraint.Parent, constraint.Match, constraint.Attrib, constraint.Wild, true, level, func(stn string, lvl int) {
+							count++
+						})
+						val = strconv.Itoa(count)
+					case '%':
+						length := 0
+						ExploreElements(curr, mask, constraint.Parent, constraint.Match, constraint.Attrib, constraint.Wild, true, level, func(stn string, lvl int) {
+							if stn != "" {
+								length += len(stn)
+							}
+						})
+						val = strconv.Itoa(length)
+					case '^':
+						depth := 0
+						ExploreElements(curr, mask, constraint.Parent, constraint.Match, constraint.Attrib, constraint.Wild, true, level, func(stn string, lvl int) {
+							depth = lvl
+						})
+						val = strconv.Itoa(depth)
+					default:
+						ExploreElements(curr, mask, constraint.Parent, constraint.Match, constraint.Attrib, constraint.Wild, true, level, func(stn string, lvl int) {
+							if stn != "" {
+								val = stn
+							}
+						})
+					}
+				}
+				str = strings.ToUpper(str)
+				val = strings.ToUpper(val)
+
+				switch stat {
+				case ISEQUALTO:
+					if str == val {
+						return true
+					}
+				case DIFFERSFROM:
 					if str != val {
 						return true
 					}
@@ -4611,7 +4880,7 @@ func ConditionsAreSatisfied(conditions []*Operation, curr *Node, mask string, in
 // RECURSIVELY PROCESS EXPLORATION COMMANDS AND XML DATA STRUCTURE
 
 // ProcessCommands visits XML nodes, performs conditional tests, and executes data extraction instructions
-func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int, variables map[string]string, accum func(string)) (string, string) {
+func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int, variables map[string]string, transform map[string]string, histogram map[string]int, accum func(string)) (string, string) {
 
 	if accum == nil {
 		return tab, ret
@@ -4632,6 +4901,12 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 		prnt = "*"
 		deep = true
 	}
+	// Object/** performs exhaustive exploration of nodes
+	tall := false
+	if match == "**" {
+		match = "*"
+		tall = true
+	}
 
 	// closure passes local variables to callback, which can modify caller tab and ret values
 	processNode := func(node *Node, idx, lvl int) {
@@ -4641,28 +4916,28 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 
 			// execute data extraction commands
 			if len(cmds.Commands) > 0 {
-				tab, ret = ProcessInstructions(cmds.Commands, node, match, tab, ret, idx, lvl, variables, accum)
+				tab, ret = ProcessInstructions(cmds.Commands, node, match, tab, ret, idx, lvl, variables, transform, histogram, accum)
 			}
 
 			// process sub commands on child node
 			for _, sub := range cmds.Subtasks {
-				tab, ret = ProcessCommands(sub, node, tab, ret, 1, lvl, variables, accum)
+				tab, ret = ProcessCommands(sub, node, tab, ret, 1, lvl, variables, transform, histogram, accum)
 			}
 
 		} else {
 
 			// execute commands after -else statement
 			if len(cmds.Failure) > 0 {
-				tab, ret = ProcessInstructions(cmds.Failure, node, match, tab, ret, idx, lvl, variables, accum)
+				tab, ret = ProcessInstructions(cmds.Failure, node, match, tab, ret, idx, lvl, variables, transform, histogram, accum)
 			}
 		}
 	}
 
 	// exploreNodes recursive definition
-	var exploreNodes func(*Node, int, int, func(*Node, int, int)) int
+	var exploreNodes func(*Node, int, int, bool, func(*Node, int, int)) int
 
 	// exploreNodes visits all nodes that match the selection criteria
-	exploreNodes = func(curr *Node, indx, levl int, proc func(*Node, int, int)) int {
+	exploreNodes = func(curr *Node, indx, levl int, force bool, proc func(*Node, int, int)) int {
 
 		if curr == nil || proc == nil {
 			return indx
@@ -4676,10 +4951,18 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 
 			if prnt == "" ||
 				curr.Parent == prnt ||
+				force ||
 				(wildcard && strings.HasPrefix(prnt, ":") && strings.HasSuffix(curr.Parent, prnt)) {
 
 				proc(curr, indx, levl)
 				indx++
+
+				if tall && prnt != "" {
+					// exhaustive exploration of child nodes within region of parent match
+					for chld := curr.Children; chld != nil; chld = chld.Next {
+						indx = exploreNodes(chld, indx, levl+1, true, proc)
+					}
+				}
 
 				if !deep {
 					// do not explore within recursive object
@@ -4695,17 +4978,59 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 
 		// explore child nodes
 		for chld := curr.Children; chld != nil; chld = chld.Next {
-			indx = exploreNodes(chld, indx, levl+1, proc)
+			indx = exploreNodes(chld, indx, levl+1, false, proc)
 		}
 
 		return indx
+	}
+
+	// explorePath recursive definition
+	var explorePath func(*Node, []string, int, int, func(*Node, int, int)) int
+
+	// explorePath visits child nodes and matches against next entry in path
+	explorePath = func(curr *Node, path []string, indx, levl int, proc func(*Node, int, int)) int {
+
+		if curr == nil || proc == nil {
+			return indx
+		}
+
+		if len(path) < 1 {
+			proc(curr, indx, levl)
+			indx++
+			return indx
+		}
+
+		name := path[0]
+		rest := path[1:]
+
+		// explore next level of child nodes
+		for chld := curr.Children; chld != nil; chld = chld.Next {
+			if chld.Name == name {
+				// recurse only if child matches next component in path
+				indx = explorePath(chld, rest, indx, levl+1, proc)
+			}
+		}
+
+		return indx
+	}
+
+	if cmds.Foreword != "" {
+		accum(cmds.Foreword)
 	}
 
 	// apply -position test
 
 	if cmds.Position == "" || cmds.Position == "all" {
 
-		exploreNodes(curr, index, level, processNode)
+		exploreNodes(curr, index, level, false, processNode)
+
+	} else if cmds.Position == "path" {
+
+		exploreNodes(curr, index, level, false,
+			func(node *Node, idx, lvl int) {
+				// exploreNodes callback has matched first path component, now explore remainder one level and component at a time
+				explorePath(node, cmds.Path, idx, lvl, processNode)
+			})
 
 	} else {
 
@@ -4715,7 +5040,7 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 
 		if cmds.Position == "first" {
 
-			exploreNodes(curr, index, level,
+			exploreNodes(curr, index, level, false,
 				func(node *Node, idx, lvl int) {
 					if single == nil {
 						single = node
@@ -4726,7 +5051,7 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 
 		} else if cmds.Position == "last" {
 
-			exploreNodes(curr, index, level,
+			exploreNodes(curr, index, level, false,
 				func(node *Node, idx, lvl int) {
 					single = node
 					ind = idx
@@ -4739,7 +5064,7 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 			var beg *Limiter
 			var end *Limiter
 
-			exploreNodes(curr, index, level,
+			exploreNodes(curr, index, level, false,
 				func(node *Node, idx, lvl int) {
 					if beg == nil {
 						beg = &Limiter{node, idx, lvl}
@@ -4762,7 +5087,7 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 			var next *Limiter
 			first := true
 
-			exploreNodes(curr, index, level,
+			exploreNodes(curr, index, level, false,
 				func(node *Node, idx, lvl int) {
 					if first {
 						first = false
@@ -4777,6 +5102,30 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 					}
 				})
 
+		} else if cmds.Position == "even" {
+
+			okay := false
+
+			exploreNodes(curr, index, level, false,
+				func(node *Node, idx, lvl int) {
+					if okay {
+						processNode(node, idx, lvl)
+					}
+					okay = !okay
+				})
+
+		} else if cmds.Position == "odd" {
+
+			okay := true
+
+			exploreNodes(curr, index, level, false,
+				func(node *Node, idx, lvl int) {
+					if okay {
+						processNode(node, idx, lvl)
+					}
+					okay = !okay
+				})
+
 		} else {
 
 			// use numeric position
@@ -4785,7 +5134,7 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 
 				pos := 0
 
-				exploreNodes(curr, index, level,
+				exploreNodes(curr, index, level, false,
 					func(node *Node, idx, lvl int) {
 						pos++
 						if pos == number {
@@ -4807,13 +5156,17 @@ func ProcessCommands(cmds *Block, curr *Node, tab, ret string, index, level int,
 		}
 	}
 
+	if cmds.Afterword != "" {
+		accum(cmds.Afterword)
+	}
+
 	return tab, ret
 }
 
 // PROCESS ONE XML COMPONENT RECORD
 
 // ProcessQuery perform data extraction driven by command-line arguments
-func ProcessQuery(Text, parent string, index int, hd, tl string, cmds *Block) string {
+func ProcessQuery(Text, parent string, index int, hd, tl string, transform map[string]string, histogram map[string]int, cmds *Block) string {
 
 	if Text == "" || cmds == nil {
 		return ""
@@ -4850,7 +5203,7 @@ func ProcessQuery(Text, parent string, index int, hd, tl string, cmds *Block) st
 	} else {
 
 		// start processing at top of command tree and top of XML subregion selected by -pattern
-		_, ret = ProcessCommands(cmds, pat, "", "", index, 1, variables,
+		_, ret = ProcessCommands(cmds, pat, "", "", index, 1, variables, transform, histogram,
 			func(str string) {
 				if str != "" {
 					ok = true
@@ -5098,6 +5451,7 @@ func ProcessINSD(args []string, isPipe, addDash, doIndex bool) []string {
 		"sub_clone",
 		"sub_species",
 		"sub_strain",
+		"submitter_seqid",
 		"tag_peptide",
 		"tissue_lib",
 		"tissue_type",
@@ -5275,7 +5629,7 @@ func ProcessINSD(args []string, isPipe, addDash, doIndex bool) []string {
 			acc = append(acc, "-element", "INSDSeq_accession-version", "-clr", "-rst", "-tab", "\\n")
 		}
 	} else {
-		acc = append(acc, "-pattern", "INSDSeq", "-ACCN", "INSDSeq_accession-version")
+		acc = append(acc, "-pattern", "INSDSeq", "-ACCN", "INSDSeq_accession-version", "-SEQ", "INSDSeq_sequence")
 	}
 
 	if doIndex {
@@ -5395,6 +5749,11 @@ func ProcessINSD(args []string, isPipe, addDash, doIndex bool) []string {
 	}
 
 	for _, str := range args {
+
+		if str == "mol_wt" {
+			str = "calculated_mol_wt"
+		}
+
 		if strings.HasPrefix(str, "INSD") {
 
 			checkAgainstVocabulary(str, "element", insdtags)
@@ -5445,6 +5804,30 @@ func ProcessINSD(args []string, isPipe, addDash, doIndex bool) []string {
 
 			// report capitalization or vocabulary failure
 			checkAgainstVocabulary(str, "element", insdtags)
+
+		} else if str == "sub_sequence" {
+
+			// special sub_sequence qualifier shows sequence under feature intervals
+			acc = append(acc, "-block", "INSDFeature_intervals")
+			if isPipe {
+				acc = append(acc, "-clr", "-lbl", "")
+			} else {
+				acc = append(acc, "-clr", "-lbl", "\"\"")
+			}
+
+			acc = append(acc, "-subset", "INSDInterval", "-FR", "INSDInterval_from", "-TO", "INSDInterval_to")
+			if isPipe {
+				acc = append(acc, "-pfx", "", "-tab", "", "-nucleic", "&SEQ[&FR:&TO]")
+			} else {
+				acc = append(acc, "-pfx", "\"\"", "-tab", "\"\"", "-nucleic", "\"&SEQ[&FR:&TO]\"")
+			}
+
+			acc = append(acc, "-subset", "INSDFeature_intervals")
+			if isPipe {
+				acc = append(acc, "-lbl", "\\t")
+			} else {
+				acc = append(acc, "-lbl", "\"\\t\"")
+			}
 
 		} else {
 
@@ -5505,6 +5888,64 @@ func ProcessINSD(args []string, isPipe, addDash, doIndex bool) []string {
 	return acc
 }
 
+// BIOTHINGS EXTRACTION COMMAND GENERATOR
+
+// ProcessBiopath generates extraction commands for BioThings resources (undocumented)
+func ProcessBiopath(args []string, isPipe bool) []string {
+
+	// nquire -get "http://myvariant.info/v1/variant/chr6:g.26093141G>A" \
+	//   -fields clinvar.rcv.conditions.identifiers \
+	//   -always_list clinvar.rcv.conditions.identifiers |
+	// xtract -j2x |
+	// xtract -biopath opt clinvar.rcv.conditions.identifiers.omim
+
+	var acc []string
+
+	max := len(args)
+	if max < 2 {
+		fmt.Fprintf(os.Stderr, "\nERROR: Insufficient command-line arguments supplied to xtract -biopath\n")
+		os.Exit(1)
+	}
+
+	obj := args[0]
+	args = args[1:]
+
+	acc = append(acc, "-pattern", obj)
+
+	paths := args[0]
+
+	items := strings.Split(paths, ",")
+
+	for _, path := range items {
+
+		dirs := strings.Split(path, ".")
+		max = len(dirs)
+		if max < 1 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Insufficient path arguments supplied to xtract -biopath\n")
+			os.Exit(1)
+		}
+		if max > 7 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Too many nodes in argument supplied to xtract -biopath\n")
+			os.Exit(1)
+		}
+
+		str := dirs[max-1]
+
+		acc = append(acc, "-path")
+		if isPipe {
+			acc = append(acc, path)
+			acc = append(acc, "-tab", "\\n")
+			acc = append(acc, "-element", str)
+		} else {
+			acc = append(acc, "\""+path+"\"")
+			acc = append(acc, "-tab", "\"\\n\"")
+			acc = append(acc, "-element", "\""+str+"\"")
+		}
+	}
+
+	return acc
+}
+
 // HYDRA CITATION MATCHER COMMAND GENERATOR
 
 // ProcessHydra generates extraction commands for NCBI's in-house citation matcher (undocumented)
@@ -5526,7 +5967,7 @@ func ProcessHydra(isPipe bool) []string {
 // ENTREZ2INDEX COMMAND GENERATOR
 
 // ProcessE2Index generates extraction commands to create input for Entrez2Index
-func ProcessE2Index(args []string, isPipe bool) []string {
+func ProcessE2Index(args []string, tform string, isPipe bool) []string {
 
 	var acc []string
 
@@ -5553,6 +5994,9 @@ func ProcessE2Index(args []string, isPipe bool) []string {
 		if !DeStop {
 			acc = append(acc, "-stops")
 		}
+		if DoStem {
+			acc = append(acc, "-stems")
+		}
 	}
 
 	if isPipe {
@@ -5569,9 +6013,17 @@ func ProcessE2Index(args []string, isPipe bool) []string {
 		acc = append(acc, ident)
 		acc = append(acc, "-clr", "-rst", "-tab", "")
 		acc = append(acc, "-lbl", "    <IdxSearchFields>\\n")
+		acc = append(acc, "-pfx", "      <YEAR>", "-sfx", "</YEAR>\\n")
+		acc = append(acc, "-year", "PubDate/*")
+		acc = append(acc, "-clr", "-rst", "-tab", "")
 		acc = append(acc, "-indices")
 		for _, str := range args {
 			acc = append(acc, str)
+		}
+		if tform != "" {
+			acc = append(acc, "-clr", "-rst", "-tab", "\"\"")
+			acc = append(acc, "-sep", ",", "-meshcode")
+			acc = append(acc, "MeshHeading/DescriptorName@UI,Chemical/NameOfSubstance@UI,SupplMeshName@UI")
 		}
 		acc = append(acc, "-clr", "-lbl", "    </IdxSearchFields>\\n")
 	} else {
@@ -5590,10 +6042,18 @@ func ProcessE2Index(args []string, isPipe bool) []string {
 		acc = append(acc, ql)
 		acc = append(acc, "-clr", "-rst", "-tab", "\"\"")
 		acc = append(acc, "-lbl", "\"    <IdxSearchFields>\\n\"")
+		acc = append(acc, "-pfx", "\"      <YEAR>\"", "-sfx", "\"</YEAR>\\n\"")
+		acc = append(acc, "-year", "\"PubDate/*\"")
+		acc = append(acc, "-clr", "-rst", "-tab", "\"\"")
 		acc = append(acc, "-indices")
 		for _, str := range args {
 			ql = fmt.Sprintf("\"%s\"", str)
 			acc = append(acc, ql)
+		}
+		if tform != "" {
+			acc = append(acc, "-clr", "-rst", "-tab", "\"\"")
+			acc = append(acc, "-sep", "\",\"", "-meshcode")
+			acc = append(acc, "\"MeshHeading/DescriptorName@UI,Chemical/NameOfSubstance@UI,SupplMeshName@UI\"")
 		}
 		acc = append(acc, "-clr", "-lbl", "\"    </IdxSearchFields>\\n\"")
 	}
@@ -5603,12 +6063,12 @@ func ProcessE2Index(args []string, isPipe bool) []string {
 
 // CONCURRENT CONSUMER GOROUTINES PARSE AND PROCESS PARTITIONED XML OBJECTS
 
-// ReadBlocks -> SplitPattern => StreamTokens => ParseXML => ProcessQuery -> MergeResults
+// StreamBlocks -> SplitPattern => StreamTokens => ParseXML => ProcessQuery -> MergeResults
 
 // processes with single goroutine call defer close(out) so consumer(s) can range over channel
 // processes with multiple instances call defer wg.Done(), separate goroutine uses wg.Wait() to delay close(out)
 
-func CreateConsumers(cmds *Block, parent, hd, tl string, inp <-chan Extract) <-chan Extract {
+func CreateConsumers(cmds *Block, parent, hd, tl string, transform map[string]string, histogram map[string]int, inp <-chan Extract) <-chan Extract {
 
 	if inp == nil {
 		return nil
@@ -5638,7 +6098,7 @@ func CreateConsumers(cmds *Block, parent, hd, tl string, inp <-chan Extract) <-c
 				continue
 			}
 
-			str := ProcessQuery(text[:], parent, idx, hd, tl, cmds)
+			str := ProcessQuery(text[:], parent, idx, hd, tl, transform, histogram, cmds)
 
 			// send even if empty to get all record counts for reordering
 			out <- Extract{idx, "", str, nil}
@@ -5662,271 +6122,176 @@ func CreateConsumers(cmds *Block, parent, hd, tl string, inp <-chan Extract) <-c
 	return out
 }
 
-func CreateMatchers(phrs string, exclude bool, inp <-chan Extract) <-chan Extract {
+func CreateFormatters(parent string, inp <-chan Extract) <-chan Extract {
 
 	if inp == nil {
 		return nil
 	}
 
-	if phrs == "" {
-		// if -phrase (-require, -exclude) argument is not present, simply return input channel
-		return inp
-	}
-
-	phrs = PrepareQuery(phrs)
-
-	clauses := PartitionQuery(phrs)
-
-	clauses = MarkClauses(clauses)
-
-	if clauses == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to parse phrase\n")
-		os.Exit(1)
-	}
-
 	out := make(chan Extract, ChanDepth)
 	if out == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create phrase matcher channel\n")
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create formatter channel\n")
 		os.Exit(1)
 	}
 
-	// split at punctuation, but leave < and > in to delimit content strings
-	cleanupRecord := func(str string) string {
+	// xmlFormatter reads partitioned XML from channel and formats on a per-record basis
+	xmlFormatter := func(wg *sync.WaitGroup, inp <-chan Extract, out chan<- Extract) {
 
-		if IsNotASCII(str) {
-			if HasGreek(str) {
-				str = SpellGreek(str)
-			}
-			str = DoAccentTransform(str)
-			if HasUnicodeMarkup(str) {
-				str = RepairUnicodeMarkup(str, SPACE)
-			}
-		}
-
-		if HasAmpOrNotASCII(str) {
-			str = html.UnescapeString(str)
-		}
-
-		if HasBadSpace(str) {
-			str = CleanupBadSpaces(str)
-		}
-
-		str = RemoveAllPrefixHyphens(str)
-
-		var buffer strings.Builder
-
-		for _, ch := range str {
-			if ch > 127 {
-				buffer.WriteRune(' ')
-			} else if unicode.IsLetter(ch) || unicode.IsDigit(ch) {
-				buffer.WriteRune(ch)
-			} else if ch == '<' || ch == '>' {
-				buffer.WriteRune(' ')
-				buffer.WriteRune(ch)
-				buffer.WriteRune(' ')
-			} else {
-				buffer.WriteRune(' ')
-			}
-		}
-
-		res := buffer.String()
-
-		res = strings.TrimSpace(res)
-		res = CompressRunsOfSpaces(res)
-		res = strings.ToLower(res)
-
-		var chain []string
-
-		terms := strings.Fields(res)
-
-		// replace unwanted and stop words with plus sign
-		for _, item := range terms {
-
-			// allow tilde proximity indicator
-			if item == "~" {
-				chain = append(chain, item)
-				continue
-			}
-
-			// skip a single character
-			if len(item) < 2 {
-				chain = append(chain, "+")
-				continue
-			}
-
-			if DeStop && IsStopWord(item) {
-				// skip if stop word, breaking word pair chain
-				chain = append(chain, "+")
-				continue
-			}
-			if DoStem && !strings.HasSuffix(item, "*") {
-				// apply stemming algorithm
-				item = porter2.Stem(item)
-				item = strings.TrimSpace(item)
-			}
-
-			// record single term
-			chain = append(chain, item)
-		}
-
-		// rejoin into processed sentence
-		tmp := strings.Join(chain, " ")
-
-		tmp = CompressRunsOfSpaces(tmp)
-		tmp = strings.TrimSpace(tmp)
-
-		return tmp
-	}
-
-	proximitySearch := func(srch, str string) bool {
-
-		// split into two words separated by run of tildes
-		words := strings.Split(str, " ")
-		// proximity variables
-		first := ""
-		secnd := ""
-		dist := 0
-		for _, item := range words {
-			if strings.Contains(item, "~") {
-				dist = len(item)
-			} else if first == "" {
-				first = item
-			} else if secnd == "" {
-				secnd = item
-			} else {
-				fmt.Fprintf(os.Stderr, "\nERROR: More than two terms in proximity search\n")
-				os.Exit(1)
-			}
-		}
-		if first == "" || secnd == "" || dist < 1 {
-			fmt.Fprintf(os.Stderr, "\nERROR: Fields missing in proximity search\n")
-			os.Exit(1)
-		}
-
-		terms := strings.Fields(srch)
-
-		for j, fst := range terms {
-			if fst != first {
-				continue
-			}
-			rest := terms[j+1:]
-			for k, sec := range rest {
-				if sec == secnd {
-					return true
-				}
-				if k >= dist {
-					break
-				}
-			}
-		}
-
-		return false
-	}
-
-	// check each phrase against record
-	testPhrase := func(srch string, tokens []string) bool {
-
-		eval := func(str string) bool {
-
-			if strings.Contains(str, "~") {
-				return proximitySearch(srch, str)
-			}
-
-			return strings.Contains(srch, str)
-		}
-
-		nextToken := func() string {
-
-			if len(tokens) < 1 {
-				return ""
-			}
-
-			tkn := tokens[0]
-			tokens = tokens[1:]
-
-			return tkn
-		}
-
-		// recursive definitions
-		var excl func() (bool, string)
-		var expr func() (bool, string)
-		var fact func() (bool, string)
-		var term func() (bool, string)
-
-		fact = func() (bool, string) {
-
-			var res bool
-
-			tkn := nextToken()
-			if tkn == "(" {
-				res, tkn = expr()
-				if tkn == ")" {
-					tkn = nextToken()
-				}
-			} else {
-				res = eval(tkn)
-				tkn = nextToken()
-			}
-
-			return res, tkn
-		}
-
-		excl = func() (bool, string) {
-
-			var val bool
-
-			res, tkn := fact()
-			for tkn == "!" {
-				val, tkn = fact()
-				if val {
-					res = false
-				}
-			}
-
-			return res, tkn
-		}
-
-		term = func() (bool, string) {
-
-			var val bool
-
-			res, tkn := excl()
-			for tkn == "&" {
-				val, tkn = excl()
-				if !val {
-					res = false
-				}
-			}
-
-			return res, tkn
-		}
-
-		expr = func() (bool, string) {
-
-			var val bool
-
-			res, tkn := term()
-			for tkn == "|" {
-				val, tkn = term()
-				if val {
-					res = true
-				}
-			}
-
-			return res, tkn
-		}
-
-		// enter recursive descent parser
-		found, _ := expr()
-
-		return found
-	}
-
-	// xmlMatcher reads partitioned XML from channel and removes records that do not contain the phrase(s)
-	xmlMatcher := func(wg *sync.WaitGroup, inp <-chan Extract, out chan<- Extract) {
-
-		// report when this phrase matcher has no more records to process
+		// report when this formatter has no more records to process
 		defer wg.Done()
+
+		// clean and reformat one record, flush left
+		doFormat := func(text string) string {
+
+			var buffer strings.Builder
+
+			// print attributes
+			printAttributes := func(attr string) {
+
+				if attr == "" {
+					return
+				}
+				attr = strings.TrimSpace(attr)
+				attr = CompressRunsOfSpaces(attr)
+
+				if DeAccent {
+					if IsNotASCII(attr) {
+						attr = DoAccentTransform(attr)
+					}
+				}
+				if DoASCII {
+					if IsNotASCII(attr) {
+						attr = UnicodeToASCII(attr)
+					}
+				}
+
+				buffer.WriteString(" ")
+				buffer.WriteString(attr)
+			}
+
+			ret := "\n"
+			pfx := ""
+			skip := 0
+
+			doCleanup := func(tkn Token, nxtTag TagType, nxtName string) {
+
+				if skip > 0 {
+					skip--
+					return
+				}
+
+				name := tkn.Name
+
+				switch tkn.Tag {
+				case STARTTAG:
+					// convert start-stop to self-closing tag if attributes are present, otherwise skip
+					if nxtTag == STOPTAG && nxtName == name {
+						if tkn.Attr != "" {
+							buffer.WriteString(pfx)
+							buffer.WriteString("<")
+							buffer.WriteString(name)
+							printAttributes(tkn.Attr)
+							buffer.WriteString("/>")
+							pfx = ret
+						}
+						skip++
+						return
+					}
+					buffer.WriteString(pfx)
+					buffer.WriteString("<")
+					buffer.WriteString(name)
+					printAttributes(tkn.Attr)
+					buffer.WriteString(">")
+					pfx = ret
+				case SELFTAG:
+					if tkn.Attr != "" {
+						buffer.WriteString(pfx)
+						buffer.WriteString("<")
+						buffer.WriteString(name)
+						printAttributes(tkn.Attr)
+						buffer.WriteString("/>")
+						pfx = ret
+					}
+				case STOPTAG:
+					buffer.WriteString(pfx)
+					buffer.WriteString("</")
+					buffer.WriteString(name)
+					buffer.WriteString(">")
+					if DoMixed && nxtTag == CONTENTTAG {
+						buffer.WriteString(" ")
+					}
+					pfx = ret
+				case CONTENTTAG:
+					if nxtTag == STARTTAG || nxtTag == SELFTAG {
+						if DoStrict {
+							fmt.Fprintf(os.Stderr, "ERROR: UNRECOGNIZED MIXED CONTENT <%s> in <%s>\n", nxtName, name)
+						} else if !DoMixed {
+							fmt.Fprintf(os.Stderr, "ERROR: UNEXPECTED MIXED CONTENT <%s> in <%s>\n", nxtName, name)
+						}
+					}
+					if len(name) > 0 && IsNotJustWhitespace(name) {
+						// support for all content processing flags
+						if DoStrict || DoMixed || DoCompress {
+							ctype := tkn.Cont
+							name = CleanupContents(name, (ctype&ASCII) != 0, (ctype&AMPER) != 0, (ctype&MIXED) != 0)
+						}
+						buffer.WriteString(name)
+					}
+					if DoMixed && nxtTag == STARTTAG {
+						buffer.WriteString(" ")
+					}
+					pfx = ""
+				case CDATATAG, COMMENTTAG:
+					// ignore
+				case DOCTYPETAG:
+				case NOTAG:
+				case ISCLOSED:
+					// now handled at end of calling function
+				default:
+					buffer.WriteString(pfx)
+					pfx = ""
+				}
+			}
+
+			var prev Token
+			primed := false
+
+			// track adjacent pairs to give look-ahead at next token
+			doPair := func(tkn Token) {
+
+				if primed {
+					doCleanup(prev, tkn.Tag, tkn.Name)
+				}
+
+				prev = Token{tkn.Tag, tkn.Cont, tkn.Name, tkn.Attr, tkn.Index, tkn.Line}
+				primed = true
+			}
+
+			ParseXML(text, parent, nil, doPair, nil, nil)
+
+			// isclosed tag
+			if primed {
+				buffer.WriteString(pfx)
+			}
+
+			txt := buffer.String()
+
+			if DoMixed {
+				// clean up reconstructed mixed content
+				txt = DoTrimFlankingHTML(txt)
+				if HasBadSpace(txt) {
+					txt = CleanupBadSpaces(txt)
+				}
+				if HasAdjacentSpaces(txt) {
+					txt = CompressRunsOfSpaces(txt)
+				}
+				if NeedsTightening(txt) {
+					txt = TightenParentheses(txt)
+				}
+			}
+
+			return txt
+		}
 
 		// read partitioned XML from producer channel
 		for ext := range inp {
@@ -5940,30 +6305,86 @@ func CreateMatchers(phrs string, exclude bool, inp <-chan Extract) <-chan Extrac
 				continue
 			}
 
-			srch := cleanupRecord(text)
+			str := doFormat(text[:])
 
-			ok := testPhrase(srch, clauses)
-
-			if exclude != ok {
-				// send text of record if phrase match succeeded with -require, or failed with -exclude
-				out <- Extract{idx, "", text, nil}
-				continue
-			}
-
-			// otherwise send empty text so unshuffler does not have to deal with record index gaps
-			out <- Extract{idx, "", "", nil}
+			// send even if empty to get all record counts for reordering
+			out <- Extract{idx, "", str, nil}
 		}
 	}
 
 	var wg sync.WaitGroup
 
-	// launch multiple phrase matcher goroutines
+	// launch multiple formatter goroutines
 	for i := 0; i < NumServe; i++ {
 		wg.Add(1)
-		go xmlMatcher(&wg, inp, out)
+		go xmlFormatter(&wg, inp, out)
 	}
 
-	// launch separate anonymous goroutine to wait until all phrase matchers are done
+	// launch separate anonymous goroutine to wait until all formatters are done
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
+}
+
+func CreateSelectors(parent, indx string, order map[string]bool, inp <-chan Extract) <-chan Extract {
+
+	if parent == "" || indx == "" || order == nil || inp == nil {
+		return nil
+	}
+
+	find := ParseIndex(indx)
+
+	out := make(chan Extract, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create selector channel\n")
+		os.Exit(1)
+	}
+
+	// xmlSelector reads partitioned XML from channel and matches identifiers of records to keep
+	xmlSelector := func(wg *sync.WaitGroup, inp <-chan Extract, out chan<- Extract) {
+
+		// report when this selector has no more records to process
+		defer wg.Done()
+
+		// read partitioned XML from producer channel
+		for ext := range inp {
+
+			text := ext.Text
+
+			found := false
+
+			FindIdentifiers(text[:], parent, find,
+				func(id string) {
+					id = SortStringByWords(id)
+					_, ok := order[id]
+					if ok {
+						found = true
+					}
+				})
+
+			if !found {
+				// identifier field not found or not in identifier list, send empty placeholder for unshuffler
+				out <- Extract{ext.Index, "", "", nil}
+				continue
+			}
+
+			// send selected record
+			out <- Extract{ext.Index, "", text, nil}
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	// launch multiple selector goroutines
+	for i := 0; i < NumServe; i++ {
+		wg.Add(1)
+		go xmlSelector(&wg, inp, out)
+	}
+
+	// launch separate anonymous goroutine to wait until all selectors are done
 	go func() {
 		wg.Wait()
 		close(out)
@@ -5974,10 +6395,10 @@ func CreateMatchers(phrs string, exclude bool, inp <-chan Extract) <-chan Extrac
 
 // XML VALIDATION AND FORMATTING FUNCTIONS
 
-// ReadBlocks -> StreamTokens -> ProcessStream
+// StreamBlocks -> StreamTokens -> ProcessStream
 
 // ProcessTokens shows individual tokens in stream (undocumented)
-func ProcessTokens(rdr *XMLReader) {
+func ProcessTokens(rdr <-chan string) {
 
 	if rdr == nil {
 		return
@@ -6026,6 +6447,14 @@ func ProcessTokens(rdr *XMLReader) {
 			buffer.WriteString(name)
 			buffer.WriteString("/")
 			buffer.WriteString("\n")
+			if attr != "" {
+				buffer.WriteString("AT: ")
+				for i := 0; i < indent; i++ {
+					buffer.WriteString("  ")
+				}
+				buffer.WriteString(attr)
+				buffer.WriteString("\n")
+			}
 		case STOPTAG:
 			indent--
 			buffer.WriteString("SP: ")
@@ -6036,7 +6465,18 @@ func ProcessTokens(rdr *XMLReader) {
 			buffer.WriteString("/")
 			buffer.WriteString("\n")
 		case CONTENTTAG:
-			buffer.WriteString("VL: ")
+			ctype := tkn.Cont
+			if (ctype & LFTSPACE) != 0 {
+				if (ctype & RGTSPACE) != 0 {
+					buffer.WriteString("FL: ")
+				} else {
+					buffer.WriteString("LF: ")
+				}
+			} else if (ctype & RGTSPACE) != 0 {
+				buffer.WriteString("RT: ")
+			} else {
+				buffer.WriteString("VL: ")
+			}
 			for i := 0; i < indent; i++ {
 				buffer.WriteString("  ")
 			}
@@ -6064,9 +6504,21 @@ func ProcessTokens(rdr *XMLReader) {
 			buffer.WriteString(name)
 			buffer.WriteString("\n")
 		case NOTAG:
-			buffer.WriteString("NO:\n")
+			buffer.WriteString("NO:")
+			if indent != 0 {
+				buffer.WriteString(" (indent ")
+				buffer.WriteString(strconv.Itoa(indent))
+				buffer.WriteString(")")
+			}
+			buffer.WriteString("\n")
 		case ISCLOSED:
-			buffer.WriteString("CL:\n")
+			buffer.WriteString("CL:")
+			if indent != 0 {
+				buffer.WriteString(" (indent ")
+				buffer.WriteString(strconv.Itoa(indent))
+				buffer.WriteString(")")
+			}
+			buffer.WriteString("\n")
 			txt := buffer.String()
 			if txt != "" {
 				// print final buffer
@@ -6074,7 +6526,13 @@ func ProcessTokens(rdr *XMLReader) {
 			}
 			return
 		default:
-			buffer.WriteString("UNKONWN:\n")
+			buffer.WriteString("UNKONWN:")
+			if indent != 0 {
+				buffer.WriteString(" (indent ")
+				buffer.WriteString(strconv.Itoa(indent))
+				buffer.WriteString(")")
+			}
+			buffer.WriteString("\n")
 		}
 
 		count++
@@ -6090,8 +6548,608 @@ func ProcessTokens(rdr *XMLReader) {
 	}
 }
 
+// ProcessFormat reformats XML for ease of reading
+func ProcessFormat(rdr <-chan string, args []string) {
+
+	if rdr == nil || args == nil {
+		return
+	}
+
+	var buffer strings.Builder
+	count := 0
+
+	// skip past command name
+	args = args[1:]
+
+	copyRecrd := false
+	compRecrd := false
+	flushLeft := false
+	wrapAttrs := false
+	ret := "\n"
+
+	xml := ""
+	customDoctype := false
+	doctype := ""
+
+	// look for [copy|compact|flush|indent|expand] specification
+	if len(args) > 0 {
+		inSwitch := true
+
+		switch args[0] {
+		case "compact", "compacted", "compress", "compressed", "terse", "*":
+			// compress to one record per line
+			compRecrd = true
+			ret = ""
+		case "flush", "flushed", "left":
+			// suppress line indentation
+			flushLeft = true
+		case "expand", "expanded", "extend", "extended", "verbose", "@":
+			// each attribute on its own line
+			wrapAttrs = true
+		case "indent", "indented", "normal", "default":
+			// default behavior
+		case "copy":
+			// fast block copy
+			copyRecrd = true
+		default:
+			// if not any of the controls, will check later for -xml and -doctype arguments
+			inSwitch = false
+		}
+
+		if inSwitch {
+			// skip past first argument
+			args = args[1:]
+		}
+	}
+
+	// fast block copy, supporting only -spaces processing flag
+	if copyRecrd {
+
+		for str := range rdr {
+			if str == "" {
+				break
+			}
+
+			os.Stdout.WriteString(str)
+		}
+		os.Stdout.WriteString("\n")
+		return
+	}
+
+	unicodePolicy := ""
+	scriptPolicy := ""
+	mathmlPolicy := ""
+
+	fuseTopSets := true
+	keepEmptySelfClosing := false
+
+	// look for -xml and -doctype arguments (undocumented)
+	for len(args) > 0 {
+
+		switch args[0] {
+		case "-xml":
+			args = args[1:]
+			// -xml argument must be followed by value to use in xml line
+			if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+				fmt.Fprintf(os.Stderr, "\nERROR: -xml argument is missing\n")
+				os.Exit(1)
+			}
+			xml = args[0]
+			args = args[1:]
+		case "-doctype":
+			customDoctype = true
+			args = args[1:]
+			if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+				// if -doctype argument followed by value, use instead of DOCTYPE line
+				doctype = args[0]
+				args = args[1:]
+			}
+
+		// allow setting of unicode, script, and mathml flags within -format
+		case "-unicode":
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unicode argument is missing\n")
+				os.Exit(1)
+			}
+			unicodePolicy = args[1]
+			args = args[2:]
+		case "-script":
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "\nERROR: Script argument is missing\n")
+				os.Exit(1)
+			}
+			scriptPolicy = args[1]
+			args = args[2:]
+		case "-mathml":
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "\nERROR: MathML argument is missing\n")
+				os.Exit(1)
+			}
+			mathmlPolicy = args[1]
+			args = args[2:]
+
+		// also allow setting additional processing flags within -format (undocumented)
+		case "-strict":
+			// can set -strict within -format
+			DoStrict = true
+			args = args[1:]
+		case "-mixed":
+			// can set -mixed within -format
+			DoMixed = true
+			args = args[1:]
+		case "-compress", "-compressed":
+			DoCompress = true
+			args = args[1:]
+		case "-accent":
+			DeAccent = true
+			args = args[1:]
+		case "-ascii":
+			DoASCII = true
+			args = args[1:]
+		case "-separate", "-separated":
+			fuseTopSets = false
+			args = args[1:]
+		case "-self", "-self-closing":
+			keepEmptySelfClosing = true
+			args = args[1:]
+		default:
+			fmt.Fprintf(os.Stderr, "\nERROR: Unrecognized option after -format command\n")
+			os.Exit(1)
+		}
+	}
+
+	UnicodeFix = ParseMarkup(unicodePolicy, "-unicode")
+	ScriptFix = ParseMarkup(scriptPolicy, "-script")
+	MathMLFix = ParseMarkup(mathmlPolicy, "-mathml")
+
+	if UnicodeFix != NOMARKUP {
+		DoUnicode = true
+	}
+
+	if ScriptFix != NOMARKUP {
+		DoScript = true
+	}
+
+	if MathMLFix != NOMARKUP {
+		DoMathML = true
+	}
+
+	CountLines = DoMixed
+	AllowEmbed = DoStrict || DoMixed
+	ContentMods = AllowEmbed || DoCompress || DoUnicode || DoScript || DoMathML || DeAccent || DoASCII
+
+	// array to speed up indentation
+	indentSpaces := []string{
+		"",
+		"  ",
+		"    ",
+		"      ",
+		"        ",
+		"          ",
+		"            ",
+		"              ",
+		"                ",
+		"                  ",
+	}
+
+	indent := 0
+
+	// indent a specified number of spaces
+	doIndent := func(indt int) {
+		if compRecrd || flushLeft {
+			return
+		}
+		i := indt
+		for i > 9 {
+			buffer.WriteString("                    ")
+			i -= 10
+		}
+		if i < 0 {
+			return
+		}
+		buffer.WriteString(indentSpaces[i])
+	}
+
+	badAttributeSpacing := func(attr string) bool {
+
+		if len(attr) < 2 {
+			return false
+		}
+
+		var prev rune
+
+		for _, ch := range attr {
+			if ch == '=' && prev == ' ' {
+				return true
+			}
+			if ch == ' ' && prev == '=' {
+				return true
+			}
+			prev = ch
+		}
+
+		return false
+	}
+
+	// print attributes
+	printAttributes := func(attr string) {
+
+		if attr == "" {
+			return
+		}
+		attr = strings.TrimSpace(attr)
+		attr = CompressRunsOfSpaces(attr)
+
+		if DeAccent {
+			if IsNotASCII(attr) {
+				attr = DoAccentTransform(attr)
+			}
+		}
+		if DoASCII {
+			if IsNotASCII(attr) {
+				attr = UnicodeToASCII(attr)
+			}
+		}
+
+		if wrapAttrs {
+
+			start := 0
+			idx := 0
+			inQuote := false
+
+			attlen := len(attr)
+
+			for idx < attlen {
+				ch := attr[idx]
+				if ch == '=' && !inQuote {
+					inQuote = true
+					str := strings.TrimSpace(attr[start:idx])
+					buffer.WriteString("\n")
+					doIndent(indent)
+					buffer.WriteString(" ")
+					buffer.WriteString(str)
+					// skip past equal sign
+					idx++
+					ch = attr[idx]
+					if ch != '"' && ch != '\'' {
+						// "
+						// skip past unexpected blanks
+						for InBlank[ch] {
+							idx++
+							ch = attr[idx]
+						}
+					}
+					// skip past leading double quote
+					idx++
+					start = idx
+				} else if ch == '"' || ch == '\'' {
+					// "
+					inQuote = !inQuote
+					str := strings.TrimSpace(attr[start:idx])
+					buffer.WriteString("=\"")
+					buffer.WriteString(str)
+					buffer.WriteString("\"")
+					// skip past trailing double quote and (possible) space
+					idx += 2
+					start = idx
+				} else {
+					idx++
+				}
+			}
+
+			buffer.WriteString("\n")
+			doIndent(indent)
+
+		} else if badAttributeSpacing(attr) {
+
+			buffer.WriteString(" ")
+
+			start := 0
+			idx := 0
+
+			attlen := len(attr)
+
+			for idx < attlen {
+				ch := attr[idx]
+				if ch == '=' {
+					str := strings.TrimSpace(attr[start:idx])
+					buffer.WriteString(str)
+					// skip past equal sign
+					idx++
+					ch = attr[idx]
+					if ch != '"' && ch != '\'' {
+						// "
+						// skip past unexpected blanks
+						for InBlank[ch] {
+							idx++
+							ch = attr[idx]
+						}
+					}
+					// skip past leading double quote
+					idx++
+					start = idx
+				} else if ch == '"' || ch == '\'' {
+					// "
+					str := strings.TrimSpace(attr[start:idx])
+					buffer.WriteString("=\"")
+					buffer.WriteString(str)
+					buffer.WriteString("\"")
+					// skip past trailing double quote and (possible) space
+					idx += 2
+					start = idx
+				} else {
+					idx++
+				}
+			}
+
+		} else {
+
+			buffer.WriteString(" ")
+			buffer.WriteString(attr)
+		}
+	}
+
+	parent := ""
+	pfx := ""
+	skip := 0
+	okIndent := true
+
+	printXMLAndDoctype := func(xml, doctype, parent string) {
+
+		// check for xml line explicitly set in argument
+		if xml != "" {
+			xml = strings.TrimSpace(xml)
+			if strings.HasPrefix(xml, "<") {
+				xml = xml[1:]
+			}
+			if strings.HasPrefix(xml, "?") {
+				xml = xml[1:]
+			}
+			if strings.HasPrefix(xml, "xml") {
+				xml = xml[3:]
+			}
+			if strings.HasPrefix(xml, " ") {
+				xml = xml[1:]
+			}
+			if strings.HasSuffix(xml, "?>") {
+				xlen := len(xml)
+				xml = xml[:xlen-2]
+			}
+			xml = strings.TrimSpace(xml)
+
+			buffer.WriteString("<?xml ")
+			buffer.WriteString(xml)
+			buffer.WriteString("?>")
+		} else {
+			buffer.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+		}
+
+		buffer.WriteString("\n")
+
+		// check for doctype taken from XML file or explicitly set in argument
+		if doctype != "" {
+			doctype = strings.TrimSpace(doctype)
+			if strings.HasPrefix(doctype, "<") {
+				doctype = doctype[1:]
+			}
+			if strings.HasPrefix(doctype, "!") {
+				doctype = doctype[1:]
+			}
+			if strings.HasPrefix(doctype, "DOCTYPE") {
+				doctype = doctype[7:]
+			}
+			if strings.HasPrefix(doctype, " ") {
+				doctype = doctype[1:]
+			}
+			doctype = strings.TrimSuffix(doctype, ">")
+			doctype = strings.TrimSpace(doctype)
+
+			buffer.WriteString("<!DOCTYPE ")
+			buffer.WriteString(doctype)
+			buffer.WriteString(">")
+		} else {
+			buffer.WriteString("<!DOCTYPE ")
+			buffer.WriteString(parent)
+			buffer.WriteString(">")
+		}
+
+		buffer.WriteString("\n")
+	}
+
+	cleanupMixed := func(txt string) string {
+
+		txt = DoTrimFlankingHTML(txt)
+		if HasBadSpace(txt) {
+			txt = CleanupBadSpaces(txt)
+		}
+		if HasAdjacentSpaces(txt) {
+			txt = CompressRunsOfSpaces(txt)
+		}
+		if NeedsTightening(txt) {
+			txt = TightenParentheses(txt)
+		}
+
+		return txt
+	}
+
+	doCleanup := func(tkn Token, nxtTag TagType, nxtName, nxtAttr string) {
+
+		if skip > 0 {
+			skip--
+			return
+		}
+
+		name := tkn.Name
+
+		switch tkn.Tag {
+		case STARTTAG:
+			// detect first start tag, print xml and doctype parent
+			if indent == 0 && parent == "" {
+				parent = name
+				printXMLAndDoctype(xml, doctype, parent)
+				// do not fuse <opt> or <anon> top-level objects (converted from JSON)
+				if parent == "opt" || parent == "anon" {
+					fuseTopSets = false
+				}
+			}
+			// convert start-stop to self-closing tag if attributes are present, otherwise skip
+			if nxtTag == STOPTAG && nxtName == name {
+				if tkn.Attr != "" || keepEmptySelfClosing {
+					buffer.WriteString(pfx)
+					doIndent(indent)
+					buffer.WriteString("<")
+					buffer.WriteString(name)
+					printAttributes(tkn.Attr)
+					buffer.WriteString("/>")
+					pfx = ret
+					okIndent = true
+				}
+				skip++
+				return
+			}
+			buffer.WriteString(pfx)
+			doIndent(indent)
+			indent++
+			buffer.WriteString("<")
+			buffer.WriteString(name)
+			printAttributes(tkn.Attr)
+			buffer.WriteString(">")
+			pfx = ret
+			okIndent = true
+			if compRecrd && indent == 1 {
+				buffer.WriteString("\n")
+			}
+		case SELFTAG:
+			if tkn.Attr != "" || keepEmptySelfClosing {
+				buffer.WriteString(pfx)
+				doIndent(indent)
+				buffer.WriteString("<")
+				buffer.WriteString(name)
+				printAttributes(tkn.Attr)
+				buffer.WriteString("/>")
+				pfx = ret
+				okIndent = true
+			}
+		case STOPTAG:
+			// skip internal copies of top-level </parent><parent> tags (to fuse multiple chunks returned by efetch)
+			// do not skip if attributes are present, unless pattern ends in "Set" (e.g., <DocumentSummarySet status="OK">)
+			if nxtTag == STARTTAG && indent == 1 && fuseTopSets && nxtName == parent {
+				if nxtAttr == "" || (strings.HasSuffix(parent, "Set") && len(parent) > 3) {
+					skip++
+					return
+				}
+			}
+			buffer.WriteString(pfx)
+			indent--
+			if okIndent {
+				doIndent(indent)
+			}
+			buffer.WriteString("</")
+			buffer.WriteString(name)
+			buffer.WriteString(">")
+			if DoMixed && nxtTag == CONTENTTAG {
+				buffer.WriteString(" ")
+			}
+			pfx = ret
+			okIndent = true
+			if compRecrd && indent < 2 {
+				buffer.WriteString("\n")
+			}
+		case CONTENTTAG:
+			if nxtTag == STARTTAG || nxtTag == SELFTAG {
+				if DoStrict {
+					fmt.Fprintf(os.Stderr, "ERROR: UNRECOGNIZED MIXED CONTENT <%s> in <%s>\n", nxtName, name)
+				} else if !DoMixed {
+					fmt.Fprintf(os.Stderr, "ERROR: UNEXPECTED MIXED CONTENT <%s> in <%s>\n", nxtName, name)
+				}
+			}
+			if len(name) > 0 && IsNotJustWhitespace(name) {
+				// support for all content processing flags
+				if DoStrict || DoMixed || DoCompress {
+					ctype := tkn.Cont
+					name = CleanupContents(name, (ctype&ASCII) != 0, (ctype&AMPER) != 0, (ctype&MIXED) != 0)
+				}
+				buffer.WriteString(name)
+			}
+			if DoMixed && nxtTag == STARTTAG {
+				buffer.WriteString(" ")
+			}
+			pfx = ""
+			okIndent = false
+		case CDATATAG, COMMENTTAG:
+			// ignore
+		case DOCTYPETAG:
+			if customDoctype && doctype == "" {
+				doctype = name
+			}
+		case NOTAG:
+		case ISCLOSED:
+			// now handled at end of calling function
+		default:
+			buffer.WriteString(pfx)
+			pfx = ""
+			okIndent = false
+		}
+
+		count++
+		if count > 1000 {
+			count = 0
+			txt := buffer.String()
+			if DoMixed {
+				txt = cleanupMixed(txt)
+			}
+			if txt != "" {
+				// print current buffered output
+				fmt.Fprintf(os.Stdout, "%s", txt)
+			}
+			buffer.Reset()
+		}
+	}
+
+	var prev Token
+	primed := false
+	skipDoctype := false
+
+	// track adjacent pairs to give look-ahead at next token
+	doPair := func(tkn Token) {
+
+		if tkn.Tag == NOTAG {
+			return
+		}
+
+		if tkn.Tag == DOCTYPETAG {
+			if skipDoctype {
+				return
+			}
+			skipDoctype = true
+		}
+
+		if primed {
+			doCleanup(prev, tkn.Tag, tkn.Name, tkn.Attr)
+		}
+
+		prev = Token{tkn.Tag, tkn.Cont, tkn.Name, tkn.Attr, tkn.Index, tkn.Line}
+		primed = true
+	}
+
+	ParseXML("", "", rdr, doPair, nil, nil)
+
+	// handle isclosed tag
+	if primed {
+		buffer.WriteString(pfx)
+		txt := buffer.String()
+		if DoMixed {
+			txt = cleanupMixed(txt)
+		}
+		if txt != "" {
+			// print final buffer
+			fmt.Fprintf(os.Stdout, "%s", txt)
+		}
+	}
+}
+
 // ProcessOutline displays outline of XML structure
-func ProcessOutline(rdr *XMLReader) {
+func ProcessOutline(rdr <-chan string) {
 
 	if rdr == nil {
 		return
@@ -6166,7 +7224,7 @@ func ProcessOutline(rdr *XMLReader) {
 }
 
 // ProcessSynopsis displays paths to XML elements
-func ProcessSynopsis(rdr *XMLReader) {
+func ProcessSynopsis(rdr <-chan string, leaf bool, delim string) {
 
 	if rdr == nil {
 		return
@@ -6204,15 +7262,25 @@ func ProcessSynopsis(rdr *XMLReader) {
 					name == "TaxaSet" {
 					break
 				}
-				if parent != "" {
-					buffer.WriteString(parent)
-					buffer.WriteString("/")
+				if leaf {
+					if name == "root" ||
+						name == "opt" ||
+						name == "anon" {
+						break
+					}
 				}
-				buffer.WriteString(name)
-				buffer.WriteString("\n")
+				if !leaf {
+					// show all paths, including container objects
+					if parent != "" {
+						buffer.WriteString(parent)
+						buffer.WriteString(delim)
+					}
+					buffer.WriteString(name)
+					buffer.WriteString("\n")
+				}
 				path := parent
 				if path != "" {
-					path += "/"
+					path += delim
 				}
 				path += name
 				if synopsisLevel(path) {
@@ -6221,13 +7289,21 @@ func ProcessSynopsis(rdr *XMLReader) {
 			case SELFTAG:
 				if parent != "" {
 					buffer.WriteString(parent)
-					buffer.WriteString("/")
+					buffer.WriteString(delim)
 				}
 				buffer.WriteString(name)
 				buffer.WriteString("\n")
 			case STOPTAG:
 				// break recursion
 				return false
+			case CONTENTTAG:
+				if leaf {
+					// only show endpoint paths
+					if parent != "" {
+						buffer.WriteString(parent)
+						buffer.WriteString("\n")
+					}
+				}
 			case DOCTYPETAG:
 			case NOTAG:
 			case ISCLOSED:
@@ -6263,7 +7339,7 @@ func ProcessSynopsis(rdr *XMLReader) {
 }
 
 // ProcessVerify checks for well-formed XML
-func ProcessVerify(rdr *XMLReader, args []string) {
+func ProcessVerify(rdr <-chan string, args []string) {
 
 	if rdr == nil || args == nil {
 		return
@@ -6430,7 +7506,7 @@ func ProcessVerify(rdr *XMLReader, args []string) {
 
 			switch tag {
 			case STARTTAG:
-				if status == CHAR {
+				if status == CHAR && !DoMixed {
 					fmt.Fprintf(os.Stdout, "%s%8d\t<%s> not expected after contents\n", currID, line, name)
 				}
 				verifyLevel(name, parent, level+1)
@@ -6456,7 +7532,7 @@ func ProcessVerify(rdr *XMLReader, args []string) {
 						}
 					}
 				}
-				if status != START {
+				if status != START && !DoMixed {
 					fmt.Fprintf(os.Stdout, "%s%8d\tContents not expected before </%s>\n", currID, line, parent)
 				}
 				if AllowEmbed {
@@ -6490,557 +7566,8 @@ func ProcessVerify(rdr *XMLReader, args []string) {
 	}
 }
 
-// ProcessFormat reformats XML for ease of reading
-func ProcessFormat(rdr *XMLReader, args []string) {
-
-	if rdr == nil || args == nil {
-		return
-	}
-
-	tknq := CreateTokenizer(rdr)
-
-	if tknq == nil {
-		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create format tokenizer\n")
-		os.Exit(1)
-	}
-
-	var buffer strings.Builder
-	count := 0
-
-	// skip past command name
-	args = args[1:]
-
-	copyRecrd := false
-	compRecrd := false
-	flushLeft := false
-	wrapAttrs := false
-	ret := "\n"
-	frst := true
-
-	xml := ""
-	customDoctype := false
-	doctype := ""
-
-	// look for [copy|compact|flush|indent|expand] specification
-	if len(args) > 0 {
-		inSwitch := true
-
-		switch args[0] {
-		case "compact", "compacted", "compress", "compressed", "terse", "*":
-			// compress to one record per line
-			compRecrd = true
-			ret = ""
-		case "flush", "flushed", "left":
-			// suppress line indentation
-			flushLeft = true
-		case "expand", "expanded", "verbose", "@":
-			// each attribute on its own line
-			wrapAttrs = true
-		case "indent", "indented", "normal", "default":
-			// default behavior
-		case "copy":
-			// fast block copy
-			copyRecrd = true
-		default:
-			// if not any of the controls, will check later for -xml and -doctype arguments
-			inSwitch = false
-		}
-
-		if inSwitch {
-			// skip past first argument
-			args = args[1:]
-		}
-	}
-
-	// fast copy, supporting only -spaces processing flag
-	if copyRecrd {
-
-		for {
-			str := rdr.NextBlock()
-			if str == "" {
-				break
-			}
-
-			os.Stdout.WriteString(str)
-		}
-		os.Stdout.WriteString("\n")
-		return
-	}
-
-	unicodePolicy := ""
-	scriptPolicy := ""
-	mathmlPolicy := ""
-
-	// look for -xml and -doctype arguments (undocumented)
-	for len(args) > 0 {
-
-		switch args[0] {
-		case "-xml":
-			args = args[1:]
-			// -xml argument must be followed by value to use in xml line
-			if len(args) < 1 || strings.HasPrefix(args[0], "-") {
-				fmt.Fprintf(os.Stderr, "\nERROR: -xml argument is missing\n")
-				os.Exit(1)
-			}
-			xml = args[0]
-			args = args[1:]
-		case "-doctype":
-			customDoctype = true
-			args = args[1:]
-			if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-				// if -doctype argument followed by value, use instead of DOCTYPE line
-				doctype = args[0]
-				args = args[1:]
-			}
-
-		// allow setting of unicode, script, and mathml flags within -format
-		case "-unicode":
-			if len(args) < 2 {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unicode argument is missing\n")
-				os.Exit(1)
-			}
-			unicodePolicy = args[1]
-			args = args[2:]
-		case "-script":
-			if len(args) < 2 {
-				fmt.Fprintf(os.Stderr, "\nERROR: Script argument is missing\n")
-				os.Exit(1)
-			}
-			scriptPolicy = args[1]
-			args = args[2:]
-		case "-mathml":
-			if len(args) < 2 {
-				fmt.Fprintf(os.Stderr, "\nERROR: MathML argument is missing\n")
-				os.Exit(1)
-			}
-			mathmlPolicy = args[1]
-			args = args[2:]
-		case "-repair":
-			if unicodePolicy == "" {
-				unicodePolicy = "space"
-			}
-			args = args[1:]
-
-		// also allow setting additional processing flags within -format (undocumented)
-		case "-strict":
-			// can set -strict within -format
-			DoStrict = true
-			args = args[1:]
-		case "-mixed", "-relaxed":
-			// can set -mixed within -format
-			DoMixed = true
-			args = args[1:]
-		case "-compress", "-compressed":
-			DoCompress = true
-			args = args[1:]
-		case "-accent", "-plain":
-			DeAccent = true
-			args = args[1:]
-		case "-ascii":
-			DoASCII = true
-			args = args[1:]
-		default:
-			fmt.Fprintf(os.Stderr, "\nERROR: Unrecognized option after -format command\n")
-			os.Exit(1)
-		}
-	}
-
-	UnicodeFix = ParseMarkup(unicodePolicy, "-unicode")
-	ScriptFix = ParseMarkup(scriptPolicy, "-script")
-	MathMLFix = ParseMarkup(mathmlPolicy, "-mathml")
-
-	if UnicodeFix != NOMARKUP {
-		DoUnicode = true
-	}
-
-	if ScriptFix != NOMARKUP {
-		DoScript = true
-	}
-
-	if MathMLFix != NOMARKUP {
-		DoMathML = true
-	}
-
-	AllowEmbed = DoStrict || DoMixed
-	ContentMods = AllowEmbed || DoCompress || DoUnicode || DoScript || DoMathML || DeAccent || DoASCII
-
-	type FormatType int
-
-	const (
-		NOTSET FormatType = iota
-		START
-		STOP
-		CHAR
-		OTHER
-	)
-
-	// array to speed up indentation
-	indentSpaces := []string{
-		"",
-		"  ",
-		"    ",
-		"      ",
-		"        ",
-		"          ",
-		"            ",
-		"              ",
-		"                ",
-		"                  ",
-	}
-
-	indent := 0
-
-	// parent used to detect first start tag, will place in doctype line unless overridden by -doctype argument
-	parent := ""
-
-	status := NOTSET
-
-	// delay printing right bracket of start tag to support self-closing tag style
-	needsRightBracket := ""
-
-	// delay printing start tag if no attributes, suppress empty start-end pair if followed by end
-	justStartName := ""
-	justStartIndent := 0
-
-	// indent a specified number of spaces
-	doIndent := func(indt int) {
-		if compRecrd || flushLeft {
-			return
-		}
-		i := indt
-		for i > 9 {
-			buffer.WriteString("                    ")
-			i -= 10
-		}
-		if i < 0 {
-			return
-		}
-		buffer.WriteString(indentSpaces[i])
-	}
-
-	// handle delayed start tag
-	doDelayedName := func() {
-		if needsRightBracket != "" {
-			buffer.WriteString(">")
-			needsRightBracket = ""
-		}
-		if justStartName != "" {
-			doIndent(justStartIndent)
-			buffer.WriteString("<")
-			buffer.WriteString(justStartName)
-			buffer.WriteString(">")
-			justStartName = ""
-		}
-	}
-
-	closingTag := ""
-
-	// print attributes
-	printAttributes := func(attr string) {
-
-		attr = strings.TrimSpace(attr)
-		attr = CompressRunsOfSpaces(attr)
-		if DeAccent {
-			if IsNotASCII(attr) {
-				attr = DoAccentTransform(attr)
-			}
-		}
-		if DoASCII {
-			if IsNotASCII(attr) {
-				attr = UnicodeToASCII(attr)
-			}
-		}
-
-		if wrapAttrs {
-
-			start := 0
-			idx := 0
-
-			attlen := len(attr)
-
-			for idx < attlen {
-				ch := attr[idx]
-				if ch == '=' {
-					str := attr[start:idx]
-					buffer.WriteString("\n")
-					doIndent(indent)
-					buffer.WriteString(" ")
-					buffer.WriteString(str)
-					// skip past equal sign and leading double quote
-					idx += 2
-					start = idx
-				} else if ch == '"' {
-					str := attr[start:idx]
-					buffer.WriteString("=\"")
-					buffer.WriteString(str)
-					buffer.WriteString("\"")
-					// skip past trailing double quote and (possible) space
-					idx += 2
-					start = idx
-				} else {
-					idx++
-				}
-			}
-
-			buffer.WriteString("\n")
-			doIndent(indent)
-
-		} else {
-
-			buffer.WriteString(" ")
-			buffer.WriteString(attr)
-		}
-	}
-
-	prev := ""
-
-	for tkn := range tknq {
-
-		tag := tkn.Tag
-		name := tkn.Name
-		attr := tkn.Attr
-
-		switch tag {
-		case STARTTAG:
-			doDelayedName()
-			if status == CHAR {
-				if AllowEmbed {
-					fmt.Fprintf(os.Stdout, "ERROR: UNRECOGNIZED MIXED CONTENT <%s> in <%s>\n", name, prev)
-				} else {
-					fmt.Fprintf(os.Stdout, "ERROR: UNEXPECTED MIXED CONTENT <%s> in <%s>\n", name, prev)
-				}
-			} else {
-				prev = name
-			}
-			if status == START {
-				buffer.WriteString(ret)
-			}
-			// remove internal copies of </parent><parent> tags
-			if parent != "" && name == parent && indent == 1 {
-				break
-			}
-
-			// detect first start tag, print xml and doctype parent
-			if indent == 0 && parent == "" {
-				parent = name
-
-				// check for xml line explicitly set in argument
-				if xml != "" {
-					xml = strings.TrimSpace(xml)
-					if strings.HasPrefix(xml, "<") {
-						xml = xml[1:]
-					}
-					if strings.HasPrefix(xml, "?") {
-						xml = xml[1:]
-					}
-					if strings.HasPrefix(xml, "xml") {
-						xml = xml[3:]
-					}
-					if strings.HasPrefix(xml, " ") {
-						xml = xml[1:]
-					}
-					if strings.HasSuffix(xml, "?>") {
-						xlen := len(xml)
-						xml = xml[:xlen-2]
-					}
-					xml = strings.TrimSpace(xml)
-
-					buffer.WriteString("<?xml ")
-					buffer.WriteString(xml)
-					buffer.WriteString("?>")
-				} else {
-					buffer.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
-				}
-
-				buffer.WriteString("\n")
-
-				// check for doctype taken from XML file or explicitly set in argument
-				if doctype != "" {
-					doctype = strings.TrimSpace(doctype)
-					if strings.HasPrefix(doctype, "<") {
-						doctype = doctype[1:]
-					}
-					if strings.HasPrefix(doctype, "!") {
-						doctype = doctype[1:]
-					}
-					if strings.HasPrefix(doctype, "DOCTYPE") {
-						doctype = doctype[7:]
-					}
-					if strings.HasPrefix(doctype, " ") {
-						doctype = doctype[1:]
-					}
-					if strings.HasSuffix(doctype, ">") {
-						dlen := len(doctype)
-						doctype = doctype[:dlen-1]
-					}
-					doctype = strings.TrimSpace(doctype)
-
-					buffer.WriteString("<!DOCTYPE ")
-					buffer.WriteString(doctype)
-					buffer.WriteString(">")
-				} else {
-					buffer.WriteString("<!DOCTYPE ")
-					buffer.WriteString(parent)
-					buffer.WriteString(">")
-				}
-
-				buffer.WriteString("\n")
-
-				// now filtering internal </parent><parent> tags, so queue printing of closing tag
-				closingTag = fmt.Sprintf("</%s>\n", parent)
-				// already past </parent><parent> test, so opening tag will print normally
-			}
-
-			// check for attributes
-			if attr != "" {
-				doIndent(indent)
-
-				buffer.WriteString("<")
-				buffer.WriteString(name)
-
-				printAttributes(attr)
-
-				needsRightBracket = name
-
-			} else {
-				justStartName = name
-				justStartIndent = indent
-			}
-
-			if compRecrd && frst && indent == 0 {
-				frst = false
-				doDelayedName()
-				buffer.WriteString("\n")
-			}
-
-			indent++
-
-			status = START
-		case SELFTAG:
-			doDelayedName()
-			if status == START {
-				buffer.WriteString(ret)
-			}
-
-			// suppress self-closing tag without attributes
-			if attr != "" {
-				doIndent(indent)
-
-				buffer.WriteString("<")
-				buffer.WriteString(name)
-
-				printAttributes(attr)
-
-				buffer.WriteString("/>")
-				buffer.WriteString(ret)
-			}
-
-			status = STOP
-		case STOPTAG:
-			// if end immediately follows start, turn into self-closing tag if there were attributes, otherwise suppress empty tag
-			if needsRightBracket != "" {
-				if status == START && name == needsRightBracket {
-					// end immediately follows start, produce self-closing tag
-					buffer.WriteString("/>")
-					buffer.WriteString(ret)
-					needsRightBracket = ""
-					indent--
-					status = STOP
-					break
-				}
-				buffer.WriteString(">")
-				needsRightBracket = ""
-			}
-			if justStartName != "" {
-				if status == START && name == justStartName {
-					// end immediately follows delayed start with no attributes, suppress
-					justStartName = ""
-					indent--
-					status = STOP
-					break
-				}
-				doIndent(justStartIndent)
-				buffer.WriteString("<")
-				buffer.WriteString(justStartName)
-				buffer.WriteString(">")
-				justStartName = ""
-			}
-
-			// remove internal copies of </parent><parent> tags
-			if parent != "" && name == parent && indent == 1 {
-				break
-			}
-			indent--
-			if status == CHAR {
-				buffer.WriteString("</")
-				buffer.WriteString(name)
-				buffer.WriteString(">")
-				buffer.WriteString(ret)
-			} else if status == START {
-				buffer.WriteString("</")
-				buffer.WriteString(name)
-				buffer.WriteString(">")
-				buffer.WriteString(ret)
-			} else {
-				doIndent(indent)
-
-				buffer.WriteString("</")
-				buffer.WriteString(name)
-				buffer.WriteString(">")
-				buffer.WriteString(ret)
-			}
-			status = STOP
-			if compRecrd && indent == 1 {
-				buffer.WriteString("\n")
-			}
-		case CONTENTTAG:
-			doDelayedName()
-			if len(name) > 0 && IsNotJustWhitespace(name) {
-				// support for all content processing flags
-				if ContentMods {
-					name = CleanupContents(name, true, true, true)
-				}
-				buffer.WriteString(name)
-				status = CHAR
-			}
-		case CDATATAG, COMMENTTAG:
-			// ignore
-		case DOCTYPETAG:
-			if customDoctype && doctype == "" {
-				doctype = name
-			}
-		case NOTAG:
-		case ISCLOSED:
-			doDelayedName()
-			if closingTag != "" {
-				buffer.WriteString(closingTag)
-			}
-			txt := buffer.String()
-			if txt != "" {
-				// print final buffer
-				fmt.Fprintf(os.Stdout, "%s", txt)
-			}
-			return
-		default:
-			doDelayedName()
-			status = OTHER
-		}
-
-		count++
-		if count > 1000 {
-			count = 0
-			txt := buffer.String()
-			if txt != "" {
-				// print current buffered output
-				fmt.Fprintf(os.Stdout, "%s", txt)
-			}
-			buffer.Reset()
-		}
-	}
-}
-
 // ProcessFilter modifies XML content, comments, or CDATA
-func ProcessFilter(rdr *XMLReader, args []string) {
+func ProcessFilter(rdr <-chan string, args []string) {
 
 	if rdr == nil || args == nil {
 		return
@@ -7352,6 +7879,794 @@ func ProcessFilter(rdr *XMLReader, args []string) {
 	}
 }
 
+// ProcessNormalize adjusts XML fields to conform to common conventions
+func ProcessNormalize(rdr <-chan string, args []string) {
+
+	if rdr == nil || args == nil {
+		return
+	}
+
+	tknq := CreateTokenizer(rdr)
+
+	if tknq == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create normalize tokenizer\n")
+		os.Exit(1)
+	}
+
+	var buffer strings.Builder
+
+	count := 0
+
+	// e.g., xtract -normalize pubmed
+
+	// skip past command name
+	args = args[1:]
+
+	max := len(args)
+	if max < 1 {
+		fmt.Fprintf(os.Stderr, "\nERROR: No database name supplied to xtract -normalize\n")
+		os.Exit(1)
+	}
+
+	db := args[0]
+
+	// force -strict cleanup flag
+	if db != "bioc" {
+		DoStrict = true
+	}
+	AllowEmbed = true
+	ContentMods = true
+
+	uid := ""
+	isDocsum := false
+	prevName := ""
+
+	// removes mixed content tags
+	mfix := strings.NewReplacer(
+		"<b>", "",
+		"<i>", "",
+		"<u>", "",
+		"</b>", "",
+		"</i>", "",
+		"</u>", "",
+		"<b/>", "",
+		"<i/>", "",
+		"<u/>", "",
+		"<sup>", "",
+		"<sub>", "",
+		"</sup>", "",
+		"</sub>", "",
+		"<sup/>", "",
+		"<sub/>", "",
+	)
+
+	// reencodes < and > to &lt and &gt
+	rfix := strings.NewReplacer(
+		"<", "&lt;",
+		">", "&gt;",
+	)
+
+	for tkn := range tknq {
+
+		tag := tkn.Tag
+		name := tkn.Name
+		attr := tkn.Attr
+
+		switch tag {
+		case STARTTAG:
+			if name == "Id" && uid != "" {
+				uid = ""
+			}
+			if uid != "" {
+				// if object after DocumentSummary is not already Id, create Id from rescued attribute
+				buffer.WriteString("<Id>\n")
+				buffer.WriteString(uid)
+				buffer.WriteString("</Id>\n")
+				// clear until next docsum
+				uid = ""
+			}
+			if name == "DocumentSummary" {
+				isDocsum = true
+				if strings.HasPrefix(attr, "uid=\"") && strings.HasSuffix(attr, "\"") {
+					attr = strings.TrimPrefix(attr, "uid=\"")
+					attr = strings.TrimSuffix(attr, "\"")
+					// store uid from DocumentSummary
+					uid = attr
+					// remove attribute
+					attr = ""
+				}
+			}
+			buffer.WriteString("<")
+			buffer.WriteString(name)
+			if attr != "" {
+				attr = strings.TrimSpace(attr)
+				attr = CompressRunsOfSpaces(attr)
+				buffer.WriteString(" ")
+				buffer.WriteString(attr)
+			}
+			buffer.WriteString(">\n")
+			prevName = name
+		case SELFTAG:
+			buffer.WriteString("<")
+			buffer.WriteString(name)
+			if attr != "" {
+				attr = strings.TrimSpace(attr)
+				attr = CompressRunsOfSpaces(attr)
+				buffer.WriteString(" ")
+				buffer.WriteString(attr)
+			}
+			buffer.WriteString("/>\n")
+		case STOPTAG:
+			buffer.WriteString("</")
+			buffer.WriteString(name)
+			buffer.WriteString(">\n")
+		case CONTENTTAG:
+			if isDocsum {
+				if db == "pubmed" && prevName == "Title" {
+					if strings.Contains(name, "&") ||
+						strings.Contains(name, "<") ||
+						strings.Contains(name, ">") {
+						ctype := tkn.Cont
+						name = CleanupContents(name, (ctype&ASCII) != 0, (ctype&AMPER) != 0, (ctype&MIXED) != 0)
+						if HasFlankingSpace(name) {
+							name = strings.TrimSpace(name)
+						}
+						name = html.UnescapeString(name)
+						// remove mixed content tags
+						name = mfix.Replace(name)
+						// reencode < and > to avoid breaking XML
+						if strings.Contains(name, "<") || strings.Contains(name, ">") {
+							name = rfix.Replace(name)
+						}
+					}
+				} else if db == "gene" && prevName == "Summary" {
+					if strings.Contains(name, "&amp;") {
+						if HasFlankingSpace(name) {
+							name = strings.TrimSpace(name)
+						}
+						name = html.UnescapeString(name)
+						// reencode < and > to avoid breaking XML
+						if strings.Contains(name, "<") || strings.Contains(name, ">") {
+							name = rfix.Replace(name)
+						}
+					}
+				} else if (db == "biosample" && prevName == "SampleData") ||
+					(db == "medgen" && prevName == "ConceptMeta") ||
+					(db == "sra" && prevName == "ExpXml") ||
+					(db == "sra" && prevName == "Runs") {
+					if strings.Contains(name, "&lt;") && strings.Contains(name, "&gt;") {
+						if HasFlankingSpace(name) {
+							name = strings.TrimSpace(name)
+						}
+						name = html.UnescapeString(name)
+					}
+				}
+			} else {
+				if db == "pubmed" {
+					ctype := tkn.Cont
+					name = CleanupContents(name, (ctype&ASCII) != 0, (ctype&AMPER) != 0, (ctype&MIXED) != 0)
+					if HasFlankingSpace(name) {
+						name = strings.TrimSpace(name)
+					}
+				} else if db == "bioc" {
+					name = CleanupContents(name, true, true, true)
+					if HasFlankingSpace(name) {
+						name = strings.TrimSpace(name)
+					}
+				}
+			}
+			// content normally printed
+			if HasFlankingSpace(name) {
+				name = strings.TrimSpace(name)
+			}
+			buffer.WriteString(name)
+			buffer.WriteString("\n")
+		case CDATATAG:
+			if isDocsum {
+				if db == "assembly" && prevName == "Meta" {
+					if strings.Contains(name, "<") && strings.Contains(name, ">") {
+						// if CDATA contains embedded XML, simply remove CDATA wrapper
+						if HasFlankingSpace(name) {
+							name = strings.TrimSpace(name)
+						}
+						buffer.WriteString(name)
+						buffer.WriteString("\n")
+					}
+				} else if db == "gtr" && prevName == "Extra" {
+					// remove entire CDATA contents
+				}
+			}
+		case COMMENTTAG:
+			if !isDocsum {
+				if db == "sra" {
+					if strings.Contains(name, "<") && strings.Contains(name, ">") {
+						// if comment contains embedded XML, remove comment wrapper and trim to leading < bracket
+						pos := strings.Index(name, "<")
+						if pos > 0 {
+							name = name[pos:]
+						}
+						if HasFlankingSpace(name) {
+							name = strings.TrimSpace(name)
+						}
+						buffer.WriteString(name)
+						buffer.WriteString("\n")
+					}
+				}
+			}
+		case DOCTYPETAG:
+			doctype := strings.TrimSpace(name)
+			if strings.HasPrefix(doctype, "<") {
+				doctype = doctype[1:]
+			}
+			if strings.HasPrefix(doctype, "!") {
+				doctype = doctype[1:]
+			}
+			if strings.HasPrefix(doctype, "DOCTYPE") {
+				doctype = doctype[7:]
+			}
+			if strings.HasPrefix(doctype, " ") {
+				doctype = doctype[1:]
+			}
+			doctype = strings.TrimSuffix(doctype, ">")
+			doctype = strings.TrimSpace(doctype)
+
+			buffer.WriteString("<!DOCTYPE ")
+			buffer.WriteString(doctype)
+			buffer.WriteString(">")
+		case NOTAG:
+		case ISCLOSED:
+			txt := buffer.String()
+			if txt != "" {
+				// print final buffer
+				fmt.Fprintf(os.Stdout, "%s", txt)
+			}
+			return
+		default:
+		}
+
+		count++
+		if count > 1000 {
+			count = 0
+			txt := buffer.String()
+			if txt != "" {
+				// print current buffered output
+				fmt.Fprintf(os.Stdout, "%s", txt)
+			}
+			buffer.Reset()
+		}
+	}
+}
+
+// JSONTokenizer sends sequential JSON tokens down a channel
+func JSONTokenizer(inp io.Reader) <-chan string {
+
+	if inp == nil {
+		return nil
+	}
+
+	out := make(chan string, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create JSON tokenizer channel\n")
+		os.Exit(1)
+	}
+
+	tokenizeJSON := func(inp io.Reader, out chan<- string) {
+
+		// close channel when all tokens have been sent
+		defer close(out)
+
+		// use token decoder from encoding/json package
+		dec := json.NewDecoder(inp)
+		if dec == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create JSON Decoder\n")
+			os.Exit(1)
+		}
+		dec.UseNumber()
+
+		for {
+			t, err := dec.Token()
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unable to read JSON token '%s'\n", err)
+				os.Exit(1)
+			}
+
+			// type switch performs sequential type assertions until match is found
+			switch v := t.(type) {
+			case json.Delim:
+				// opening or closing braces (for objects) or brackets (for arrays)
+				out <- string(v)
+			case string:
+				str := v
+				if HasAdjacentSpacesOrNewline(str) {
+					str = CompressRunsOfSpaces(str)
+				}
+				out <- str
+			case json.Number:
+				out <- v.String()
+			case float64:
+				out <- strconv.FormatFloat(v, 'f', -1, 64)
+			case bool:
+				if v {
+					out <- "true"
+				} else {
+					out <- "false"
+				}
+			case nil:
+				out <- "null"
+			default:
+				out <- t.(string)
+			}
+		}
+	}
+
+	// launch single tokenizer goroutine
+	go tokenizeJSON(inp, out)
+
+	return out
+}
+
+// JSONConverter parses JSON token stream into XML object stream
+func JSONConverter(inp <-chan string, set, rec, nest string) <-chan string {
+
+	if inp == nil {
+		return nil
+	}
+
+	out := make(chan string, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create JSON converter channel\n")
+		os.Exit(1)
+	}
+
+	// opt is used for anonymous top-level objects, anon for anonymous top-level arrays
+	opt := "opt"
+	anon := "anon"
+	if rec != "" {
+		// override record delimiter
+		opt = rec
+		anon = rec
+	}
+
+	flat := false
+	plural := false
+	depth := false
+
+	switch nest {
+	case "flat":
+		flat = true
+	case "plural", "name":
+		plural = true
+	case "depth", "deep", "level":
+		depth = true
+	}
+
+	// convertJSON sends XML records down a channel
+	convertJSON := func(inp <-chan string, out chan<- string) {
+
+		// close channel when all tokens have been processed
+		defer close(out)
+
+		// ensure that XML tags are legal (initial digit allowed by xtract for biological data in JSON)
+		fixTag := func(tag string) string {
+
+			if tag == "" {
+				return tag
+			}
+
+			okay := true
+			for _, ch := range tag {
+				if !InElement[ch] {
+					okay = false
+				}
+			}
+			if okay {
+				return tag
+			}
+
+			var temp strings.Builder
+
+			// replace illegal characters with underscore
+			for _, ch := range tag {
+				if InElement[ch] {
+					temp.WriteRune(ch)
+				} else {
+					temp.WriteRune('_')
+				}
+			}
+
+			return temp.String()
+		}
+
+		// closure silently places local variable pointer onto inner function call stack
+		var buffer strings.Builder
+
+		// array to speed up indentation
+		indentSpaces := []string{
+			"",
+			"  ",
+			"    ",
+			"      ",
+			"        ",
+			"          ",
+			"            ",
+			"              ",
+			"                ",
+			"                  ",
+		}
+
+		indent := 0
+		if set != "" {
+			indent = 1
+		}
+
+		// indent a specified number of spaces
+		doIndent := func(indt int) {
+			i := indt
+			for i > 9 {
+				buffer.WriteString("                    ")
+				i -= 10
+			}
+			if i < 0 {
+				return
+			}
+			buffer.WriteString(indentSpaces[i])
+		}
+
+		// recursive function definitions
+		var parseObject func(tag string)
+		var parseArray func(tag, pfx string, lvl int)
+
+		// recursive descent parser uses mutual recursion
+		parseValue := func(tag, pfx, tkn string, lvl int) {
+
+			switch tkn {
+			case "{":
+				parseObject(tag)
+				// no break needed, would use fallthrough to explicitly cause program control to flow to the next case
+			case "[":
+				if flat {
+					parseArray(tag, pfx, lvl+1)
+				} else if lvl > 0 {
+					// nested JSON arrays create recursive XML objects
+					doIndent(indent)
+					indent++
+					tg := tag
+					if plural {
+						tg = inflector.Pluralize(tag)
+					}
+					buffer.WriteString("<")
+					buffer.WriteString(tg)
+					buffer.WriteString(">\n")
+					if depth {
+						parseArray(pfx+"_"+strconv.Itoa(lvl), tag, lvl+1)
+					} else {
+						parseArray(tag, pfx, lvl+1)
+					}
+					indent--
+					doIndent(indent)
+					buffer.WriteString("</")
+					buffer.WriteString(tg)
+					buffer.WriteString(">\n")
+				} else {
+					parseArray(tag, pfx, lvl+1)
+				}
+			case "}", "]":
+				// should not get here, decoder tracks nesting of braces and brackets
+			case "":
+				// empty value string generates self-closing object
+				doIndent(indent)
+				buffer.WriteString("<")
+				buffer.WriteString(tag)
+				buffer.WriteString("/>\n")
+			default:
+				// write object and contents to string builder
+				doIndent(indent)
+				tkn = strings.TrimSpace(tkn)
+				tkn = html.EscapeString(tkn)
+				buffer.WriteString("<")
+				buffer.WriteString(tag)
+				buffer.WriteString(">")
+				buffer.WriteString(tkn)
+				buffer.WriteString("</")
+				buffer.WriteString(tag)
+				buffer.WriteString(">\n")
+			}
+		}
+
+		parseObject = func(tag string) {
+
+			doIndent(indent)
+			indent++
+			buffer.WriteString("<")
+			buffer.WriteString(tag)
+			buffer.WriteString(">\n")
+
+			for {
+				// shadowing tag variable inside for loop does not step on value of tag argument in outer scope
+				tag, ok := <-inp
+				if !ok {
+					break
+				}
+
+				if tag == "}" || tag == "]" {
+					break
+				}
+
+				tag = fixTag(tag)
+
+				tkn, ok := <-inp
+				if !ok {
+					break
+				}
+
+				if tkn == "}" || tkn == "]" {
+					break
+				}
+
+				parseValue(tag, tag, tkn, 0)
+			}
+
+			indent--
+			doIndent(indent)
+			buffer.WriteString("</")
+			buffer.WriteString(tag)
+			buffer.WriteString(">\n")
+		}
+
+		parseArray = func(tag, pfx string, lvl int) {
+
+			for {
+				tkn, ok := <-inp
+				if !ok {
+					break
+				}
+
+				if tkn == "}" || tkn == "]" {
+					break
+				}
+
+				parseValue(tag, pfx, tkn, lvl)
+			}
+		}
+
+		// process stream of catenated top-level JSON objects or arrays
+		for {
+			tkn, ok := <-inp
+			if !ok {
+				break
+			}
+			if tkn == "{" {
+				parseObject(opt)
+			} else if tkn == "[" {
+				parseArray(anon, anon, 0)
+			} else {
+				break
+			}
+
+			txt := buffer.String()
+
+			// send result through output channel
+			out <- txt
+
+			buffer.Reset()
+
+			runtime.Gosched()
+		}
+	}
+
+	// launch single converter goroutine
+	go convertJSON(inp, out)
+
+	return out
+}
+
+// READ TAB-DELIMITED FILE AND WRAP IN XML FIELDS
+
+// TableConverter parses tab-delimited files into XML
+func TableConverter(inp io.Reader, args []string) int {
+
+	// e.g., xtract -t2x -set Set -rec Rec -skip 0 Uid Name
+
+	if inp == nil {
+		return 0
+	}
+
+	head := ""
+	tail := ""
+
+	hd := ""
+	tl := ""
+
+	skip := 0
+	lower := false
+	upper := false
+	indent := true
+
+	var fields []string
+	numFlds := 0
+
+	for len(args) > 0 {
+		str := args[0]
+		switch str {
+		case "-set":
+			args = args[1:]
+			if len(args) < 1 {
+				fmt.Fprintf(os.Stderr, "\nERROR: No argument after -set\n")
+				os.Exit(1)
+			}
+			set := args[0]
+			if set != "" && set != "-" {
+				head = "<" + set + ">"
+				tail = "</" + set + ">"
+			}
+			args = args[1:]
+		case "-rec":
+			args = args[1:]
+			if len(args) < 1 {
+				fmt.Fprintf(os.Stderr, "\nERROR: No argument after -rec\n")
+				os.Exit(1)
+			}
+			rec := args[0]
+			if rec != "" && rec != "-" {
+				hd = "<" + rec + ">"
+				tl = "</" + rec + ">"
+			}
+			args = args[1:]
+		case "-skip":
+			args = args[1:]
+			if len(args) < 1 {
+				fmt.Fprintf(os.Stderr, "\nERROR: No argument after -skip\n")
+				os.Exit(1)
+			}
+			tmp := args[0]
+			val, err := strconv.Atoi(tmp)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\nERROR: -skip argument (%s) is not an integer\n", tmp)
+				os.Exit(1)
+			}
+			skip = val
+			args = args[1:]
+		case "-lower":
+			lower = true
+			args = args[1:]
+		case "-upper":
+			upper = true
+			args = args[1:]
+		case "-indent":
+			indent = true
+			args = args[1:]
+		case "-flush":
+			indent = false
+			args = args[1:]
+		default:
+			// remaining arguments are names for columns
+			if str != "" && str != "*" {
+				fields = append(fields, str)
+				numFlds++
+			}
+			args = args[1:]
+		}
+	}
+
+	if numFlds < 1 {
+		fmt.Fprintf(os.Stderr, "\nERROR: Insufficient arguments for -t2x\n")
+		os.Exit(1)
+	}
+
+	var buffer strings.Builder
+	count := 0
+	okay := false
+	row := 0
+	recordCount := 0
+
+	wrtr := bufio.NewWriter(os.Stdout)
+
+	scanr := bufio.NewScanner(inp)
+
+	if head != "" {
+		buffer.WriteString(head)
+		buffer.WriteString("\n")
+	}
+
+	for scanr.Scan() {
+
+		line := scanr.Text()
+
+		row++
+
+		if skip > 0 {
+			skip--
+			continue
+		}
+
+		cols := strings.Split(line, "\t")
+
+		if len(cols) != numFlds {
+			fmt.Fprintf(os.Stderr, "Mismatched columns in row %d - '%s'\n", row, line)
+			continue
+		}
+
+		if hd != "" {
+			if indent {
+				buffer.WriteString("  ")
+			}
+			buffer.WriteString(hd)
+			buffer.WriteString("\n")
+		}
+
+		for i, fld := range fields {
+			val := cols[i]
+			if lower {
+				val = strings.ToLower(val)
+			}
+			if upper {
+				val = strings.ToUpper(val)
+			}
+			if fld[0] == '*' {
+				fld = fld[1:]
+			} else {
+				val = html.EscapeString(val)
+			}
+			val = strings.TrimSpace(val)
+			if indent {
+				buffer.WriteString("    ")
+			}
+			buffer.WriteString("<")
+			buffer.WriteString(fld)
+			buffer.WriteString(">")
+			buffer.WriteString(val)
+			buffer.WriteString("</")
+			buffer.WriteString(fld)
+			buffer.WriteString(">")
+			buffer.WriteString("\n")
+		}
+
+		if tl != "" {
+			if indent {
+				buffer.WriteString("  ")
+			}
+			buffer.WriteString(tl)
+			buffer.WriteString("\n")
+		}
+
+		recordCount++
+		count++
+
+		if count >= 1000 {
+			count = 0
+			txt := buffer.String()
+			if txt != "" {
+				// print current buffer
+				wrtr.WriteString(txt[:])
+			}
+			buffer.Reset()
+		}
+
+		okay = true
+	}
+
+	if tail != "" {
+		buffer.WriteString(tail)
+		buffer.WriteString("\n")
+	}
+
+	if okay {
+		txt := buffer.String()
+		if txt != "" {
+			// print current buffer
+			wrtr.WriteString(txt[:])
+		}
+	}
+	buffer.Reset()
+
+	wrtr.Flush()
+
+	return recordCount
+}
+
 // MAIN FUNCTION
 
 // e.g., xtract -pattern PubmedArticle -element MedlineCitation/PMID -block Author -sep " " -element Initials,LastName
@@ -7469,7 +8784,7 @@ func main() {
 		case "-cons":
 			serverRatio = getNumericArg("Parser to processor ratio", 4, 1, 32)
 		case "-serv":
-			NumServe = getNumericArg("Concurrent parser count", 0, ncpu, 128)
+			NumServe = getNumericArg("Concurrent parser count", 0, 1, 128)
 		case "-chan":
 			ChanDepth = getNumericArg("Communication channel depth", 0, ncpu, 128)
 		case "-heap":
@@ -7477,7 +8792,7 @@ func main() {
 		case "-farm":
 			FarmSize = getNumericArg("Node buffer length", 4, 4, 2048)
 		case "-gogc":
-			goGc = getNumericArg("Garbage collection percentage", 0, 100, 1000)
+			goGc = getNumericArg("Garbage collection percentage", 0, 50, 1000)
 
 		// read data from file
 		case "-input":
@@ -7496,9 +8811,13 @@ func main() {
 			DoCleanup = true
 		case "-strict":
 			DoStrict = true
-		case "-mixed", "-relaxed":
+			AllowEmbed = true
+			ContentMods = true
+		case "-mixed":
 			DoMixed = true
-		case "-accent", "-plain":
+			AllowEmbed = true
+			ContentMods = true
+		case "-accent":
 			DeAccent = true
 		case "-ascii":
 			DoASCII = true
@@ -7534,10 +8853,6 @@ func main() {
 			mathmlPolicy = args[1]
 			// skip past first of two arguments
 			args = args[1:]
-		case "-repair":
-			if unicodePolicy == "" {
-				unicodePolicy = "space"
-			}
 
 		case "-flag", "-flags":
 			if len(args) < 2 {
@@ -7615,6 +8930,8 @@ func main() {
 		DoMathML = true
 	}
 
+	// set dependent flags
+	CountLines = DoMixed
 	AllowEmbed = DoStrict || DoMixed
 	ContentMods = AllowEmbed || DoCompress || DoUnicode || DoScript || DoMathML || DeAccent || DoASCII
 
@@ -7624,9 +8941,15 @@ func main() {
 		if defProcs > 0 {
 			numProcs = defProcs
 		} else {
-			// best performance measurement with current code is obtained when 4 to 6 processors are assigned,
+			// best performance measurement with current code is obtained when 6 to 8 processors are assigned,
 			// varying slightly among queries on PubmedArticle, gene DocumentSummary, and INSDSeq sequence records
-			numProcs = 4
+			numProcs = 8
+			if cpuid.CPU.ThreadsPerCore > 1 {
+				cores := ncpu / cpuid.CPU.ThreadsPerCore
+				if cores > 4 && cores < 8 {
+					numProcs = cores
+				}
+			}
 		}
 	}
 	if numProcs > ncpu {
@@ -7640,7 +8963,7 @@ func main() {
 	runtime.GOMAXPROCS(numProcs)
 
 	// adjust garbage collection target percentage
-	if goGc >= 100 {
+	if goGc >= 50 && goGc <= 1000 {
 		debug.SetGCPercent(goGc)
 	}
 
@@ -7669,7 +8992,11 @@ func main() {
 	// -stats prints number of CPUs and performance tuning values if no other arguments (undocumented)
 	if stts && len(args) < 1 {
 
-		fmt.Fprintf(os.Stderr, "CPUs %d\n", ncpu)
+		fmt.Fprintf(os.Stderr, "Core %d\n", ncpu/cpuid.CPU.ThreadsPerCore)
+		fmt.Fprintf(os.Stderr, "Thrd %d\n", ncpu)
+		fmt.Fprintf(os.Stderr, "Sock %d\n", ncpu/cpuid.CPU.LogicalCores)
+		fmt.Fprintf(os.Stderr, "Mmry %d\n", memory.TotalMemory()/(1024*1024*1024))
+
 		fmt.Fprintf(os.Stderr, "Proc %d\n", numProcs)
 		if serverRatio > 0 {
 			fmt.Fprintf(os.Stderr, "Cons %d\n", serverRatio)
@@ -7678,14 +9005,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Chan %d\n", ChanDepth)
 		fmt.Fprintf(os.Stderr, "Heap %d\n", HeapSize)
 		fmt.Fprintf(os.Stderr, "Farm %d\n", FarmSize)
-		if goGc >= 100 {
-			fmt.Fprintf(os.Stderr, "Gogc %d\n", goGc)
-		}
+		fmt.Fprintf(os.Stderr, "Gogc %d\n", goGc)
+
 		fi, err := os.Stdin.Stat()
 		if err == nil {
 			mode := fi.Mode().String()
 			fmt.Fprintf(os.Stderr, "Mode %s\n", mode)
 		}
+
 		fmt.Fprintf(os.Stderr, "\n")
 
 		return
@@ -7706,27 +9033,25 @@ func main() {
 	case "-help":
 		fmt.Printf("xtract %s\n%s\n", xtractVersion, xtractHelp)
 	case "-examples", "-example":
-		fmt.Printf("xtract %s\n%s\n", xtractVersion, xtractExamples)
+		ex, eerr := os.Executable()
+		if eerr == nil {
+			fmt.Printf("xtract %s\n\n", xtractVersion)
+			exPath := filepath.Dir(ex)
+			fpath := path.Join(exPath, "hlp-xtract.txt")
+			file, ferr := os.Open(fpath)
+			if file != nil && ferr == nil {
+				scanner := bufio.NewScanner(file)
+				for scanner.Scan() {
+					fmt.Println(scanner.Text())
+				}
+			}
+			file.Close()
+			fmt.Printf("\n")
+		}
 	case "-extras", "-extra", "-advanced":
 		fmt.Printf("Please run rchive -help for local record indexing information\n")
 	case "-internal", "-internals":
 		fmt.Printf("xtract %s\n%s\n", xtractVersion, xtractInternal)
-	case "-sample", "-samples":
-		// -sample [pubmed|protein|gene] sends specified sample record to stdout (undocumented)
-		testType := ""
-		if len(args) > 1 {
-			testType = args[1]
-		}
-		switch testType {
-		case "pubmed":
-			fmt.Printf("%s\n", pubMedArtSample)
-		case "protein", "sequence", "insd":
-			fmt.Printf("%s\n", insdSeqSample)
-		case "gene", "docsum":
-			fmt.Printf("%s\n", geneDocSumSample)
-		default:
-			fmt.Printf("%s\n", pubMedArtSample)
-		}
 	case "-keys":
 		fmt.Printf("%s\n", keyboardShortcuts)
 	case "-unix":
@@ -7797,52 +9122,184 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	// INITIALIZE PROCESS TIMER AND RECORD COUNT
+	// INITIALIZE RECORD COUNT
 
-	startTime := time.Now()
 	recordCount := 0
 	byteCount := 0
 
 	// print processing rate and program duration
 	printDuration := func(name string) {
 
-		stopTime := time.Now()
-		duration := stopTime.Sub(startTime)
-		seconds := float64(duration.Nanoseconds()) / 1e9
+		PrintDuration(name, recordCount, byteCount)
+	}
 
-		if recordCount >= 1000000 {
-			throughput := float64(recordCount/100000) / 10.0
-			fmt.Fprintf(os.Stderr, "\nXtract processed %.1f million %s in %.3f seconds", throughput, name, seconds)
-		} else {
-			fmt.Fprintf(os.Stderr, "\nXtract processed %d %s in %.3f seconds", recordCount, name, seconds)
+	// JSON TO XML CONVERTER
+
+	if args[0] == "-j2x" || args[0] == "-json2xml" {
+
+		set := "root"
+		rec := ""
+		nest := ""
+
+		nextArg := func() (string, bool) {
+
+			if len(args) < 1 {
+				return "", false
+			}
+
+			// remove next token from slice
+			nxt := args[0]
+			args = args[1:]
+
+			return nxt, true
 		}
 
-		if seconds >= 0.001 && recordCount > 0 {
-			rate := int(float64(recordCount) / seconds)
-			if rate >= 1000000 {
-				fmt.Fprintf(os.Stderr, " (%d mega%s/second", rate/1000000, name)
-			} else {
-				fmt.Fprintf(os.Stderr, " (%d %s/second", rate, name)
+		// look for optional arguments
+		args = args[1:]
+		for {
+			arg, ok := nextArg()
+			if !ok {
+				break
 			}
-			if byteCount > 0 {
-				rate := int(float64(byteCount) / seconds)
-				if rate >= 1000000 {
-					fmt.Fprintf(os.Stderr, ", %d megabytes/second", rate/1000000)
-				} else if rate >= 1000 {
-					fmt.Fprintf(os.Stderr, ", %d kilobytes/second", rate/1000)
-				} else {
-					fmt.Fprintf(os.Stderr, ", %d bytes/second", rate)
+
+			switch arg {
+			case "-set":
+				// override set wrapper
+				set, ok = nextArg()
+				if ok && set == "-" {
+					set = ""
+				}
+			case "-rec":
+				// override record wrapper
+				rec, ok = nextArg()
+				if ok && rec == "-" {
+					rec = ""
+				}
+			case "-nest":
+				// specify nested array naming policy
+				nest, ok = nextArg()
+				if !ok {
+					fmt.Fprintf(os.Stderr, "Nested array naming policy is missing\n")
+					os.Exit(1)
+				}
+				if ok && nest == "-" {
+					nest = "flat"
+				}
+				switch nest {
+				case "flat", "plural", "name", "recurse", "recursive", "same", "depth", "deep", "level":
+				default:
+					fmt.Fprintf(os.Stderr, "Unrecognized nested array naming policy\n")
+					os.Exit(1)
+				}
+			default:
+				// alternative form uses positional arguments to override set and rec
+				set = arg
+				if set == "-" {
+					set = ""
+				}
+				rec, ok = nextArg()
+				if ok && rec == "-" {
+					rec = ""
 				}
 			}
-			fmt.Fprintf(os.Stderr, ")")
 		}
 
-		fmt.Fprintf(os.Stderr, "\n\n")
+		// use output channel of tokenizer as input channel of converter
+		jtkn := JSONTokenizer(in)
+		jcnv := JSONConverter(jtkn, set, rec, nest)
+
+		if jtkn == nil || jcnv == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create JSON to XML converter\n")
+			os.Exit(1)
+		}
+
+		if set != "" {
+			fmt.Fprintf(os.Stdout, "<%s>\n", set)
+		}
+
+		// drain output of last channel in service chain
+		for str := range jcnv {
+
+			if str == "" {
+				continue
+			}
+
+			// send result to output
+			os.Stdout.WriteString(str)
+			if !strings.HasSuffix(str, "\n") {
+				os.Stdout.WriteString("\n")
+			}
+
+			recordCount++
+			runtime.Gosched()
+		}
+
+		if set != "" {
+			fmt.Fprintf(os.Stdout, "</%s>\n", set)
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// NAME OF OUTPUT STRING TRANSFORMATION FILE
+
+	tform := ""
+	transform := make(map[string]string)
+
+	populateTx := func(tf string) {
+
+		inFile, err := os.Open(tf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Unable to open transformation file %s\n", err.Error())
+			os.Exit(1)
+		}
+		defer inFile.Close()
+
+		scanr := bufio.NewScanner(inFile)
+
+		// populate transformation map for -translate (and -matrix) output
+		for scanr.Scan() {
+
+			line := scanr.Text()
+			frst, scnd := SplitInTwoAt(line, "\t", LEFT)
+
+			transform[frst] = scnd
+		}
+	}
+
+	if len(args) > 2 && args[0] == "-transform" {
+		tform = args[1]
+		args = args[2:]
+		if tform != "" {
+			populateTx(tform)
+		}
+	}
+
+	// READ TAB-DELIMITED FILE AND WRAP IN XML FIELDS
+
+	// must be called before CreateReader starts draining stdin
+	if len(args) > 1 && args[0] == "-t2x" {
+
+		recordCount = TableConverter(in, args[1:])
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("lines")
+		}
+
+		return
 	}
 
 	// CREATE XML BLOCK READER FROM STDIN OR FILE
 
-	rdr := NewXMLReader(in)
+	rdr := CreateReader(in)
 	if rdr == nil {
 		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create XML Block Reader\n")
 		os.Exit(1)
@@ -7859,7 +9316,7 @@ func main() {
 		if args[0] == "-insd-" {
 			addDash = false
 		}
-		// -insd-idx variant creates word and word pair index using -indices command (undocumented)
+		// -insd-idx variant creates word index using -indices command (undocumented)
 		if args[0] == "-insd-idx" {
 			doIndex = true
 			addDash = false
@@ -7904,12 +9361,36 @@ func main() {
 		args = hydra
 	}
 
+	// BIOTHINGS EXTRACTION COMMAND GENERATOR
+
+	// -biopath takes a parent object and a dotted exploration path for BioThings resources (undocumented)
+	if args[0] == "-biopath" {
+
+		args = args[1:]
+
+		biopath := ProcessBiopath(args, isPipe || usingFile)
+
+		if !isPipe && !usingFile {
+			// no piped input, so write output instructions
+			fmt.Printf("xtract")
+			for _, str := range biopath {
+				fmt.Printf(" %s", str)
+			}
+			fmt.Printf("\n")
+			return
+		}
+
+		// data in pipe, so replace arguments, execute dynamically
+		args = biopath
+	}
+
 	// ENTREZ2INDEX COMMAND GENERATOR
 
 	// -e2index shortcut for experimental indexing code (documented in rchive.go)
 	if args[0] == "-e2index" {
 
-		// e.g., xtract -timer -strict -e2index PubmedArticle MedlineCitation/PMID ArticleTitle,Abstract/AbstractText
+		// e.g., xtract -transform "$EDIRECT_MESH_TREE" -e2index
+
 		args = args[1:]
 
 		if len(args) == 0 {
@@ -7917,11 +9398,40 @@ func main() {
 			args = []string{"PubmedArticle", "MedlineCitation/PMID", "ArticleTitle,Abstract/AbstractText"}
 		}
 
-		res := ProcessE2Index(args, isPipe || usingFile)
+		// environment variable can override garbage collector (undocumented)
+		gcEnv := os.Getenv("EDIRECT_INDEX_GOGC")
+		if gcEnv != "" {
+			val, err := strconv.Atoi(gcEnv)
+			if err == nil {
+				if val >= 50 && val <= 1000 {
+					debug.SetGCPercent(val)
+				} else {
+					debug.SetGCPercent(100)
+				}
+			}
+		}
+
+		// environment variable can override number of servers (undocumented)
+		svEnv := os.Getenv("EDIRECT_INDEX_SERV")
+		if svEnv != "" {
+			val, err := strconv.Atoi(svEnv)
+			if err == nil {
+				if val >= 1 && val <= 128 {
+					NumServe = val
+				} else {
+					NumServe = 1
+				}
+			}
+		}
+
+		res := ProcessE2Index(args, tform, isPipe || usingFile)
 
 		if !isPipe && !usingFile {
 			// no piped input, so write output instructions
 			fmt.Printf("xtract")
+			if tform != "" {
+				fmt.Printf(" -transform %s", tform)
+			}
 			for _, str := range res {
 				fmt.Printf(" %s", str)
 			}
@@ -7954,6 +9464,7 @@ func main() {
 	// SPECIAL FORMATTING COMMANDS
 
 	inSwitch = true
+	leaf := false
 
 	switch args[0] {
 	case "-format":
@@ -7963,11 +9474,24 @@ func main() {
 		ProcessVerify(rdr, args)
 	case "-filter":
 		ProcessFilter(rdr, args)
+	case "-normalize", "-normal":
+		ProcessNormalize(rdr, args)
 	case "-outline":
 		ProcessOutline(rdr)
+	case "-contour":
+		leaf = true
+		fallthrough
 	case "-synopsis":
-		ProcessSynopsis(rdr)
-	case "-tokens", "-token":
+		args = args[1:]
+		delim := "/"
+		if len(args) > 0 {
+			delim = args[0]
+			if len(delim) > 3 {
+				delim = "/"
+			}
+		}
+		ProcessSynopsis(rdr, leaf, delim)
+	case "-tokens":
 		ProcessTokens(rdr)
 	default:
 		// if not any of the formatting commands, keep going
@@ -7986,6 +9510,59 @@ func main() {
 		if timr {
 			printDuration("lines")
 		}
+
+		return
+	}
+
+	// MISCELLANEOUS TIMING COMMANDS
+
+	if args[0] == "-chunk" {
+
+		for str := range rdr {
+			recordCount++
+			byteCount += len(str)
+		}
+
+		printDuration("blocks")
+
+		return
+	}
+
+	if args[0] == "-split" {
+
+		if len(args) > 1 {
+			if args[1] == "-pattern" {
+				// skip past -split if followed by -pattern
+				args = args[1:]
+			}
+		}
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "\nERROR: Pattern missing after -split command\n")
+			os.Exit(1)
+		}
+		pat := args[1]
+
+		PartitionPattern(pat, "", rdr,
+			func(str string) {
+				recordCount++
+				byteCount += len(str)
+			})
+
+		printDuration("patterns")
+
+		return
+	}
+
+	if args[0] == "-token" {
+
+		ParseXML("", "", rdr,
+			func(tkn Token) {
+				recordCount++
+				byteCount += len(tkn.Name) + len(tkn.Attr)
+			},
+			nil, nil)
+
+		printDuration("tokens")
 
 		return
 	}
@@ -8107,45 +9684,424 @@ func main() {
 		os.Exit(1)
 	}
 
-	// FILTER XML RECORDS BY PRESENCE OF ONE OR MORE PHRASES
+	// READ FILE OF IDENTIFIERS AND CONCURRENTLY EXTRACT SELECTED RECORDS
 
-	// -pattern plus -phrase (-require, -exclude) filters by phrase in XML (undocumented)
-	if len(args) > 2 && (args[2] == "-phrase" || args[2] == "-require" || args[2] == "-exclude") {
+	// -pattern record_name -select parent/element@attribute^version -retaining file_of_identifiers
+	if len(args) == 6 && args[2] == "-select" && args[4] == "-retaining" {
 
-		exclude := false
-		if args[2] == "-exclude" {
-			exclude = true
-		}
+		indx := args[3]
+		unqe := args[5]
 
-		if len(args) < 4 {
-			fmt.Fprintf(os.Stderr, "\nERROR: Missing argument after %s\n", args[2])
-			os.Exit(1)
-		} else if len(args) > 4 {
-			fmt.Fprintf(os.Stderr, "\nERROR: No arguments allowed after %s value\n", args[2])
+		// read file of identifiers to use for filtering
+		fl, err := os.Open(unqe)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to open identifier file '%s'\n", unqe)
 			os.Exit(1)
 		}
 
-		// phrase to find anywhere in XML
-		phrs := args[3]
+		// create map that records each UID
+		order := make(map[string]bool)
 
-		// convert old "+" phrase separator to new "AND" convention for entrez-phrase-search backward compatibility
-		phrs = strings.Replace(phrs, " + ", " AND ", -1)
-		// remove wildcard asterisk characters
-		phrs = strings.Replace(phrs, "*", " ", -1)
-		phrs = CompressRunsOfSpaces(phrs)
-		phrs = strings.TrimSpace(phrs)
+		scanr := bufio.NewScanner(fl)
 
-		if phrs == "" {
-			fmt.Fprintf(os.Stderr, "\nERROR: Missing argument after %s\n", args[2])
-			os.Exit(1)
+		// read lines of identifiers
+		for scanr.Scan() {
+
+			line := scanr.Text()
+			id, _ := SplitInTwoAt(line, "\t", LEFT)
+
+			id = SortStringByWords(id)
+
+			// add identifier to map
+			order[id] = true
 		}
+
+		fl.Close()
 
 		xmlq := CreateProducer(topPattern, star, rdr)
-		mchq := CreateMatchers(phrs, exclude, xmlq)
-		unsq := CreateUnshuffler(mchq)
+		fchq := CreateSelectors(topPattern, indx, order, xmlq)
+		unsq := CreateUnshuffler(fchq)
 
-		if xmlq == nil || mchq == nil || unsq == nil {
-			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create phrase matcher\n")
+		if xmlq == nil || fchq == nil || unsq == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create selector\n")
+			os.Exit(1)
+		}
+
+		if head != "" {
+			os.Stdout.WriteString(head)
+			os.Stdout.WriteString("\n")
+		}
+
+		// drain output channel
+		for curr := range unsq {
+
+			str := curr.Text
+
+			if str == "" {
+				continue
+			}
+
+			if hd != "" {
+				os.Stdout.WriteString(hd)
+				os.Stdout.WriteString("\n")
+			}
+
+			// send result to output
+			os.Stdout.WriteString(str)
+			if !strings.HasSuffix(str, "\n") {
+				os.Stdout.WriteString("\n")
+			}
+
+			if tl != "" {
+				os.Stdout.WriteString(tl)
+				os.Stdout.WriteString("\n")
+			}
+
+			recordCount++
+			runtime.Gosched()
+		}
+
+		if tail != "" {
+			os.Stdout.WriteString(tail)
+			os.Stdout.WriteString("\n")
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// READ FILE OF IDENTIFIERS AND EXCLUDE SELECTED RECORDS
+
+	// -pattern record_name -exclude parent/element@attribute^version -excluding file_of_identifiers
+	if len(args) == 6 && args[2] == "-select" && args[4] == "-excluding" {
+
+		indx := args[3]
+		unqe := args[5]
+
+		// read file of identifiers to use for filtering
+		fl, err := os.Open(unqe)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to open identifier file '%s'\n", unqe)
+			os.Exit(1)
+		}
+
+		// create map that records each UID
+		order := make(map[string]bool)
+
+		scanr := bufio.NewScanner(fl)
+
+		// read lines of identifiers
+		for scanr.Scan() {
+
+			line := scanr.Text()
+			id, _ := SplitInTwoAt(line, "\t", LEFT)
+			id = strings.ToLower(id)
+
+			// add identifier to map
+			order[id] = true
+		}
+
+		fl.Close()
+
+		find := ParseIndex(indx)
+
+		if head != "" {
+			os.Stdout.WriteString(head)
+			os.Stdout.WriteString("\n")
+		}
+
+		PartitionPattern(topPattern, star, rdr,
+			func(str string) {
+				recordCount++
+
+				id := FindIdentifier(str[:], parent, find)
+				if id != "" {
+					id = strings.ToLower(id)
+					_, ok := order[id]
+					if ok {
+						// in exclusion list, skip
+						return
+					}
+				}
+
+				if hd != "" {
+					os.Stdout.WriteString(hd)
+					os.Stdout.WriteString("\n")
+				}
+
+				// write selected record
+				os.Stdout.WriteString(str[:])
+				os.Stdout.WriteString("\n")
+
+				if tl != "" {
+					os.Stdout.WriteString(tl)
+					os.Stdout.WriteString("\n")
+				}
+			})
+
+		if tail != "" {
+			os.Stdout.WriteString(tail)
+			os.Stdout.WriteString("\n")
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// READ ORDERED FILE OF IDENTIFIERS AND XML STRINGS, APPEND XML JUST INSIDE CLOSING TAG OF APPROPRIATE RECORD
+
+	// -pattern record_name -select parent/element@attribute^version -appending file_of_identifiers_and_metadata
+	if len(args) == 6 && args[2] == "-select" && args[4] == "-appending" {
+
+		indx := args[3]
+		apnd := args[5]
+
+		fl, err := os.Open(apnd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to open transformation file '%s'\n", apnd)
+			os.Exit(1)
+		}
+
+		scanr := bufio.NewScanner(fl)
+
+		find := ParseIndex(indx)
+
+		if head != "" {
+			os.Stdout.WriteString(head)
+			os.Stdout.WriteString("\n")
+		}
+
+		rgt := "</" + topPattern + ">"
+
+		PartitionPattern(topPattern, star, rdr,
+			func(str string) {
+				recordCount++
+
+				id := FindIdentifier(str[:], parent, find)
+				if id == "" {
+					return
+				}
+				id = strings.ToLower(id)
+
+				for scanr.Scan() {
+
+					line := scanr.Text()
+					frst, scnd := SplitInTwoAt(line, "\t", LEFT)
+					frst = strings.ToLower(frst)
+
+					if id != frst {
+						return
+					}
+					if !strings.HasSuffix(str, rgt) {
+						return
+					}
+
+					lft := strings.TrimSuffix(str, rgt)
+					str = lft + "  " + scnd + "\n" + rgt
+
+					if hd != "" {
+						os.Stdout.WriteString(hd)
+						os.Stdout.WriteString("\n")
+					}
+
+					os.Stdout.WriteString(str[:])
+					os.Stdout.WriteString("\n")
+
+					if tl != "" {
+						os.Stdout.WriteString(tl)
+						os.Stdout.WriteString("\n")
+					}
+
+					break
+				}
+			})
+
+		if tail != "" {
+			os.Stdout.WriteString(tail)
+			os.Stdout.WriteString("\n")
+		}
+
+		fl.Close()
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// SORT XML RECORDS BY IDENTIFIER
+
+	// -pattern record_name -sort parent/element@attribute^version
+	if len(args) == 4 && args[2] == "-sort" {
+
+		indx := args[3]
+
+		// create map that records each UID
+		order := make(map[string][]string)
+
+		find := ParseIndex(indx)
+
+		PartitionPattern(topPattern, star, rdr,
+			func(str string) {
+				recordCount++
+
+				id := FindIdentifier(str[:], parent, find)
+				if id == "" {
+					return
+				}
+
+				data, ok := order[id]
+				if !ok {
+					data = make([]string, 0, 1)
+				}
+				data = append(data, str)
+				// always need to update order, since data may be reallocated
+				order[id] = data
+			})
+
+		var keys []string
+		for ky := range order {
+			keys = append(keys, ky)
+		}
+		// sort fields in alphabetical or numeric order
+		sort.Slice(keys, func(i, j int) bool {
+			// numeric sort on strings checks lengths first
+			if IsAllDigits(keys[i]) && IsAllDigits(keys[j]) {
+				lni := len(keys[i])
+				lnj := len(keys[j])
+				// shorter string is numerically less, assuming no leading zeros
+				if lni < lnj {
+					return true
+				}
+				if lni > lnj {
+					return false
+				}
+			}
+			// same length or non-numeric, can now do string comparison on contents
+			return keys[i] < keys[j]
+		})
+
+		if head != "" {
+			os.Stdout.WriteString(head)
+			os.Stdout.WriteString("\n")
+		}
+
+		for _, id := range keys {
+
+			strs := order[id]
+			for _, str := range strs {
+				os.Stdout.WriteString(str)
+				os.Stdout.WriteString("\n")
+			}
+		}
+
+		if tail != "" {
+			os.Stdout.WriteString(tail)
+			os.Stdout.WriteString("\n")
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// SPLIT FILE BY BY RECORD COUNT
+
+	// split XML record into subfiles by count (undocumented)
+	if len(args) == 8 && args[2] == "-split" && args[4] == "-prefix" && args[6] == "-suffix" {
+
+		// e.g., -head "<IdxDocumentSet>" -tail "</IdxDocumentSet>" -pattern IdxDocument -split 250000 -prefix "biocon" -suffix "e2x"
+		count := 0
+		fnum := 0
+		var (
+			fl  *os.File
+			err error
+		)
+		chunk, err := strconv.Atoi(args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+			return
+		}
+		prefix := args[5]
+		suffix := args[7]
+
+		PartitionPattern(topPattern, star, rdr,
+			func(str string) {
+				recordCount++
+
+				if count >= chunk {
+					if tail != "" {
+						fl.WriteString(tail)
+						fl.WriteString("\n")
+					}
+					fl.Close()
+					count = 0
+				}
+				if count == 0 {
+					fpath := fmt.Sprintf("%s%03d.%s", prefix, fnum, suffix)
+					fl, err = os.Create(fpath)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+						return
+					}
+					os.Stderr.WriteString(fpath + "\n")
+					fnum++
+					if head != "" {
+						fl.WriteString(head)
+						fl.WriteString("\n")
+					}
+				}
+				count++
+
+				fl.WriteString(str[:])
+				fl.WriteString("\n")
+			})
+
+		if count >= chunk {
+			if tail != "" {
+				fl.WriteString(tail)
+				fl.WriteString("\n")
+			}
+			fl.Close()
+		}
+
+		debug.FreeOSMemory()
+
+		if timr {
+			printDuration("records")
+		}
+
+		return
+	}
+
+	// CONCURRENT REFORMATTING OF PARSED XML RECORDS
+
+	// -pattern plus -format does concurrent flush reformatting
+	if len(args) > 2 && args[2] == "-format" {
+
+		xmlq := CreateProducer(topPattern, star, rdr)
+		fchq := CreateFormatters(topPattern, xmlq)
+		unsq := CreateUnshuffler(fchq)
+
+		if xmlq == nil || fchq == nil || unsq == nil {
+			fmt.Fprintf(os.Stderr, "\nERROR: Unable to create formatter\n")
 			os.Exit(1)
 		}
 
@@ -8206,6 +10162,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// GLOBAL MAP FOR SORT-UNIQ-COUNT HISTOGRAM ARGUMENT
+
+	histogram := make(map[string]int)
+
 	// PERFORMANCE TIMING COMMAND
 
 	// -stats with an extraction command prints XML size and processing time for each record
@@ -8213,10 +10173,13 @@ func main() {
 
 		legend := "REC\tOFST\tSIZE\tTIME"
 
+		rec := 0
+
 		PartitionPattern(topPattern, star, rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
+				rec++
 				beginTime := time.Now()
-				ProcessQuery(str[:], parent, rec, hd, tl, cmds)
+				ProcessQuery(str[:], parent, rec, hd, tl, transform, histogram, cmds)
 				endTime := time.Now()
 				duration := endTime.Sub(beginTime)
 				micro := int(float64(duration.Nanoseconds()) / 1e3)
@@ -8224,7 +10187,7 @@ func main() {
 					fmt.Printf("%s\n", legend)
 					legend = ""
 				}
-				fmt.Printf("%d\t%d\t%d\t%d\n", rec, ofs, len(str), micro)
+				fmt.Printf("%d\t%d\t%d\n", rec, len(str), micro)
 			})
 
 		return
@@ -8257,14 +10220,14 @@ func main() {
 					os.Exit(1)
 				}
 
-				rdr := NewXMLReader(inFile)
-				if rdr == nil {
+				trdr := CreateReader(inFile)
+				if trdr == nil {
 					fmt.Fprintf(os.Stderr, "\nERROR: Unable to read input file\n")
 					os.Exit(1)
 				}
 
-				xmlq := CreateProducer(topPattern, star, rdr)
-				tblq := CreateConsumers(cmds, parent, hd, tl, xmlq)
+				xmlq := CreateProducer(topPattern, star, trdr)
+				tblq := CreateConsumers(cmds, parent, hd, tl, transform, histogram, xmlq)
 
 				if xmlq == nil || tblq == nil {
 					fmt.Fprintf(os.Stderr, "\nERROR: Unable to create servers\n")
@@ -8274,7 +10237,7 @@ func main() {
 				begTime := time.Now()
 				recordCount = 0
 
-				for _ = range tblq {
+				for range tblq {
 					recordCount++
 					runtime.Gosched()
 				}
@@ -8316,7 +10279,11 @@ func main() {
 
 	posn := ""
 	if cmds.Visit == topPat {
-		if cmds.Position == "outer" || cmds.Position == "inner" || cmds.Position == "all" {
+		if cmds.Position == "outer" ||
+			cmds.Position == "inner" ||
+			cmds.Position == "even" ||
+			cmds.Position == "odd" ||
+			cmds.Position == "all" {
 			// filter by record position when draining unshuffler channel
 			posn = cmds.Position
 			cmds.Position = ""
@@ -8327,11 +10294,13 @@ func main() {
 
 		qry := ""
 		idx := 0
+		rec := 0
 
 		if cmds.Position == "first" {
 
 			PartitionPattern(topPattern, star, rdr,
-				func(rec int, ofs int64, str string) {
+				func(str string) {
+					rec++
 					if rec == 1 {
 						qry = str
 						idx = rec
@@ -8341,7 +10310,7 @@ func main() {
 		} else if cmds.Position == "last" {
 
 			PartitionPattern(topPattern, star, rdr,
-				func(rec int, ofs int64, str string) {
+				func(str string) {
 					qry = str
 					idx = rec
 				})
@@ -8356,7 +10325,8 @@ func main() {
 			}
 
 			PartitionPattern(topPattern, star, rdr,
-				func(rec int, ofs int64, str string) {
+				func(str string) {
+					rec++
 					if rec == number {
 						qry = str
 						idx = rec
@@ -8372,10 +10342,10 @@ func main() {
 		cmds.Position = ""
 
 		// process single selected record
-		res := ProcessQuery(qry[:], parent, idx, hd, tl, cmds)
+		res := ProcessQuery(qry[:], parent, idx, hd, tl, transform, histogram, cmds)
 
 		if res != "" {
-			fmt.Printf("%s\n", res)
+			fmt.Printf("%s", res)
 		}
 
 		return
@@ -8387,7 +10357,7 @@ func main() {
 	xmlq := CreateProducer(topPattern, star, rdr)
 
 	// launch consumer goroutines to parse and explore partitioned XML objects
-	tblq := CreateConsumers(cmds, parent, hd, tl, xmlq)
+	tblq := CreateConsumers(cmds, parent, hd, tl, transform, histogram, xmlq)
 
 	// launch unshuffler goroutine to restore order of results
 	unsq := CreateUnshuffler(tblq)
@@ -8413,7 +10383,7 @@ func main() {
 
 		// print processing parameters as XML object
 		stopTime := time.Now()
-		duration := stopTime.Sub(startTime)
+		duration := stopTime.Sub(StartTime)
 		seconds := float64(duration.Nanoseconds()) / 1e9
 
 		// Threads is a more easily explained concept than GOMAXPROCS
@@ -8479,7 +10449,6 @@ func main() {
 			txt := buffer.String()
 			if txt != "" {
 				// print current buffer
-				// os.Stdout.WriteString(txt[:])
 				wrtr.WriteString(txt[:])
 			}
 			buffer.Reset()
@@ -8540,6 +10509,34 @@ func main() {
 			recordCount++
 		}
 
+	} else if posn == "even" {
+
+		even := false
+
+		for curr := range unsq {
+
+			if even {
+				printResult(curr)
+			}
+			even = !even
+
+			recordCount++
+		}
+
+	} else if posn == "odd" {
+
+		odd := true
+
+		for curr := range unsq {
+
+			if odd {
+				printResult(curr)
+			}
+			odd = !odd
+
+			recordCount++
+		}
+
 	} else {
 
 		// default or -position all
@@ -8563,13 +10560,47 @@ func main() {
 		txt := buffer.String()
 		if txt != "" {
 			// print final buffer
-			// os.Stdout.WriteString(txt[:])
 			wrtr.WriteString(txt[:])
 		}
 	}
 	buffer.Reset()
 
 	wrtr.Flush()
+
+	// print -histogram results, if populated
+	var keys []string
+	for ky := range histogram {
+		keys = append(keys, ky)
+	}
+	if len(keys) > 0 {
+		// sort fields in alphabetical or numeric order
+		sort.Slice(keys, func(i, j int) bool {
+			// numeric sort on strings checks lengths first
+			if IsAllDigits(keys[i]) && IsAllDigits(keys[j]) {
+				lni := len(keys[i])
+				lnj := len(keys[j])
+				// shorter string is numerically less, assuming no leading zeros
+				if lni < lnj {
+					return true
+				}
+				if lni > lnj {
+					return false
+				}
+			}
+			// same length or non-numeric, can now do string comparison on contents
+			return keys[i] < keys[j]
+		})
+
+		for _, str := range keys {
+
+			count := histogram[str]
+			val := strconv.Itoa(count)
+			os.Stdout.WriteString(val)
+			os.Stdout.WriteString("\t")
+			os.Stdout.WriteString(str)
+			os.Stdout.WriteString("\n")
+		}
+	}
 
 	// force garbage collection and return memory before calculating processing rate
 	debug.FreeOSMemory()

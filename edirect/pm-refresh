@@ -45,7 +45,7 @@ then
   echo "$missing" |
   epost -db pubmed -format uid |
   efetch -format xml |
-  xtract -flag "$flag"  -compress -format flush |
+  xtract -flag "$flag" -compress -format flush |
   rchive -gzip -flag "$flag" -archive "$target" \
     -index MedlineCitation/PMID^Version -pattern PubmedArticle
 fi

@@ -1,5 +1,12 @@
 #!/bin/bash -norc
 
+PERL=perl
+case "`uname -s`" in
+Darwin )
+  PERL=/usr/bin/perl
+  ;;
+esac
+
 DIR="$( cd "$( dirname "$0" )" && pwd )"
 
 cat <<EOF
@@ -11,9 +18,14 @@ EOF
 
 cd "$DIR"
 
+if ! "${PERL}" -Iaux/lib/perl5 -MMozilla::CA -e '1;' 2>/dev/null
+then
+  gzip -cd Mozilla-CA.tar.gz | tar xvf -
+fi
+
 mkdir -p _cpan/CPAN
 echo '1;' >> _cpan/CPAN/MyConfig.pm
-if ! perl -I_cpan -Iaux/lib/perl5 setup-deps.pl </dev/null >setup-deps.log 2>&1
+if ! "${PERL}" -I_cpan -Iaux/lib/perl5 setup-deps.pl </dev/null >setup-deps.log 2>&1
 then
   if grep '^read timeout.*HTTP' setup-deps.log >/dev/null
   then
@@ -31,11 +43,6 @@ EOF
   fi
 fi
 rm -rf _cpan
-
-if ! perl -Iaux/lib/perl5 -MMozilla::CA -e '1;' 2>/dev/null
-then
-  gzip -cd Mozilla-CA.tar.gz | tar xvf -
-fi
 
 osname=`uname -s`
 cputype=`uname -m`
@@ -78,6 +85,7 @@ echo "Entrez Direct has been successfully downloaded and installed."
 echo ""
 
 prfx="In order to complete the configuration process, please execute the following:\n"
+advice=`mktemp`
 
 target=bash_profile
 if ! grep "$target" "$HOME/.bashrc" >/dev/null 2>&1
@@ -91,7 +99,7 @@ then
       echo -e "$prfx"
       prfx=""
     fi
-    echo "  echo \"source ~/.bash_profile\" >>" "\$HOME/.bashrc"
+    echo "  echo \"source ~/.bash_profile\" >>" "\$HOME/.bashrc" | tee $advice
   fi
 fi
 if ! grep "PATH.*edirect" "$HOME/.$target" >/dev/null 2>&1
@@ -101,7 +109,8 @@ then
     echo -e "$prfx"
     prfx=""
   fi
-  echo "  echo \"export PATH=\\\${PATH}:$DIR\" >>" "\$HOME/.$target"
+  echo "  echo \"export PATH=\\\${PATH}:$DIR\" >>" "\$HOME/.$target" \
+    | tee $advice
 fi
 
 if [ -z "$prfx" ]
@@ -109,4 +118,12 @@ then
 echo ""
 echo "or manually edit the PATH variable assignment in your .bash_profile file."
 echo ""
+echo "Would you like to do that automatically now? [y/N]"
+read response
+case "$response" in
+  [Yy]*      ) . $advice; echo "OK, done." ;;
+  [Nn]* | '' ) echo "Holding off, then." ;;
+  *          ) echo "Conservatively taking that as a no." ;;
+esac
 fi
+rm $advice

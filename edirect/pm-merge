@@ -10,6 +10,7 @@ target="$1"
 
 target=${target%/}
 
+find "$target" -name "*.mrg" -delete
 find "$target" -name "*.mrg.gz" -delete
 
 osname=`uname -s | sed -e 's/_NT-.*$/_NT/; s/^MINGW[0-9]*/CYGWIN/'`
@@ -20,4 +21,4 @@ fi
 
 target=${target%/}
 
-rchive -gzip -merge "$target" NORM *.inv.gz
+rchive -timer -gzip -merge "$target" *.inv.gz

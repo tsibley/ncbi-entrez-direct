@@ -18,10 +18,18 @@ fi
 
 target=${target%/}
 
-find "." -name "*.mrg.gz" |
-sort |
-xargs -n 100 echo |
-while read files
+for fld in NORM STEM YEAR CODE TREE
 do
-  rchive -promote "$target" NORM $files
+  seconds_start=$(date "+%s")
+  echo "$fld"
+  find "." -name "*.mrg.gz" |
+  sort |
+  xargs -n 100 echo |
+  while read files
+  do
+    rchive -promote "$target" "$fld" $files
+  done
+  seconds_end=$(date "+%s")
+  seconds=$((seconds_end - seconds_start))
+  echo "($fld $seconds seconds)"
 done

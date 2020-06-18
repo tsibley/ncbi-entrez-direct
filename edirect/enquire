@@ -1,0 +1,442 @@
+#!/bin/sh
+
+# ===========================================================================
+#
+#                            PUBLIC DOMAIN NOTICE
+#            National Center for Biotechnology Information (NCBI)
+#
+#  This software/database is a "United States Government Work" under the
+#  terms of the United States Copyright Act.  It was written as part of
+#  the author's official duties as a United States Government employee and
+#  thus cannot be copyrighted.  This software/database is freely available
+#  to the public for use. The National Library of Medicine and the U.S.
+#  Government do not place any restriction on its use or reproduction.
+#  We would, however, appreciate having the NCBI and the author cited in
+#  any work or product based on this material.
+#
+#  Although all reasonable efforts have been taken to ensure the accuracy
+#  and reliability of the software and data, the NLM and the U.S.
+#  Government do not and cannot warrant the performance or results that
+#  may be obtained by using this software or data. The NLM and the U.S.
+#  Government disclaim all warranties, express or implied, including
+#  warranties of performance, merchantability or fitness for any particular
+#  purpose.
+#
+# ===========================================================================
+#
+# File Name:  enquire
+#
+# Author:  Jonathan Kans
+#
+# Version Creation Date:   03/28/20
+#
+# ==========================================================================
+
+version="13.7"
+
+binary=$(command -v curl)
+if [ ! -x "$binary" ]
+then
+  binary=$(command -v wget)
+fi
+if [ ! -x "$binary" ]
+then
+  echo "ERROR: enquire requires either curl or wget" >&2
+  exit 1
+fi
+
+# pth must contain aux/lib/perl5/Mozilla/CA/cacert.pem certificate
+
+pth=`dirname "$0"`
+
+# help and example texts
+
+PrintHelp() {
+  echo "enquire $version"
+  cat << "EOF"
+
+Query Commands
+
+  -url    Sends query with HTTP POST
+  -get    Uses HTTP GET instead of POST
+  -lst    Lists contents of FTP site
+  -ftp    Retrieves data from FTP site
+
+Examples
+
+  enquire -url https://eutils.ncbi.nlm.nih.gov entrez/eutils einfo.fcgi |
+  xtract -pattern DbList -sep "\n" -element DbName | sort -f
+
+  enquire -url https://eutils.ncbi.nlm.nih.gov entrez/eutils elink.fcgi \
+    -dbfrom pubmed -db pubmed -cmd neighbor -linkname pubmed_pubmed -id 2539356
+
+  enquire -get https://icite.od.nih.gov/api/pubs -pmids 1937004 10838572 |
+  xtract -j2x |
+  xtract -pattern opt -element cited_by references |
+  word-at-a-time
+
+  enquire -get "http://collections.mnh.si.edu/services/resolver/resolver.php" \
+    -voucher "Birds:625456" |
+  xtract -pattern Result -element ScientificName Country
+
+  enquire -get http://w1.weather.gov/xml/current_obs/KSFO.xml |
+  xtract -pattern current_observation -tab "\n" \
+    -element weather temp_f wind_dir wind_mph
+
+  enquire -get https://api.bigdatacloud.net/data/reverse-geocode-client \
+    -latitude 41.7909 -longitude "\-87.5994" |
+  xtract -j2x |
+  xtract -pattern opt -element countryCode \
+    -block administrative -if description -starts-with "state " -element name \
+    -block administrative -if description -starts-with "city " -element name |
+  tr '\t' '\n'
+
+  enquire -lst ftp.ncbi.nlm.nih.gov/pubmed/baseline |
+  grep -v ".md5" | grep "xml.gz"
+
+  enquire -ftp ftp.ncbi.nlm.nih.gov pub/gdp ideogram_9606_GCF_000001305.14_850_V1 |
+  grep acen | cut -f 1,2,6,7 | awk '/^X\t/'
+
+EOF
+}
+
+PrintExamples() {
+  echo "enquire $version"
+  cat << "EOF"
+
+Medical Subject Headings
+
+  enquire -get "http://id.nlm.nih.gov/mesh/sparql" \
+    -query "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+      SELECT DISTINCT ?class FROM <http://id.nlm.nih.gov/mesh> \
+      WHERE { ?s rdf:type ?class } ORDER BY ?class" |
+  xtract -pattern result -pfx "meshv:" -first "uri[http://id.nlm.nih.gov/mesh/vocab#|]"
+
+MeSH Predicates
+
+  enquire -get "http://id.nlm.nih.gov/mesh/sparql" \
+    -query "SELECT DISTINCT ?p FROM <http://id.nlm.nih.gov/mesh> \
+      WHERE { ?s ?p ?o } ORDER BY ?p" |
+  xtract -pattern result -pfx "meshv:" -first "uri[http://id.nlm.nih.gov/mesh/vocab#|]"
+
+WikiData Predicate List
+
+  enquire -url "https://query.wikidata.org/sparql" \
+    -query "SELECT ?property ?propertyType ?propertyLabel \
+      ?propertyDescription ?propertyAltLabel WHERE { \
+      ?property wikibase:propertyType ?propertyType . SERVICE wikibase:label \
+      { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } } \
+      ORDER BY ASC(xsd:integer(STRAFTER(STR(?property), 'P')))" |
+  xtract -pattern result -first "uri[http://www.wikidata.org/entity/|]" -first literal
+
+Vitamin Binding Site
+
+  enquire -get "http://www.wikidata.org/entity/Q22679758" |
+  xtract -j2x |
+  xtract -pattern entities -group claims -block P527 -element "value/id"
+
+Children of JS Bach
+
+  enquire -url "https://query.wikidata.org/sparql" \
+    -query "SELECT ?child ?childLabel WHERE \
+      { ?child wdt:P22 wd:Q1339. SERVICE wikibase:label \
+        { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } }" |
+  xtract -pattern result -block binding -if "@name" -equals childLabel -element literal
+
+Eye Color Frequency
+
+  enquire -url "https://query.wikidata.org/sparql" \
+    -query "SELECT ?eyeColorLabel WHERE \
+      { ?human wdt:P31 wd:Q5. ?human wdt:P1340 ?eyeColor. SERVICE wikibase:label \
+        { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } }" |
+  xtract -pattern result -element literal |
+  sort-uniq-count-rank
+
+Federated Query
+
+  enquire -url "https://query.wikidata.org/sparql" \
+    -query " \
+      PREFIX wp:      <http://vocabularies.wikipathways.org/wp#> \
+      PREFIX dcterms:  <http://purl.org/dc/terms/> \
+      PREFIX dc:      <http://purl.org/dc/elements/1.1/> \
+      SELECT DISTINCT ?metabolite1Label ?metabolite2Label ?mass1 ?mass2 WITH { \
+        SELECT ?metabolite1 ?metabolite2 WHERE { \
+          ?pathwayItem wdt:P2410 'WP706'; \
+                       wdt:P2888 ?pwIri. \
+          SERVICE <http://sparql.wikipathways.org/> { \
+            ?pathway dc:identifier ?pwIri. \
+            ?interaction rdf:type wp:Interaction; \
+                         wp:participants ?wpmb1, ?wpmb2; \
+                         dcterms:isPartOf ?pathway. \
+            FILTER (?wpmb1 != ?wpmb2) \
+            ?wpmb1 wp:bdbWikidata ?metabolite1. \
+            ?wpmb2 wp:bdbWikidata ?metabolite2. \
+          } \
+        } \
+      } AS %metabolites WHERE { \
+        INCLUDE %metabolites. \
+        ?metabolite1 wdt:P2067 ?mass1. \
+        ?metabolite2 wdt:P2067 ?mass2. \
+        SERVICE wikibase:label { bd:serviceParam wikibase:language '[AUTO_LANGUAGE],en'. } \
+      }" |
+  xtract -pattern result -block binding -element "binding@name" literal
+
+EOF
+}
+
+# check for help commands
+
+if [ $# -gt 0 ]
+then
+  case "$1" in
+    -version )
+      echo "$version"
+      exit 0
+      ;;
+    -h | -help | --help )
+      PrintHelp
+      exit 0
+      ;;
+    -examples )
+      PrintExamples
+      exit 0
+      ;;
+  esac
+fi
+
+# check for leading flags
+
+debug=false
+
+while [ $# -gt 0 ]
+do
+  case "$1" in
+    -debug )
+      debug=true
+      shift
+      ;;
+    * )
+      # allows while loop to check for multiple flags
+      break
+      ;;
+  esac
+done
+
+# get extraction method
+
+mode=""
+
+if [ $# -gt 0 ]
+then
+  case "$1" in
+    -url | -get | -lst | -ftp )
+      mode="$1"
+      shift
+      ;;
+    -* )
+      exec >&2
+      echo "$0: Unrecognized option $1" >&2
+      exit 1
+      ;;
+    * )
+      echo "$0: Missing command $1" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# collect URL directory components
+
+url=""
+sls=""
+
+while [ $# -gt 0 ]
+do
+  case "$1" in
+    -* )
+      # leading dash indicates end of path, switch to arguments
+      break
+      ;;
+    * )
+      dir="$1"
+      # remove trailing slash directory delimiter
+      dir=${dir%/}
+      shift
+      url="$url$sls$dir"
+      sls="/"
+      ;;
+  esac
+done
+
+# subset of perl -MURI::Escape -ne 'chomp;print uri_escape($_),"\n"'
+
+Escape() {
+  echo "$1" |
+  sed -e "s/%/%25/g" \
+      -e "s/!/%21/g" \
+      -e "s/#/%23/g" \
+      -e "s/&/%26/g" \
+      -e "s/'/%27/g" \
+      -e "s/*/%2A/g" \
+      -e "s/+/%2B/g" \
+      -e "s/,/%2C/g" \
+      -e "s|/|%2F|g" \
+      -e "s/:/%3A/g" \
+      -e "s/;/%3B/g" \
+      -e "s/=/%3D/g" \
+      -e "s/?/%3F/g" \
+      -e "s/@/%40/g" \
+      -e "s/|/%7C/g" \
+      -e "s/ /%20/g" |
+  sed -e 's/\$/%24/g' \
+      -e 's/(/%28/g' \
+      -e 's/)/%29/g' \
+      -e 's/</%3C/g' \
+      -e 's/>/%3E/g' \
+      -e 's/\[/%5B/g' \
+      -e 's/\]/%5D/g' \
+      -e 's/\^/%5E/g' \
+      -e 's/{/%7B/g' \
+      -e 's/}/%7D/g'
+}
+
+# collect argument tags paired with (escaped) values
+
+arg=""
+amp=""
+cmd=""
+pfx=""
+
+while [ $# -gt 0 ]
+do
+  case "$1" in
+    -* )
+      cmd="$1"
+      # remove leading dash from argument
+      cmd=${cmd#-}
+      # add argument and command
+      arg="$arg$amp$cmd"
+      # subsequent commands preceded by ampersand
+      amp="&"
+      # precede first value (if any) with equal sign
+      pfx="="
+      shift
+      ;;
+    * )
+      val="$1"
+      # remove initial backslash used to protect leading minus sign
+      val=${val#\\}
+      # URL encoding
+      val=$( Escape "$val" )
+      arg="$arg$pfx$val"
+      # concatenate run of values with commas
+      pfx=","
+      shift
+      ;;
+  esac
+done
+
+# debugging output to stderr
+
+if [ "$debug" = true ]
+then
+  echo "PTH $pth" >&2
+  echo "URL $url" >&2
+  echo "ARG $arg" >&2
+  exit 0
+fi
+
+# pause if Entrez Utilities server to avoid exceeding request frequency limit
+
+hasperl=$(command -v perl)
+
+case $url in
+  *"dev.ncbi.nlm.nih.gov/entrez/eutils/"* | *"internal.ncbi.nlm.nih.gov/entrez/eutils/"* )
+    if [ -x "$hasperl" ]
+    then
+      perl -MTime::HiRes -e 'Time::HiRes::usleep(1000)'
+    fi
+    ;;
+  *"/entrez/eutils/"* )
+    if [ -x "$hasperl" ]
+    then
+      case $arg in
+        *"api_key="* )
+          perl -MTime::HiRes -e 'Time::HiRes::usleep(110000)'
+          ;;
+        * )
+          perl -MTime::HiRes -e 'Time::HiRes::usleep(350000)'
+          ;;
+      esac
+    else
+      sleep 1
+    fi
+    ;;
+esac
+
+# common function to execute curl or wget command
+
+SendRequest() {
+
+  case "$binary" in
+    */curl )
+      curl -fsSL --capath "$pth"/aux/lib/perl5/Mozilla/CA/cacert.pem "$@"
+      ;;
+    */wget )
+      # wget -q -O - --no-check-certificate "$@"
+      wget -q -O - --ca-certificate="$pth"/aux/lib/perl5/Mozilla/CA/cacert.pem "$@"
+      ;;
+  esac
+}
+
+# send request with method-specific arguments
+
+case "$mode" in
+  -url )
+    case "$binary" in
+      */curl )
+        if [ -n "$arg" ]
+        then
+          SendRequest "$url" -d "$arg"
+        else
+          SendRequest "$url"
+        fi
+        ;;
+      */wget )
+        if [ -n "$arg" ]
+        then
+          SendRequest --post-data="$arg" "$url"
+        else
+          SendRequest --post-data="" "$url"
+        fi
+        ;;
+    esac
+    ;;
+  -get )
+    if [ -n "$arg" ]
+    then
+      SendRequest "$url?$arg"
+    else
+      SendRequest "$url"
+    fi
+    ;;
+  -lst )
+    case "$binary" in
+      */curl )
+        SendRequest "$url/" |
+        tr -s ' ' | tr ' ' '\t' | cut -f 9 | grep '.'
+        ;;
+      */wget )
+        SendRequest "$url" |
+        sed -e 's/<[^>]*>//g' | tr ' ' '\t' | cut -f 1 | grep '.'
+        ;;
+    esac
+    ;;
+  -ftp )
+    SendRequest "$url"
+    ;;
+  * )
+    echo "$0: Unrecognized option $1" >&2
+    exit 1
+    ;;
+esac

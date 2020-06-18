@@ -45,9 +45,15 @@ use warnings;
 #  Keywords and References are currently not supported.
 
 
+# definitions
+
+use constant false => 0;
+use constant true  => 1;
+
 # state variables for tracking current position in flatfile
 
 my $in_seq;
+my $in_con;
 my $in_feat;
 my $in_key;
 my $in_qual;
@@ -55,6 +61,8 @@ my $in_def;
 my $in_tax;
 my $any_feat;
 my $any_qual;
+my $no_space;
+my $is_comp;
 my $current_key;
 my $current_loc;
 my $current_qual;
@@ -68,27 +76,28 @@ my $taxonomy;
 my $topology;
 my $sequence;
 my $length;
-my $is_translation;
 my $curr_seq;
 my $locus;
 my $defline;
 my $accn;
 my $accndv;
 my $location_operator;
-my $is_comp;
 
 # subroutine to clear state variables for each flatfile
 # start in in_feat state to gracefully handle missing FEATURES/FH line
 
 sub clearflags {
-  $in_seq = 0;
-  $in_feat = 0;
-  $in_key = 0;
-  $in_qual = 0;
-  $in_def = 0;
-  $in_tax = 0;
-  $any_feat = 0;
-  $any_qual = 0;
+  $in_seq = false;
+  $in_con = false;
+  $in_feat = false;
+  $in_key = false;
+  $in_qual = false;
+  $in_def = false;
+  $in_tax = false;
+  $any_feat = false;
+  $any_qual = false;
+  $no_space = false;
+  $is_comp = false;
   $current_key = "";
   $current_loc = "";
   $current_qual = "";
@@ -102,14 +111,12 @@ sub clearflags {
   $topology = "";
   $sequence = "";
   $length = 0;
-  $is_translation = 0;
   $curr_seq = "";
   $locus = "";
   $defline = "";
   $accn = "";
   $accndv = "";
   $location_operator = "";
-  $is_comp = 0;
 }
 
 # recursive subroutine for parsing flatfile representation of feature location
@@ -129,7 +136,7 @@ sub parseloc {
     }
 
   } elsif ( $subloc =~ /^complement\((.+)\)$/ ) {
-    $is_comp = 1;
+    $is_comp = true;
     my $comploc = $1;
     my @items = parseloc ($comploc);
     my @rev = reverse (@items);
@@ -160,17 +167,17 @@ sub parseloc {
 #subroutine to print next feature key / location / qualifier line
 
 sub flushline {
-  if ( $in_key == 1 ) {
+  if ( $in_key ) {
 
-    if ( $any_qual == 1 ) {
+    if ( $any_qual ) {
       print  "        </INSDFeature_quals>\n";
-      $any_qual = 0;
+      $any_qual = false;
     }
 
-    if ( $any_feat == 1 ) {
+    if ( $any_feat ) {
       print  "      </INSDFeature>\n";
     }
-    $any_feat = 1;
+    $any_feat = true;
 
     print  "      <INSDFeature>\n";
 
@@ -186,13 +193,13 @@ sub flushline {
 
     # parse join() order() complement() ###..### location
     $location_operator = 0;
-    $is_comp = 0;
+    $is_comp = false;
     my @theloc = parseloc ($current_loc);
 
     # convert number (dot) (dot) number to number (tab) number
     my $numivals = 0;
-    my $prime5 = 0;
-    my $prime3 = 0;
+    my $prime5 = false;
+    my $prime3 = false;
     foreach my $thisloc (@theloc ) {
       $numivals++;
       print  "          <INSDInterval>\n";
@@ -200,10 +207,10 @@ sub flushline {
         my $fr = $1;
         my $to = $2;
         if ( $thisloc =~ /^</ ) {
-          $prime5 = 1;
+          $prime5 = true;
         }
         if ( $thisloc =~ /\.\.>/ ) {
-          $prime3 = 1;
+          $prime3 = true;
         }
         $fr =~ s/[<>]//;
         $to =~ s/[<>]//;
@@ -246,12 +253,12 @@ sub flushline {
       print  "        <INSDFeature_partial3 value=\"true\"/>\n";
     }
 
-  } elsif ( $in_qual == 1 ) {
+  } elsif ( $in_qual ) {
 
-    if ( $any_qual == 0 ) {
+    if ( ! $any_qual ) {
       print  "        <INSDFeature_quals>\n";
     }
-    $any_qual = 1;
+    $any_qual = true;
 
     if ( $current_val eq "" ) {
       print  "          <INSDQualifier>\n";
@@ -288,7 +295,7 @@ while (<> ) {
     if ( /^ {12}(.*)$/ ) {
       $defline = $defline . " " . $1;
     } else {
-      $in_def = 0;
+      $in_def = false;
     }
   } elsif ( $in_tax ) {
     if ( /^ {12}(.*)$/ ) {
@@ -298,11 +305,11 @@ while (<> ) {
         $taxonomy = $taxonomy . " " . $1;
       }
     } else {
-      $in_tax = 0;
+      $in_tax = false;
     }
   }
 
-  if ( $in_def == 1 || $in_tax == 1 ) {
+  if ( $in_def || $in_tax ) {
 
     # continuation lines taken care of above
 
@@ -348,7 +355,7 @@ while (<> ) {
     # record first line of definition line
     $defline = $1;
     # next line with leading spaces will be continuation of definition line
-    $in_def = 1;
+    $in_def = true;
 
   } elsif ( /^ACCESSION\s*(\S*).*$/ ) {
 
@@ -375,7 +382,7 @@ while (<> ) {
       }
     }
     # next line with leading spaces will be start of taxonomy
-    $in_tax = 1;
+    $in_tax = true;
 
   } elsif ( /^FEATURES\s+.*$/ ) {
 
@@ -395,7 +402,7 @@ while (<> ) {
       print  "    <INSDSeq_accession-version>$accndv</INSDSeq_accession-version>\n";
     }
 
-    $in_feat = 1;
+    $in_feat = true;
 
     if ( $source ne "" ) {
       print  "    <INSDSeq_source>$source</INSDSeq_source>\n";
@@ -415,30 +422,58 @@ while (<> ) {
     # end of feature table, print final newline
     flushline ();
 
-    if ( $any_qual == 1 ) {
-      print  "        </INSDFeature_quals>\n";
-      $any_qual = 0;
+    if ( $in_feat ) {
+      if ( $any_qual ) {
+        print  "        </INSDFeature_quals>\n";
+        $any_qual = false;
+      }
+
+      print  "      </INSDFeature>\n";
+
+      print  "    </INSDSeq_feature-table>\n";
     }
 
-    print  "      </INSDFeature>\n";
+    $in_feat = false;
+    $in_key = false;
+    $in_qual = false;
+    $no_space = false;
+    $in_seq = true;
+    $in_con = false;
 
-    print  "    </INSDSeq_feature-table>\n";
+  } elsif ( /^CONTIG\s*.*$/ ) {
 
-    $in_feat = 0;
-    $in_key = 0;
-    $in_qual = 0;
-    $is_translation = 0;
-    $in_seq = 1;
+    # end of feature table, print final newline
+    flushline ();
+
+    if ( $in_feat ) {
+      if ( $any_qual ) {
+        print  "        </INSDFeature_quals>\n";
+        $any_qual = false;
+      }
+
+      print  "      </INSDFeature>\n";
+
+      print  "    </INSDSeq_feature-table>\n";
+    }
+
+    $in_feat = false;
+    $in_key = false;
+    $in_qual = false;
+    $no_space = false;
+    $in_seq = false;
+    $in_con = true;
 
   } elsif ( /^\/\/\.*/ ) {
 
     # at end-of-record double slash
-    print  "    <INSDSeq_sequence>$sequence</INSDSeq_sequence>\n";
+    if ( $sequence ne "" ) {
+        print  "    <INSDSeq_sequence>$sequence</INSDSeq_sequence>\n";
+    }
     print  "  </INSDSeq>\n";
     # reset variables for catenated flatfiles
     clearflags ();
 
-  } elsif ( $in_seq == 1 ) {
+  } elsif ( $in_seq ) {
 
     if ( /^\s+\d+ (.*)$/ || /^\s+(.*)\s+\d+$/ ) {
       # record sequence
@@ -452,14 +487,16 @@ while (<> ) {
       }
     }
 
-  } elsif ( $in_feat == 1 ) {
+  } elsif ( $in_con ) {
+
+  } elsif ( $in_feat ) {
 
     if ( /^ {1,10}(\w+)\s+(.*)$/ ) {
       # new feature key and location
       flushline ();
 
-      $in_key = 1;
-      $in_qual = 0;
+      $in_key = true;
+      $in_qual = false;
       $current_key = $1;
       $current_loc = $2;
 
@@ -467,41 +504,43 @@ while (<> ) {
       # new qualifier
       flushline ();
 
-      $in_key = 0;
-      $in_qual = 1;
+      $in_key = false;
+      $in_qual = true;
       $current_qual = $1;
       # remove leading double quote
       my $val = $2;
       $val =~ s/\"//g;
       $current_val = $val;
-      if ( $current_qual =~ /(?:translation|transcription|peptide)/ ) {
-        $is_translation = 1;
+      if ( $current_qual =~ /(?:translation|transcription|peptide|anticodon)/ ) {
+        $no_space = true;
       } else {
-        $is_translation = 0;
+        $no_space = false;
       }
 
     } elsif ( /^\s+\/(\w+)$/ ) {
       # new singleton qualifier - e.g., trans-splicing, pseudo
       flushline ();
 
-      $in_key = 0;
-      $in_qual = 1;
+      $in_key = false;
+      $in_qual = true;
       $current_qual = $1;
       $current_val = "";
-      $is_translation = 0;
+      $no_space = false;
 
     } elsif ( /^\s+(.*)$/ ) {
 
-      if ( $in_key == 1 ) {
+      if ( $in_key ) {
         # continuation of feature location
         $current_loc = $current_loc . $1;
 
-      } elsif ( $in_qual == 1 ) {
+      } elsif ( $in_qual ) {
         # continuation of qualifier
         # remove trailing double quote
         my $val = $1;
         $val =~ s/\"//g;
-        if ( $is_translation == 1 ) {
+        if ( $no_space ) {
+          $current_val = $current_val . $val;
+        } elsif ( $current_val =~ /-$/ ) {
           $current_val = $current_val . $val;
         } else {
           $current_val = $current_val . " " . $val;

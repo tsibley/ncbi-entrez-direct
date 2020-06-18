@@ -23,6 +23,11 @@ if [ "$#" -gt 0 ]
 then
   argument="$1"
   target=$(cd "$argument" && pwd)
+  target=${target%/}
+  case "$target" in
+    */Archive ) ;;
+    * ) target=$target/Archive ;;
+  esac
 else
   if [ -z "${EDIRECT_PUBMED_MASTER}" ]
   then
@@ -39,7 +44,7 @@ target=${target%/}
 
 HEAD=$(cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle, 1st June 2018//EN" "http://dtd.nlm.nih.gov/ncbi/pubmed/out/180601/pubmed_180601.dtd">
+<!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle, 1st January 2019//EN" "https://dtd.nlm.nih.gov/ncbi/pubmed/out/pubmed_190101.dtd">
 <PubmedArticleSet>
 EOF
 )

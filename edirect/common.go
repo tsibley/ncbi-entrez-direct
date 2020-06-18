@@ -29,15 +29,24 @@
 // ==========================================================================
 
 /*
-  Download external Go libraries by running:
+  Older - Download external Go libraries by running:
 
   cd "$GOPATH"
-  go get -u github.com/antzucaro/matchr
+  go get -u github.com/fatih/color
   go get -u github.com/fiam/gounidecode/unidecode
+  go get -u github.com/gedex/inflector
+  go get -u github.com/klauspost/cpuid
+  go get -u github.com/pbnjay/memory
   go get -u github.com/surgebase/porter2
   go get -u golang.org/x/text/runes
   go get -u golang.org/x/text/transform
   go get -u golang.org/x/text/unicode/norm
+
+  Newer - Prepare modules by running:
+
+  cd edirect
+  go mod init edirect
+  go mod tidy
 
   Test for presence of Go compiler, and cross-compile xtract executable, by running:
 
@@ -78,18 +87,19 @@
 package main
 
 import (
+	"bytes"
 	"container/heap"
 	"fmt"
-	"github.com/surgebase/porter2"
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
-	"html"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 )
 
@@ -125,10 +135,11 @@ type ContentType int
 
 const (
 	NONE  ContentType = iota
-	PLAIN ContentType = 1 << iota
-	MIXED
+	MIXED             = 1 << iota
 	AMPER
 	ASCII
+	LFTSPACE
+	RGTSPACE
 )
 
 type VerifyType int
@@ -261,128 +272,258 @@ var greekRunes = map[rune]string{
 }
 
 var isStopWord = map[string]bool{
-	"!":             true,
-	"\"":            true,
-	"#":             true,
-	"$":             true,
-	"%":             true,
-	"&":             true,
-	"'":             true,
-	"(":             true,
-	")":             true,
-	"*":             true,
-	"+":             true,
-	",":             true,
-	"-":             true,
-	".":             true,
-	"/":             true,
-	":":             true,
-	";":             true,
-	"<":             true,
-	"=":             true,
-	">":             true,
-	"?":             true,
-	"@":             true,
-	"[":             true,
-	"\\":            true,
-	"]":             true,
-	"^":             true,
-	"_":             true,
-	"`":             true,
-	"{":             true,
-	"|":             true,
-	"}":             true,
-	"~":             true,
 	"a":             true,
 	"about":         true,
+	"above":         true,
+	"abs":           true,
+	"accordingly":   true,
+	"across":        true,
+	"after":         true,
+	"afterwards":    true,
 	"again":         true,
+	"against":       true,
 	"all":           true,
 	"almost":        true,
+	"alone":         true,
+	"along":         true,
+	"already":       true,
 	"also":          true,
 	"although":      true,
 	"always":        true,
+	"am":            true,
 	"among":         true,
+	"amongst":       true,
 	"an":            true,
+	"analyze":       true,
 	"and":           true,
 	"another":       true,
 	"any":           true,
+	"anyhow":        true,
+	"anyone":        true,
+	"anything":      true,
+	"anywhere":      true,
+	"applicable":    true,
+	"apply":         true,
 	"are":           true,
+	"arise":         true,
+	"around":        true,
 	"as":            true,
+	"assume":        true,
 	"at":            true,
 	"be":            true,
+	"became":        true,
 	"because":       true,
+	"become":        true,
+	"becomes":       true,
+	"becoming":      true,
 	"been":          true,
 	"before":        true,
+	"beforehand":    true,
 	"being":         true,
+	"below":         true,
+	"beside":        true,
+	"besides":       true,
 	"between":       true,
+	"beyond":        true,
 	"both":          true,
 	"but":           true,
 	"by":            true,
+	"came":          true,
 	"can":           true,
+	"cannot":        true,
+	"cc":            true,
+	"cm":            true,
+	"come":          true,
+	"compare":       true,
 	"could":         true,
+	"de":            true,
+	"dealing":       true,
+	"department":    true,
+	"depend":        true,
 	"did":           true,
+	"discover":      true,
+	"dl":            true,
 	"do":            true,
 	"does":          true,
 	"done":          true,
 	"due":           true,
 	"during":        true,
 	"each":          true,
+	"ec":            true,
+	"ed":            true,
+	"effected":      true,
+	"eg":            true,
 	"either":        true,
+	"else":          true,
+	"elsewhere":     true,
 	"enough":        true,
 	"especially":    true,
+	"et":            true,
 	"etc":           true,
+	"ever":          true,
+	"every":         true,
+	"everyone":      true,
+	"everything":    true,
+	"everywhere":    true,
+	"except":        true,
+	"find":          true,
 	"for":           true,
 	"found":         true,
 	"from":          true,
 	"further":       true,
+	"gave":          true,
+	"get":           true,
+	"give":          true,
+	"go":            true,
+	"gone":          true,
+	"got":           true,
+	"gov":           true,
 	"had":           true,
 	"has":           true,
 	"have":          true,
 	"having":        true,
+	"he":            true,
+	"hence":         true,
+	"her":           true,
 	"here":          true,
+	"hereafter":     true,
+	"hereby":        true,
+	"herein":        true,
+	"hereupon":      true,
+	"hers":          true,
+	"herself":       true,
+	"him":           true,
+	"himself":       true,
+	"his":           true,
 	"how":           true,
 	"however":       true,
+	"hr":            true,
 	"i":             true,
+	"ie":            true,
 	"if":            true,
+	"ii":            true,
+	"iii":           true,
+	"immediately":   true,
+	"importance":    true,
+	"important":     true,
 	"in":            true,
+	"inc":           true,
+	"incl":          true,
+	"indeed":        true,
 	"into":          true,
+	"investigate":   true,
 	"is":            true,
 	"it":            true,
 	"its":           true,
 	"itself":        true,
 	"just":          true,
+	"keep":          true,
+	"kept":          true,
 	"kg":            true,
 	"km":            true,
+	"last":          true,
+	"latter":        true,
+	"latterly":      true,
+	"lb":            true,
+	"ld":            true,
+	"letter":        true,
+	"like":          true,
+	"ltd":           true,
 	"made":          true,
 	"mainly":        true,
 	"make":          true,
+	"many":          true,
 	"may":           true,
+	"me":            true,
+	"meanwhile":     true,
 	"mg":            true,
 	"might":         true,
 	"ml":            true,
 	"mm":            true,
+	"mo":            true,
+	"more":          true,
+	"moreover":      true,
 	"most":          true,
 	"mostly":        true,
+	"mr":            true,
+	"much":          true,
+	"mug":           true,
 	"must":          true,
+	"my":            true,
+	"myself":        true,
+	"namely":        true,
 	"nearly":        true,
+	"necessarily":   true,
 	"neither":       true,
+	"never":         true,
+	"nevertheless":  true,
+	"next":          true,
 	"no":            true,
+	"nobody":        true,
+	"noone":         true,
 	"nor":           true,
+	"normally":      true,
+	"nos":           true,
+	"not":           true,
+	"noted":         true,
+	"nothing":       true,
+	"now":           true,
+	"nowhere":       true,
 	"obtained":      true,
 	"of":            true,
+	"off":           true,
 	"often":         true,
 	"on":            true,
+	"only":          true,
+	"onto":          true,
+	"or":            true,
+	"other":         true,
+	"others":        true,
+	"otherwise":     true,
+	"ought":         true,
 	"our":           true,
+	"ours":          true,
+	"ourselves":     true,
+	"out":           true,
+	"over":          true,
 	"overall":       true,
+	"owing":         true,
+	"own":           true,
+	"oz":            true,
+	"particularly":  true,
+	"per":           true,
 	"perhaps":       true,
+	"pm":            true,
 	"pmid":          true,
+	"precede":       true,
+	"predominantly": true,
+	"present":       true,
+	"presently":     true,
+	"previously":    true,
+	"primarily":     true,
+	"promptly":      true,
+	"pt":            true,
+	"quickly":       true,
 	"quite":         true,
+	"quot":          true,
 	"rather":        true,
+	"readily":       true,
 	"really":        true,
+	"recently":      true,
+	"refs":          true,
 	"regarding":     true,
+	"relate":        true,
+	"said":          true,
+	"same":          true,
 	"seem":          true,
+	"seemed":        true,
+	"seeming":       true,
+	"seems":         true,
 	"seen":          true,
+	"seriously":     true,
 	"several":       true,
+	"shall":         true,
+	"she":           true,
 	"should":        true,
 	"show":          true,
 	"showed":        true,
@@ -390,42 +531,116 @@ var isStopWord = map[string]bool{
 	"shows":         true,
 	"significantly": true,
 	"since":         true,
+	"slightly":      true,
 	"so":            true,
 	"some":          true,
+	"somehow":       true,
+	"someone":       true,
+	"something":     true,
+	"sometime":      true,
+	"sometimes":     true,
+	"somewhat":      true,
+	"somewhere":     true,
+	"soon":          true,
+	"specifically":  true,
+	"still":         true,
+	"strongly":      true,
+	"studied":       true,
+	"studies":       true,
+	"study":         true,
+	"sub":           true,
+	"substantially": true,
 	"such":          true,
+	"sufficiently":  true,
+	"take":          true,
+	"tell":          true,
+	"th":            true,
 	"than":          true,
 	"that":          true,
 	"the":           true,
 	"their":         true,
 	"theirs":        true,
 	"them":          true,
+	"themselves":    true,
 	"then":          true,
+	"thence":        true,
 	"there":         true,
+	"thereafter":    true,
+	"thereby":       true,
 	"therefore":     true,
+	"therein":       true,
+	"thereupon":     true,
 	"these":         true,
 	"they":          true,
 	"this":          true,
+	"thorough":      true,
 	"those":         true,
+	"though":        true,
 	"through":       true,
+	"throughout":    true,
+	"thru":          true,
 	"thus":          true,
 	"to":            true,
+	"together":      true,
+	"too":           true,
+	"toward":        true,
+	"towards":       true,
+	"try":           true,
+	"type":          true,
+	"ug":            true,
+	"under":         true,
+	"unless":        true,
+	"until":         true,
+	"up":            true,
 	"upon":          true,
+	"us":            true,
 	"use":           true,
 	"used":          true,
+	"usefully":      true,
+	"usefulness":    true,
 	"using":         true,
+	"usually":       true,
 	"various":       true,
 	"very":          true,
+	"via":           true,
 	"was":           true,
 	"we":            true,
 	"were":          true,
 	"what":          true,
+	"whatever":      true,
 	"when":          true,
+	"whence":        true,
+	"whenever":      true,
+	"where":         true,
+	"whereafter":    true,
+	"whereas":       true,
+	"whereby":       true,
+	"wherein":       true,
+	"whereupon":     true,
+	"wherever":      true,
+	"whether":       true,
 	"which":         true,
 	"while":         true,
+	"whither":       true,
+	"who":           true,
+	"whoever":       true,
+	"whom":          true,
+	"whose":         true,
+	"why":           true,
+	"will":          true,
 	"with":          true,
 	"within":        true,
 	"without":       true,
+	"wk":            true,
 	"would":         true,
+	"wt":            true,
+	"yet":           true,
+	"you":           true,
+	"your":          true,
+	"yours":         true,
+	"yourself":      true,
+	"yourselves":    true,
+	"yr":            true,
 }
 
 var htmlRepair = map[string]string{
@@ -507,6 +722,15 @@ var hyphenatedPrefixes = map[string]bool{
 	"un":      true,
 	"under":   true,
 	"whole":   true,
+}
+
+var primedPrefixes = map[string]bool{
+	"5": true,
+	"3": true,
+}
+
+var primedSuffix = map[string]bool{
+	"s": true,
 }
 
 // DATA OBJECTS
@@ -593,111 +817,483 @@ var (
 	UnicodeFix = NOMARKUP
 	ScriptFix  = NOMARKUP
 	MathMLFix  = NOMARKUP
+
+	IdxFields []string
+
+	StartTime time.Time
 )
 
 // UTILITIES
 
-func IsNotJustWhitespace(str string) bool {
+func CleanupBadSpaces(str string) string {
+
+	var buffer strings.Builder
 
 	for _, ch := range str {
-		if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' && ch != '\f' {
-			return true
+		if ch > 127 && unicode.IsSpace(ch) {
+			buffer.WriteRune(' ')
+		} else {
+			buffer.WriteRune(ch)
 		}
 	}
 
-	return false
+	return buffer.String()
 }
 
-func IsNotASCII(str string) bool {
+func CleanupContents(str string, ascii, amper, mixed bool) string {
+
+	if DoCompress {
+		if !AllowEmbed {
+			if ascii && HasBadSpace(str) {
+				str = CleanupBadSpaces(str)
+			}
+		}
+		if HasAdjacentSpacesOrNewline(str) {
+			str = CompressRunsOfSpaces(str)
+		}
+	}
+	if DoUnicode {
+		if ascii && HasUnicodeMarkup(str) {
+			str = RepairUnicodeMarkup(str, UnicodeFix)
+		}
+	}
+	if AllowEmbed {
+		if amper {
+			str = RepairEncodedMarkup(str)
+		}
+	}
+	if DoScript {
+		if mixed && HasAngleBracket(str) {
+			str = RepairScriptMarkup(str, ScriptFix)
+		}
+	}
+	if DoMathML {
+		if mixed && HasAngleBracket(str) {
+			str = RepairMathMLMarkup(str, MathMLFix)
+		}
+	}
+	if DoStrict {
+		if mixed || amper {
+			if HasAngleBracket(str) {
+				str = RepairTableMarkup(str, SPACE)
+				str = RemoveEmbeddedMarkup(str)
+			}
+		}
+		if ascii && HasBadSpace(str) {
+			str = CleanupBadSpaces(str)
+		}
+		if HasAdjacentSpaces(str) {
+			str = CompressRunsOfSpaces(str)
+		}
+		// Remove MathML artifact
+		if NeedsTightening(str) {
+			str = TightenParentheses(str)
+		}
+	}
+	if DoMixed {
+		if mixed {
+			str = DoTrimFlankingHTML(str)
+		}
+		if ascii && HasBadSpace(str) {
+			str = CleanupBadSpaces(str)
+		}
+		if HasAdjacentSpaces(str) {
+			str = CompressRunsOfSpaces(str)
+		}
+	}
+	if DeAccent {
+		if ascii {
+			str = DoAccentTransform(str)
+		}
+	}
+	if DoASCII {
+		if ascii {
+			str = UnicodeToASCII(str)
+		}
+	}
+
+	if HasFlankingSpace(str) {
+		str = strings.TrimSpace(str)
+	}
+
+	return str
+}
+
+func CompressRunsOfSpaces(str string) string {
+
+	whiteSpace := false
+	var buffer strings.Builder
+
+	for _, ch := range str {
+		if ch < 127 && InBlank[ch] {
+			if !whiteSpace {
+				buffer.WriteRune(' ')
+			}
+			whiteSpace = true
+		} else {
+			buffer.WriteRune(ch)
+			whiteSpace = false
+		}
+	}
+
+	return buffer.String()
+}
+
+func ConvertSlash(str string) string {
+
+	if str == "" {
+		return str
+	}
+
+	length := len(str)
+	res := make([]byte, length+1, length+1)
+
+	isSlash := false
+	idx := 0
+	for _, ch := range str {
+		if isSlash {
+			switch ch {
+			case 'n':
+				// line feed
+				res[idx] = '\n'
+			case 'r':
+				// carriage return
+				res[idx] = '\r'
+			case 't':
+				// horizontal tab
+				res[idx] = '\t'
+			case 'f':
+				// form feed
+				res[idx] = '\f'
+			case 'a':
+				// audible bell from terminal (undocumented)
+				res[idx] = '\x07'
+			default:
+				res[idx] = byte(ch)
+			}
+			idx++
+			isSlash = false
+		} else if ch == '\\' {
+			isSlash = true
+		} else {
+			res[idx] = byte(ch)
+			idx++
+		}
+	}
+
+	res = res[0:idx]
+
+	return string(res)
+}
+
+var (
+	rlock sync.Mutex
+	ffix  *strings.Replacer
+)
+
+func DecodeFields(str string) string {
+
+	// NewReplacer not reentrant (?), protected by mutex
+	rlock.Lock()
+
+	if ffix == nil {
+		// handles bracketed field specifiers
+		ffix = strings.NewReplacer(
+			"[chem]", " CHEM ",
+			"[code]", " CODE ",
+			"[conv]", " CONV ",
+			"[disz]", " DISZ ",
+			"[gene]", " GENE ",
+			"[norm]", " NORM ",
+			"[path]", " PATH ",
+			"[pipe]", " PIPE ",
+			"[stem]", " STEM ",
+			"[thme]", " THME ",
+			"[tree]", " TREE ",
+			"[year]", " YEAR ",
+		)
+	}
+
+	// must do after lower casing and removing underscores, but before removing hyphens
+	if ffix != nil {
+
+		str = CompressRunsOfSpaces(str)
+		str = strings.TrimSpace(str)
+
+		str = " " + str + " "
+
+		str = ffix.Replace(str)
+
+		str = CompressRunsOfSpaces(str)
+		str = strings.TrimSpace(str)
+	}
+
+	rlock.Unlock()
+
+	return str
+}
+
+var (
+	tlock sync.Mutex
+	tform transform.Transformer
+)
+
+func DoAccentTransform(str string) string {
+
+	// transformer not reentrant, protected by mutex
+	tlock.Lock()
+
+	if tform == nil {
+		tform = transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+	}
+
+	if tform != nil {
+
+		var arry []string
+
+		// split long string into words to avoid transform short internal buffer error
+		terms := strings.Fields(str)
+
+		for _, item := range terms {
+
+			// remove accents from single word
+			tmp, _, err := transform.String(tform, item)
+			if err == nil {
+				// collect transformed result
+				arry = append(arry, tmp)
+			} else {
+				fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+			}
+		}
+
+		// reconstruct string from transformed words
+		str = strings.Join(arry, " ")
+	}
+
+	// look for characters not in current external runes conversion table
+	if HasBadAccent(str) {
+		str = FixBadAccent(str)
+	}
+
+	tlock.Unlock()
+
+	return str
+}
+
+func DoTrimFlankingHTML(str string) string {
+
+	badPrefix := [10]string{
+		"<i></i>",
+		"<b></b>",
+		"<u></u>",
+		"<sup></sup>",
+		"<sub></sub>",
+		"</i>",
+		"</b>",
+		"</u>",
+		"</sup>",
+		"</sub>",
+	}
+
+	badSuffix := [10]string{
+		"<i></i>",
+		"<b></b>",
+		"<u></u>",
+		"<sup></sup>",
+		"<sub></sub>",
+		"<i>",
+		"<b>",
+		"<u>",
+		"<sup>",
+		"<sub>",
+	}
+
+	if strings.Contains(str, "<") {
+		goOn := true
+		for goOn {
+			goOn = false
+			for _, tag := range badPrefix {
+				if strings.HasPrefix(str, tag) {
+					str = str[len(tag):]
+					goOn = true
+				}
+			}
+			for _, tag := range badSuffix {
+				if strings.HasSuffix(str, tag) {
+					str = str[:len(str)-len(tag)]
+					goOn = true
+				}
+			}
+		}
+	}
+
+	return str
+}
+
+func FixBadAccent(str string) string {
+
+	var buffer strings.Builder
 
 	for _, ch := range str {
 		if ch > 127 {
-			return true
+			if ch >= '\u00D8' && ch <= '\u02BC' {
+				rn, ok := accentRunes[ch]
+				if ok {
+					buffer.WriteRune(rn)
+					continue
+				}
+				st, ok := ligatureRunes[ch]
+				if ok {
+					buffer.WriteString(st)
+					continue
+				}
+			}
+			if ch >= '\uFB00' && ch <= '\uFB06' {
+				st, ok := ligatureRunes[ch]
+				if ok {
+					buffer.WriteString(st)
+					continue
+				}
+			}
 		}
+		buffer.WriteRune(ch)
 	}
 
-	return false
+	return buffer.String()
 }
 
-func HasAmpOrNotASCII(str string) bool {
+func FixSpecialCases(str string) string {
 
-	for _, ch := range str {
-		if ch == '&' || ch > 127 {
-			return true
+	var arry []string
+	var buffer strings.Builder
+
+	terms := strings.Fields(str)
+
+	for _, item := range terms {
+
+		buffer.Reset()
+
+		for i, ch := range item {
+			if ch == '-' {
+				_, ok := hyphenatedPrefixes[item[0:i]]
+				if ok {
+					continue
+				}
+			} else if ch == '\'' {
+				_, ok := primedPrefixes[item[0:i]]
+				if ok {
+					buffer.WriteString("_prime ")
+					continue
+				}
+				_, ok = primedSuffix[item[i:]]
+				if ok {
+					continue
+				}
+			}
+			buffer.WriteRune(ch)
 		}
+
+		item = buffer.String()
+
+		arry = append(arry, item)
 	}
 
-	return false
+	// reconstruct string from transformed words
+	str = strings.Join(arry, " ")
+
+	return str
 }
 
-func IsAllCapsOrDigits(str string) bool {
+func FixThemeCases(str string) string {
 
-	for _, ch := range str {
-		if !unicode.IsUpper(ch) && !unicode.IsDigit(ch) {
-			return false
+	if !strings.Contains(str, "[thme]") && !strings.Contains(str, "[conv]") {
+		return str
+	}
+
+	var arry []string
+
+	terms := strings.Fields(str)
+
+	for _, item := range terms {
+
+		switch item {
+		case "a+":
+			arry = append(arry, "ap")
+		case "e+":
+			arry = append(arry, "ep")
+		case "ec+":
+			arry = append(arry, "ecp")
+		case "eg+":
+			arry = append(arry, "egp")
+		case "v+":
+			arry = append(arry, "vp")
+		case "a-":
+			arry = append(arry, "am")
+		case "e-":
+			arry = append(arry, "em")
+		case "ec-":
+			arry = append(arry, "ecm")
+		default:
+			arry = append(arry, item)
 		}
 	}
 
-	return true
+	// reconstruct string from transformed words
+	str = strings.Join(arry, " ")
+
+	return str
 }
 
-func IsAllDigitsOrPeriod(str string) bool {
+func FlattenMathML(str string, policy MarkupPolicy) string {
 
-	for _, ch := range str {
-		if !unicode.IsDigit(ch) && ch != '.' {
-			return false
+	findNextXMLBlock := func(txt string) (int, int, bool) {
+
+		beg := strings.Index(txt, "<")
+		if beg < 0 {
+			return -1, -1, false
 		}
+		end := strings.Index(txt, ">")
+		if end < 0 {
+			return -1, -1, false
+		}
+		end++
+		return beg, end, true
 	}
 
-	return true
-}
+	var arry []string
 
-func IsAllNumeric(str string) bool {
-
-	for _, ch := range str {
-		if !unicode.IsDigit(ch) &&
-			ch != '.' &&
-			ch != '+' &&
-			ch != '-' &&
-			ch != '*' &&
-			ch != '/' &&
-			ch != ',' &&
-			ch != '$' &&
-			ch != '#' &&
-			ch != '%' &&
-			ch != '(' &&
-			ch != ')' {
-			return false
+	for {
+		beg, end, ok := findNextXMLBlock(str)
+		if !ok {
+			break
 		}
+		pfx := str[:beg]
+		pfx = strings.TrimSpace(pfx)
+		if pfx != "" {
+			arry = append(arry, pfx)
+		}
+		tmp := str[beg:end]
+		tmp = strings.TrimSpace(tmp)
+		str = str[end:]
 	}
 
-	return true
-}
-
-func HasAngleBracket(str string) bool {
-
-	hasAmp := false
-	hasSemi := false
-
-	for _, ch := range str {
-		if ch == '<' || ch == '>' {
-			return true
-		} else if ch == '&' {
-			hasAmp = true
-		} else if ch == ';' {
-			hasSemi = true
-		}
+	switch policy {
+	case PERIOD:
+	case SPACE:
+		str = strings.Join(arry, " ")
+	case BRACKETS:
+	case MARKDOWN:
+	case SLASH:
+	case TAGS:
+	case TERSE:
+		str = strings.Join(arry, "")
 	}
 
-	if hasAmp && hasSemi {
-		if strings.Contains(str, "&lt;") ||
-			strings.Contains(str, "&gt;") ||
-			strings.Contains(str, "&amp;") {
-			return true
-		}
-	}
+	str = strings.TrimSpace(str)
 
-	return false
+	// str = RemoveEmbeddedMarkup(str)
+
+	return str
 }
 
 func HasAdjacentSpaces(str string) bool {
@@ -739,24 +1335,80 @@ func HasAdjacentSpacesOrNewline(str string) bool {
 	return false
 }
 
-func CompressRunsOfSpaces(str string) string {
-
-	whiteSpace := false
-	var buffer strings.Builder
+func HasAmpOrNotASCII(str string) bool {
 
 	for _, ch := range str {
-		if ch < 127 && InBlank[ch] {
-			if !whiteSpace {
-				buffer.WriteRune(' ')
-			}
-			whiteSpace = true
-		} else {
-			buffer.WriteRune(ch)
-			whiteSpace = false
+		if ch == '&' || ch > 127 {
+			return true
 		}
 	}
 
-	return buffer.String()
+	return false
+}
+
+func HasAngleBracket(str string) bool {
+
+	hasAmp := false
+	hasSemi := false
+
+	for _, ch := range str {
+		if ch == '<' || ch == '>' {
+			return true
+		} else if ch == '&' {
+			hasAmp = true
+		} else if ch == ';' {
+			hasSemi = true
+		}
+	}
+
+	if hasAmp && hasSemi {
+		if strings.Contains(str, "&lt;") ||
+			strings.Contains(str, "&gt;") ||
+			strings.Contains(str, "&amp;") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HasBadAccent(str string) bool {
+
+	for _, ch := range str {
+		if ch <= 127 {
+			continue
+		}
+		// quick min-to-max check for additional characters to treat as accents
+		if ch >= '\u00D8' && ch <= '\u02BC' {
+			return true
+		} else if ch >= '\uFB00' && ch <= '\uFB06' {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HasBadSpace(str string) bool {
+
+	for _, ch := range str {
+		if ch > 127 && unicode.IsSpace(ch) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HasCommaOrSemicolon(str string) bool {
+
+	for _, ch := range str {
+		if ch == ',' || ch == ';' || ch == '-' {
+			return true
+		}
+	}
+
+	return false
 }
 
 func HasFlankingSpace(str string) bool {
@@ -779,10 +1431,22 @@ func HasFlankingSpace(str string) bool {
 	return false
 }
 
-func HasBadSpace(str string) bool {
+func HasGreek(str string) bool {
 
 	for _, ch := range str {
-		if ch > 127 && unicode.IsSpace(ch) {
+		if ch <= 127 {
+			continue
+		}
+		// quick min-to-max check for Greek characters to convert to english words
+		if ch >= '\u03B1' && ch <= '\u03C9' {
+			return true
+		} else if ch >= '\u0391' && ch <= '\u03A9' {
+			return true
+		} else if ch >= '\u03D1' && ch <= '\u03D6' {
+			return true
+		} else if ch >= '\u03F0' && ch <= '\u03F5' {
+			return true
+		} else if ch == '\u0190' || ch == '\u025B' {
 			return true
 		}
 	}
@@ -790,14 +1454,278 @@ func HasBadSpace(str string) bool {
 	return false
 }
 
-func CleanupBadSpaces(str string) string {
+func HasHyphenOrApostrophe(str string) bool {
 
+	for _, ch := range str {
+		if ch == '-' || ch == '\'' {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HasPlusOrMinus(str string) bool {
+
+	for _, ch := range str {
+		if ch == '-' || ch == '+' {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HasSpaceOrHyphen(str string) bool {
+
+	for _, ch := range str {
+		if ch == ' ' || ch == '-' {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HasUnicodeMarkup(str string) bool {
+
+	for _, ch := range str {
+		if ch <= 127 {
+			continue
+		}
+		// check for Unicode superscript or subscript characters
+		if ch == '\u00B2' || ch == '\u00B3' || ch == '\u00B9' || (ch >= '\u2070' && ch <= '\u208E') {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HTMLAhead(text string, idx, txtlen int) int {
+
+	// record position of < character
+	start := idx
+
+	// at start of element
+	idx++
+	if idx >= txtlen {
+		return 0
+	}
+	ch := text[idx]
+
+	if ch == '/' {
+		// skip past end tag symbol
+		idx++
+		ch = text[idx]
+	}
+
+	// all embedded markup tags start with a lower-case letter
+	if ch < 'a' || ch > 'z' {
+		// except for DispFormula in PubmedArticle
+		if ch == 'D' && strings.HasPrefix(text[idx:], "DispFormula") {
+			for ch != '>' {
+				idx++
+				ch = text[idx]
+			}
+			return idx + 1 - start
+		}
+
+		// otherwise not a recognized markup tag
+		return 0
+	}
+
+	idx++
+	ch = text[idx]
+	for InLower[ch] {
+		idx++
+		ch = text[idx]
+	}
+
+	// if tag name was not all lower-case, then exit
+	if ch >= 'A' && ch <= 'Z' {
+		return 0
+	}
+
+	// skip to end of element, past any attributes or slash character
+	for ch != '>' {
+		idx++
+		ch = text[idx]
+	}
+
+	// return number of characters to advance to skip this markup tag
+	return idx + 1 - start
+}
+
+func HTMLBehind(bufr []byte, pos, txtlen int) bool {
+
+	for pos >= 0 {
+		if bufr[pos] == '<' {
+			return HTMLAhead(string(bufr), pos, txtlen) != 0
+		}
+		pos--
+	}
+
+	return false
+}
+
+func IsAllCapsOrDigits(str string) bool {
+
+	for _, ch := range str {
+		if !unicode.IsUpper(ch) && !unicode.IsDigit(ch) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func IsAllDigits(str string) bool {
+
+	for _, ch := range str {
+		if !unicode.IsDigit(ch) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func IsAllDigitsOrPeriod(str string) bool {
+
+	for _, ch := range str {
+		if !unicode.IsDigit(ch) && ch != '.' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func IsAllNumeric(str string) bool {
+
+	for _, ch := range str {
+		if !unicode.IsDigit(ch) &&
+			ch != '.' &&
+			ch != '+' &&
+			ch != '-' &&
+			ch != '*' &&
+			ch != '/' &&
+			ch != ',' &&
+			ch != '$' &&
+			ch != '#' &&
+			ch != '%' &&
+			ch != '(' &&
+			ch != ')' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func IsNotASCII(str string) bool {
+
+	for _, ch := range str {
+		if ch > 127 {
+			return true
+		}
+	}
+
+	return false
+}
+
+func IsNotJustWhitespace(str string) bool {
+
+	for _, ch := range str {
+		if ch > 127 || !InBlank[ch] {
+			return true
+		}
+	}
+
+	return false
+}
+
+var plock sync.RWMutex
+
+func IsStopWord(str string) bool {
+
+	plock.RLock()
+	isSW := isStopWord[str]
+	plock.RUnlock()
+
+	return isSW
+}
+
+func IsUnicodeSubsc(ch rune) bool {
+	return ch >= '\u2080' && ch <= '\u208E'
+}
+
+func IsUnicodeSuper(ch rune) bool {
+	return ch == '\u00B2' || ch == '\u00B3' || ch == '\u00B9' || (ch >= '\u2070' && ch <= '\u207F')
+}
+
+func NeedsTightening(str string) bool {
+
+	if len(str) < 2 {
+		return false
+	}
+
+	var prev rune
+
+	for _, ch := range str {
+		if prev == '(' && ch == ' ' {
+			return true
+		}
+		if prev == ' ' && ch == ')' {
+			return true
+		}
+		prev = ch
+	}
+
+	return false
+}
+
+func ParseIndex(indx string) *Find {
+
+	if indx == "" {
+		return &Find{}
+	}
+
+	// parse parent/element@attribute^version index
+	prnt, match := SplitInTwoAt(indx, "/", RIGHT)
+	match, versn := SplitInTwoAt(match, "^", LEFT)
+	match, attrib := SplitInTwoAt(match, "@", LEFT)
+
+	return &Find{Index: indx, Parent: prnt, Match: match, Attrib: attrib, Versn: versn}
+}
+
+func RemoveCommaOrSemicolon(str string) string {
+
+	str = strings.ToLower(str)
+
+	if HasCommaOrSemicolon(str) {
+		str = strings.Replace(str, ",", " ", -1)
+		str = strings.Replace(str, ";", " ", -1)
+		str = CompressRunsOfSpaces(str)
+	}
+	str = strings.TrimSpace(str)
+	str = strings.TrimRight(str, ".?:")
+
+	return str
+}
+
+func RemoveEmbeddedMarkup(str string) string {
+
+	inContent := true
 	var buffer strings.Builder
 
 	for _, ch := range str {
-		if ch > 127 && unicode.IsSpace(ch) {
-			buffer.WriteRune(' ')
-		} else {
+		if ch == '<' {
+			inContent = false
+		} else if ch == '>' {
+			inContent = true
+		} else if inContent {
 			buffer.WriteRune(ch)
 		}
 	}
@@ -948,115 +1876,165 @@ func RepairEncodedMarkup(str string) string {
 			}
 		}
 
+		// if loop not continued by any preceding test, print character
 		buffer.WriteRune(ch)
 	}
 
 	return buffer.String()
 }
 
-func RemoveEmbeddedMarkup(str string) string {
+func RepairMathMLMarkup(str string, policy MarkupPolicy) string {
 
-	inContent := true
+	str = strings.Replace(str, "> <mml:", "><mml:", -1)
+	str = strings.Replace(str, "> </mml:", "></mml:", -1)
+
+	findNextMathBlock := func(txt string) (int, int, bool) {
+
+		beg := strings.Index(txt, "<DispFormula")
+		if beg < 0 {
+			return -1, -1, false
+		}
+		end := strings.Index(txt, "</DispFormula>")
+		if end < 0 {
+			return -1, -1, false
+		}
+		end += 14
+		return beg, end, true
+	}
+
+	var arry []string
+
+	for {
+		beg, end, ok := findNextMathBlock(str)
+		if !ok {
+			break
+		}
+		pfx := str[:beg]
+		pfx = strings.TrimSpace(pfx)
+		arry = append(arry, pfx)
+		tmp := str[beg:end]
+		if strings.HasPrefix(tmp, "<DispFormula") {
+			tmp = FlattenMathML(tmp, policy)
+		}
+		tmp = strings.TrimSpace(tmp)
+		arry = append(arry, tmp)
+		str = str[end:]
+	}
+
+	str = strings.TrimSpace(str)
+	arry = append(arry, str)
+
+	return strings.Join(arry, " ")
+}
+
+func RepairScriptMarkup(str string, policy MarkupPolicy) string {
+
 	var buffer strings.Builder
 
-	for _, ch := range str {
-		if ch == '<' {
-			inContent = false
-		} else if ch == '>' {
-			inContent = true
-		} else if inContent {
-			buffer.WriteRune(ch)
+	skip := 0
+
+	for i, ch := range str {
+		if skip > 0 {
+			skip--
+			continue
 		}
+		if ch == '<' {
+			if strings.HasPrefix(str[i:], "<sub>") {
+				switch policy {
+				case PERIOD:
+				case SPACE:
+				case BRACKETS:
+					buffer.WriteRune('(')
+				case MARKDOWN:
+					buffer.WriteRune('~')
+				}
+				skip = 4
+				continue
+			}
+			if strings.HasPrefix(str[i:], "<sup>") {
+				switch policy {
+				case PERIOD:
+				case SPACE:
+				case BRACKETS:
+					buffer.WriteRune('[')
+				case MARKDOWN:
+					buffer.WriteRune('^')
+				}
+				skip = 4
+				continue
+			}
+			if strings.HasPrefix(str[i:], "</sub>") {
+				if strings.HasPrefix(str[i+6:], "<sup>") {
+					switch policy {
+					case PERIOD:
+						buffer.WriteRune('.')
+					case SPACE:
+						buffer.WriteRune(' ')
+					case BRACKETS:
+						buffer.WriteRune(')')
+						buffer.WriteRune('[')
+					case MARKDOWN:
+						buffer.WriteRune('~')
+						buffer.WriteRune('^')
+					}
+					skip = 10
+					continue
+				}
+				switch policy {
+				case PERIOD:
+				case SPACE:
+				case BRACKETS:
+					buffer.WriteRune(')')
+				case MARKDOWN:
+					buffer.WriteRune('~')
+				}
+				skip = 5
+				continue
+			}
+			if strings.HasPrefix(str[i:], "</sup>") {
+				if strings.HasPrefix(str[i+6:], "<sub>") {
+					switch policy {
+					case PERIOD:
+						buffer.WriteRune('.')
+					case SPACE:
+						buffer.WriteRune(' ')
+					case BRACKETS:
+						buffer.WriteRune(']')
+						buffer.WriteRune('(')
+					case MARKDOWN:
+						buffer.WriteRune('^')
+						buffer.WriteRune('~')
+					}
+					skip = 10
+					continue
+				}
+				switch policy {
+				case PERIOD:
+				case SPACE:
+				case BRACKETS:
+					buffer.WriteRune(']')
+				case MARKDOWN:
+					buffer.WriteRune('^')
+				}
+				skip = 5
+				continue
+			}
+		}
+
+		buffer.WriteRune(ch)
 	}
 
 	return buffer.String()
 }
 
-func HTMLAhead(text string, idx int) int {
+func RepairTableMarkup(str string, policy MarkupPolicy) string {
 
-	// record position of < character
-	start := idx
+	str = strings.Replace(str, "<tr>", " ", -1)
+	str = strings.Replace(str, "<td>", " ", -1)
+	str = strings.Replace(str, "</tr>", " ", -1)
+	str = strings.Replace(str, "</td>", " ", -1)
 
-	// at start of element
-	idx++
-	ch := text[idx]
-
-	if ch == '/' {
-		// skip past end tag symbol
-		idx++
-		ch = text[idx]
-	}
-
-	// all embedded markup tags start with a lower-case letter
-	if ch < 'a' || ch > 'z' {
-		// except for DispFormula in PubmedArticle
-		if ch == 'D' && strings.HasPrefix(text[idx:], "DispFormula") {
-			for ch != '>' {
-				idx++
-				ch = text[idx]
-			}
-			return idx + 1 - start
-		}
-
-		// otherwise not a recognized markup tag
-		return 0
-	}
-
-	idx++
-	ch = text[idx]
-	for InLower[ch] {
-		idx++
-		ch = text[idx]
-	}
-
-	// if tag name was not all lower-case, then exit
-	if ch >= 'A' && ch <= 'Z' {
-		return 0
-	}
-
-	// skip to end of element, past any attributes or slash character
-	for ch != '>' {
-		idx++
-		ch = text[idx]
-	}
-
-	// return number of characters to advance to skip this markup tag
-	return idx + 1 - start
-}
-
-func HTMLBehind(bufr []byte, pos int) bool {
-
-	for pos >= 0 {
-		if bufr[pos] == '<' {
-			return HTMLAhead(string(bufr), pos) != 0
-		}
-		pos--
-	}
-
-	return false
-}
-
-func HasUnicodeMarkup(str string) bool {
-
-	for _, ch := range str {
-		if ch <= 127 {
-			continue
-		}
-		// check for Unicode superscript or subscript characters
-		if ch == '\u00B2' || ch == '\u00B3' || ch == '\u00B9' || (ch >= '\u2070' && ch <= '\u208E') {
-			return true
-		}
-	}
-
-	return false
-}
-
-func IsUnicodeSuper(ch rune) bool {
-	return ch == '\u00B2' || ch == '\u00B3' || ch == '\u00B9' || (ch >= '\u2070' && ch <= '\u207F')
-}
-
-func IsUnicodeSubsc(ch rune) bool {
-	return ch >= '\u2080' && ch <= '\u208E'
+	return str
 }
 
 func RepairUnicodeMarkup(str string, policy MarkupPolicy) string {
@@ -1354,455 +2332,20 @@ func RepairUnicodeMarkup(str string, policy MarkupPolicy) string {
 	return buffer.String()
 }
 
-func FlattenMathML(str string, policy MarkupPolicy) string {
+func SortStringByWords(str string) string {
 
-	findNextXMLBlock := func(txt string) (int, int, bool) {
+	str = RemoveCommaOrSemicolon(str)
 
-		beg := strings.Index(txt, "<")
-		if beg < 0 {
-			return -1, -1, false
-		}
-		end := strings.Index(txt, ">")
-		if end < 0 {
-			return -1, -1, false
-		}
-		end++
-		return beg, end, true
-	}
-
-	var arry []string
-
-	for {
-		beg, end, ok := findNextXMLBlock(str)
-		if !ok {
-			break
-		}
-		pfx := str[:beg]
-		pfx = strings.TrimSpace(pfx)
-		if pfx != "" {
-			arry = append(arry, pfx)
-		}
-		tmp := str[beg:end]
-		tmp = strings.TrimSpace(tmp)
-		str = str[end:]
-	}
-
-	switch policy {
-	case PERIOD:
-	case SPACE:
-		str = strings.Join(arry, " ")
-	case BRACKETS:
-	case MARKDOWN:
-	case SLASH:
-	case TAGS:
-	case TERSE:
-		str = strings.Join(arry, "")
-	}
-
-	str = strings.TrimSpace(str)
-
-	// str = RemoveEmbeddedMarkup(str)
-
-	return str
-}
-
-func RepairMathMLMarkup(str string, policy MarkupPolicy) string {
-
-	str = strings.Replace(str, "> <mml:", "><mml:", -1)
-	str = strings.Replace(str, "> </mml:", "></mml:", -1)
-
-	findNextMathBlock := func(txt string) (int, int, bool) {
-
-		beg := strings.Index(txt, "<DispFormula")
-		if beg < 0 {
-			return -1, -1, false
-		}
-		end := strings.Index(txt, "</DispFormula>")
-		if end < 0 {
-			return -1, -1, false
-		}
-		end += 14
-		return beg, end, true
-	}
-
-	var arry []string
-
-	for {
-		beg, end, ok := findNextMathBlock(str)
-		if !ok {
-			break
-		}
-		pfx := str[:beg]
-		pfx = strings.TrimSpace(pfx)
-		arry = append(arry, pfx)
-		tmp := str[beg:end]
-		if strings.HasPrefix(tmp, "<DispFormula") {
-			tmp = FlattenMathML(tmp, policy)
-		}
-		tmp = strings.TrimSpace(tmp)
-		arry = append(arry, tmp)
-		str = str[end:]
-	}
-
-	str = strings.TrimSpace(str)
-	arry = append(arry, str)
-
-	return strings.Join(arry, " ")
-}
-
-func RepairScriptMarkup(str string, policy MarkupPolicy) string {
-
-	var buffer strings.Builder
-
-	skip := 0
-
-	for i, ch := range str {
-		if skip > 0 {
-			skip--
-			continue
-		}
-		if ch == '<' {
-			if strings.HasPrefix(str[i:], "<sub>") {
-				switch policy {
-				case PERIOD:
-				case SPACE:
-				case BRACKETS:
-					buffer.WriteRune('(')
-				case MARKDOWN:
-					buffer.WriteRune('~')
-				}
-				skip = 4
-				continue
-			}
-			if strings.HasPrefix(str[i:], "<sup>") {
-				switch policy {
-				case PERIOD:
-				case SPACE:
-				case BRACKETS:
-					buffer.WriteRune('[')
-				case MARKDOWN:
-					buffer.WriteRune('^')
-				}
-				skip = 4
-				continue
-			}
-			if strings.HasPrefix(str[i:], "</sub>") {
-				if strings.HasPrefix(str[i+6:], "<sup>") {
-					switch policy {
-					case PERIOD:
-						buffer.WriteRune('.')
-					case SPACE:
-						buffer.WriteRune(' ')
-					case BRACKETS:
-						buffer.WriteRune(')')
-						buffer.WriteRune('[')
-					case MARKDOWN:
-						buffer.WriteRune('~')
-						buffer.WriteRune('^')
-					}
-					skip = 10
-					continue
-				}
-				switch policy {
-				case PERIOD:
-				case SPACE:
-				case BRACKETS:
-					buffer.WriteRune(')')
-				case MARKDOWN:
-					buffer.WriteRune('~')
-				}
-				skip = 5
-				continue
-			}
-			if strings.HasPrefix(str[i:], "</sup>") {
-				if strings.HasPrefix(str[i+6:], "<sub>") {
-					switch policy {
-					case PERIOD:
-						buffer.WriteRune('.')
-					case SPACE:
-						buffer.WriteRune(' ')
-					case BRACKETS:
-						buffer.WriteRune(']')
-						buffer.WriteRune('(')
-					case MARKDOWN:
-						buffer.WriteRune('^')
-						buffer.WriteRune('~')
-					}
-					skip = 10
-					continue
-				}
-				switch policy {
-				case PERIOD:
-				case SPACE:
-				case BRACKETS:
-					buffer.WriteRune(']')
-				case MARKDOWN:
-					buffer.WriteRune('^')
-				}
-				skip = 5
-				continue
-			}
-		}
-
-		buffer.WriteRune(ch)
-	}
-
-	return buffer.String()
-}
-
-func SplitInTwoAt(str, chr string, side SideType) (string, string) {
-
-	slash := strings.SplitN(str, chr, 2)
-	if len(slash) > 1 {
-		return slash[0], slash[1]
-	}
-
-	if side == LEFT {
-		return str, ""
-	}
-
-	return "", str
-}
-
-func ConvertSlash(str string) string {
-
-	if str == "" {
-		return str
-	}
-
-	length := len(str)
-	res := make([]byte, length+1, length+1)
-
-	isSlash := false
-	idx := 0
-	for _, ch := range str {
-		if isSlash {
-			switch ch {
-			case 'n':
-				// line feed
-				res[idx] = '\n'
-			case 'r':
-				// carriage return
-				res[idx] = '\r'
-			case 't':
-				// horizontal tab
-				res[idx] = '\t'
-			case 'f':
-				// form feed
-				res[idx] = '\f'
-			case 'a':
-				// audible bell from terminal (undocumented)
-				res[idx] = '\x07'
-			default:
-				res[idx] = byte(ch)
-			}
-			idx++
-			isSlash = false
-		} else if ch == '\\' {
-			isSlash = true
-		} else {
-			res[idx] = byte(ch)
-			idx++
-		}
-	}
-
-	res = res[0:idx]
-
-	return string(res)
-}
-
-func DoTrimFlankingHTML(str string) string {
-
-	badPrefix := [10]string{
-		"<i></i>",
-		"<b></b>",
-		"<u></u>",
-		"<sup></sup>",
-		"<sub></sub>",
-		"</i>",
-		"</b>",
-		"</u>",
-		"</sup>",
-		"</sub>",
-	}
-
-	badSuffix := [10]string{
-		"<i></i>",
-		"<b></b>",
-		"<u></u>",
-		"<sup></sup>",
-		"<sub></sub>",
-		"<i>",
-		"<b>",
-		"<u>",
-		"<sup>",
-		"<sub>",
-	}
-
-	if strings.Contains(str, "<") {
-		goOn := true
-		for goOn {
-			goOn = false
-			for _, tag := range badPrefix {
-				if strings.HasPrefix(str, tag) {
-					str = str[len(tag):]
-					goOn = true
-				}
-			}
-			for _, tag := range badSuffix {
-				if strings.HasSuffix(str, tag) {
-					str = str[:len(str)-len(tag)]
-					goOn = true
-				}
-			}
-		}
+	if HasSpaceOrHyphen(str) {
+		flds := strings.Fields(str)
+		sort.Slice(flds, func(i, j int) bool { return flds[i] < flds[j] })
+		str = strings.Join(flds, " ")
+		str = strings.Replace(str, "-", " ", -1)
+		str = CompressRunsOfSpaces(str)
+		str = strings.TrimRight(str, ".?:")
 	}
 
 	return str
-}
-
-func HasBadAccent(str string) bool {
-
-	for _, ch := range str {
-		if ch <= 127 {
-			continue
-		}
-		// quick min-to-max check for additional characters to treat as accents
-		if ch >= '\u00D8' && ch <= '\u02BC' {
-			return true
-		} else if ch >= '\uFB00' && ch <= '\uFB06' {
-			return true
-		}
-	}
-
-	return false
-}
-
-func FixBadAccent(str string) string {
-
-	var buffer strings.Builder
-
-	for _, ch := range str {
-		if ch > 127 {
-			if ch >= '\u00D8' && ch <= '\u02BC' {
-				rn, ok := accentRunes[ch]
-				if ok {
-					buffer.WriteRune(rn)
-					continue
-				}
-				st, ok := ligatureRunes[ch]
-				if ok {
-					buffer.WriteString(st)
-					continue
-				}
-			}
-			if ch >= '\uFB00' && ch <= '\uFB06' {
-				st, ok := ligatureRunes[ch]
-				if ok {
-					buffer.WriteString(st)
-					continue
-				}
-			}
-		}
-		buffer.WriteRune(ch)
-	}
-
-	return buffer.String()
-}
-
-var (
-	tlock sync.Mutex
-	tform transform.Transformer
-)
-
-func DoAccentTransform(str string) string {
-
-	// transformer not reentrant, protected by mutex
-	tlock.Lock()
-
-	defer tlock.Unlock()
-
-	if tform == nil {
-		tform = transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
-	}
-
-	if tform != nil {
-
-		var arry []string
-
-		// split long string into words to avoid transform short internal buffer error
-		terms := strings.Fields(str)
-
-		for _, item := range terms {
-
-			// remove accents from single word
-			tmp, _, err := transform.String(tform, item)
-			if err == nil {
-				// collect transformed result
-				arry = append(arry, tmp)
-			} else {
-				fmt.Fprintf(os.Stderr, "%s\n", err.Error())
-			}
-		}
-
-		// reconstruct string from transformed words
-		str = strings.Join(arry, " ")
-	}
-
-	// look for characters not in current external runes conversion table
-	if HasBadAccent(str) {
-		str = FixBadAccent(str)
-	}
-
-	return str
-}
-
-func UnicodeToASCII(str string) string {
-
-	var buffer strings.Builder
-
-	for _, ch := range str {
-		if ch > 127 {
-			s := strconv.QuoteToASCII(string(ch))
-			s = strings.ToUpper(s[3:7])
-			for {
-				if !strings.HasPrefix(s, "0") {
-					break
-				}
-				s = s[1:]
-			}
-			buffer.WriteString("&#x")
-			buffer.WriteString(s)
-			buffer.WriteRune(';')
-			continue
-		}
-		buffer.WriteRune(ch)
-	}
-
-	return buffer.String()
-}
-
-func HasGreek(str string) bool {
-
-	for _, ch := range str {
-		if ch <= 127 {
-			continue
-		}
-		// quick min-to-max check for Greek characters to convert to english words
-		if ch >= '\u03B1' && ch <= '\u03C9' {
-			return true
-		} else if ch >= '\u0391' && ch <= '\u03A9' {
-			return true
-		} else if ch >= '\u03D1' && ch <= '\u03D6' {
-			return true
-		} else if ch >= '\u03F0' && ch <= '\u03F5' {
-			return true
-		} else if ch == '\u0190' || ch == '\u025B' {
-			return true
-		}
-	}
-
-	return false
 }
 
 func SpellGreek(str string) string {
@@ -1835,16 +2378,65 @@ func SpellGreek(str string) string {
 	return buffer.String()
 }
 
-func RemoveHyphenFromPrefix(str string) string {
+func SplitInTwoAt(str, chr string, side SideType) (string, string) {
+
+	slash := strings.SplitN(str, chr, 2)
+	if len(slash) > 1 {
+		return slash[0], slash[1]
+	}
+
+	if side == LEFT {
+		return str, ""
+	}
+
+	return "", str
+}
+
+func TightenParentheses(str string) string {
+
+	if len(str) < 2 {
+		return str
+	}
+
+	var (
+		buffer strings.Builder
+		prev   rune
+	)
+
+	for _, ch := range str {
+		if prev == '(' && ch == ' ' {
+			ch = '('
+		} else if prev == ' ' && ch == ')' {
+			ch = ')'
+		} else if prev != 0 {
+			buffer.WriteRune(prev)
+		}
+		prev = ch
+	}
+
+	buffer.WriteRune(prev)
+
+	return buffer.String()
+}
+
+func UnicodeToASCII(str string) string {
 
 	var buffer strings.Builder
 
-	for i, ch := range str {
-		if ch == '-' {
-			_, ok := hyphenatedPrefixes[str[0:i]]
-			if ok {
-				continue
+	for _, ch := range str {
+		if ch > 127 {
+			s := strconv.QuoteToASCII(string(ch))
+			s = strings.ToUpper(s[3:7])
+			for {
+				if !strings.HasPrefix(s, "0") {
+					break
+				}
+				s = s[1:]
 			}
+			buffer.WriteString("&#x")
+			buffer.WriteString(s)
+			buffer.WriteRune(';')
+			continue
 		}
 		buffer.WriteRune(ch)
 	}
@@ -1852,559 +2444,187 @@ func RemoveHyphenFromPrefix(str string) string {
 	return buffer.String()
 }
 
-func RemoveAllPrefixHyphens(str string) string {
+// READ XML INPUT FILE INTO CHANNEL OF TRIMMED BLOCKS
 
-	var arry []string
-
-	terms := strings.Fields(str)
-
-	for _, item := range terms {
-
-		item = RemoveHyphenFromPrefix(item)
-		arry = append(arry, item)
-	}
-
-	// reconstruct string from transformed words
-	str = strings.Join(arry, " ")
-
-	return str
-}
-
-var plock sync.RWMutex
-
-func IsStopWord(str string) bool {
-
-	plock.RLock()
-	isSW := isStopWord[str]
-	plock.RUnlock()
-
-	return isSW
-}
-
-func ParseIndex(indx string) *Find {
-
-	if indx == "" {
-		return &Find{}
-	}
-
-	// parse parent/element@attribute^version index
-	prnt, match := SplitInTwoAt(indx, "/", RIGHT)
-	match, versn := SplitInTwoAt(match, "^", LEFT)
-	match, attrib := SplitInTwoAt(match, "@", LEFT)
-
-	return &Find{Index: indx, Parent: prnt, Match: match, Attrib: attrib, Versn: versn}
-}
-
-func CleanupContents(str string, ascii, amper, mixed bool) string {
-
-	if DoCompress {
-		if !AllowEmbed {
-			if ascii && HasBadSpace(str) {
-				str = CleanupBadSpaces(str)
-			}
-		}
-		if HasAdjacentSpacesOrNewline(str) {
-			str = CompressRunsOfSpaces(str)
-		}
-	}
-	if DoUnicode {
-		if ascii && HasUnicodeMarkup(str) {
-			str = RepairUnicodeMarkup(str, UnicodeFix)
-		}
-	}
-	if AllowEmbed {
-		if amper {
-			str = RepairEncodedMarkup(str)
-		}
-	}
-	if DoScript {
-		if mixed && HasAngleBracket(str) {
-			str = RepairScriptMarkup(str, ScriptFix)
-		}
-	}
-	if DoMathML {
-		if mixed && HasAngleBracket(str) {
-			str = RepairMathMLMarkup(str, MathMLFix)
-		}
-	}
-	if DoStrict {
-		if mixed || amper {
-			if HasAngleBracket(str) {
-				str = RemoveEmbeddedMarkup(str)
-			}
-		}
-		if ascii && HasBadSpace(str) {
-			str = CleanupBadSpaces(str)
-		}
-		if HasAdjacentSpaces(str) {
-			str = CompressRunsOfSpaces(str)
-		}
-	}
-	if DoMixed {
-		if mixed {
-			str = DoTrimFlankingHTML(str)
-		}
-		if ascii && HasBadSpace(str) {
-			str = CleanupBadSpaces(str)
-		}
-		if HasAdjacentSpaces(str) {
-			str = CompressRunsOfSpaces(str)
-		}
-	}
-	if DeAccent {
-		if ascii {
-			str = DoAccentTransform(str)
-		}
-	}
-	if DoASCII {
-		if ascii {
-			str = UnicodeToASCII(str)
-		}
-	}
-
-	if HasFlankingSpace(str) {
-		str = strings.TrimSpace(str)
-	}
-
-	return str
-}
-
-var (
-	rlock sync.Mutex
-	qfix  *strings.Replacer
-)
-
-func ProtectSpecialTerms(str string) string {
-
-	// NewReplacer not reentrant (?), protected by mutex
-	rlock.Lock()
-
-	defer rlock.Unlock()
-
-	if qfix == nil {
-		// handles biologically important terms that would otherwise be dropped from index
-		qfix = strings.NewReplacer(
-			" 5' ", " 5_prime ",
-			" 5'-", " 5_prime ",
-			" 3' ", " 3_prime ",
-			" 3'-", " 3_prime ",
-			" b cell ", " b_cell ",
-			" b-cell ", " b_cell ",
-			" t cell ", " t_cell ",
-			" t-cell ", " t_cell ",
-			" il 1", " il_1",
-			" il 2", " il_2",
-			" il 3", " il_3",
-			" il 4", " il_4",
-			" il 5", " il_5",
-			" il 6", " il_6",
-			" il 7", " il_7",
-			" il 8", " il_8",
-			" il 9", " il_9",
-			" il-1", " il_1",
-			" il-2", " il_2",
-			" il-3", " il_3",
-			" il-4", " il_4",
-			" il-5", " il_5",
-			" il-6", " il_6",
-			" il-7", " il_7",
-			" il-8", " il_8",
-			" il-9", " il_9",
-			" interleukin 1", " interleukin_1",
-			" interleukin 2", " interleukin_2",
-			" interleukin 3", " interleukin_3",
-			" interleukin 4", " interleukin_4",
-			" interleukin 5", " interleukin_5",
-			" interleukin 6", " interleukin_6",
-			" interleukin 7", " interleukin_7",
-			" interleukin 8", " interleukin_8",
-			" interleukin 9", " interleukin_9",
-			" interleukin-1", " interleukin_1",
-			" interleukin-2", " interleukin_2",
-			" interleukin-3", " interleukin_3",
-			" interleukin-4", " interleukin_4",
-			" interleukin-5", " interleukin_5",
-			" interleukin-6", " interleukin_6",
-			" interleukin-7", " interleukin_7",
-			" interleukin-8", " interleukin_8",
-			" interleukin-9", " interleukin_9",
-		)
-	}
-
-	// must do after lower casing and removing underscores, but before removing hyphens
-	if qfix != nil {
-
-		str = CompressRunsOfSpaces(str)
-		str = strings.TrimSpace(str)
-
-		str = " " + str + " "
-
-		str = qfix.Replace(str)
-
-		str = CompressRunsOfSpaces(str)
-		str = strings.TrimSpace(str)
-	}
-
-	return str
-}
-
-func PrepareQuery(str string) string {
-
-	if str == "" {
-		return ""
-	}
-
-	// cleanup string
-	if IsNotASCII(str) {
-		if HasGreek(str) {
-			str = SpellGreek(str)
-		}
-		str = DoAccentTransform(str)
-		if HasUnicodeMarkup(str) {
-			str = RepairUnicodeMarkup(str, SPACE)
-		}
-	}
-
-	if HasAmpOrNotASCII(str) {
-		str = html.UnescapeString(str)
-	}
-
-	if HasBadSpace(str) {
-		str = CleanupBadSpaces(str)
-	}
-	if HasAngleBracket(str) {
-		str = RepairEncodedMarkup(str)
-		str = RepairScriptMarkup(str, SPACE)
-		str = RepairMathMLMarkup(str, SPACE)
-		str = RemoveEmbeddedMarkup(str)
-	}
-
-	str = strings.Replace(str, "~ ~", "~~", -1)
-	str = strings.Replace(str, "~ ~", "~~", -1)
-
-	str = strings.Replace(str, " AND ", " & ", -1)
-	str = strings.Replace(str, " OR ", " | ", -1)
-	str = strings.Replace(str, " NOT ", " ! ", -1)
-
-	str = strings.Replace(str, "(", " ( ", -1)
-	str = strings.Replace(str, ")", " ) ", -1)
-	str = strings.Replace(str, "&", " & ", -1)
-	str = strings.Replace(str, "|", " | ", -1)
-	str = strings.Replace(str, "!", " ! ", -1)
-
-	str = strings.ToLower(str)
-
-	str = strings.Replace(str, "_", " ", -1)
-
-	// must do after lower casing and removing underscores, but before removing hyphens
-	str = ProtectSpecialTerms(str)
-
-	str = RemoveAllPrefixHyphens(str)
-
-	str = strings.Replace(str, "-", " ", -1)
-
-	// break terms at punctuation, and at non-ASCII characters, allowing Boolean control symbols, along with
-	// underscore for protected terms, asterisk to indicate truncation wildcard, tilde for maximum proximity,
-	// plus sign for exactly one wildcard word, and dollar sign to do stemming and then wildcard truncation
-	terms := strings.FieldsFunc(str, func(c rune) bool {
-		return (!unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '_' && c != '*' && c != '~' &&
-			c != '+' && c != '$' && c != '&' && c != '|' && c != '!' && c != '(' && c != ')') || c > 127
-	})
-
-	// rejoin into processed sentence
-	tmp := strings.Join(terms, " ")
-
-	tmp = CompressRunsOfSpaces(tmp)
-	tmp = strings.TrimSpace(tmp)
-
-	return tmp
-}
-
-func PartitionQuery(str string) []string {
-
-	if str == "" {
-		return nil
-	}
-
-	str = CompressRunsOfSpaces(str)
-	str = strings.TrimSpace(str)
-
-	str = " " + str + " "
-
-	// flank all operators with caret
-	str = strings.Replace(str, " ( ", " ^ ( ^ ", -1)
-	str = strings.Replace(str, " ) ", " ^ ) ^ ", -1)
-	str = strings.Replace(str, " & ", " ^ & ^ ", -1)
-	str = strings.Replace(str, " | ", " ^ | ^ ", -1)
-	str = strings.Replace(str, " ! ", " ^ ! ^ ", -1)
-	str = strings.Replace(str, " ~", " ^ ~", -1)
-	str = strings.Replace(str, "~ ", "~ ^ ", -1)
-
-	str = CompressRunsOfSpaces(str)
-	str = strings.TrimSpace(str)
-
-	str = strings.Replace(str, "^ ^", "^", -1)
-
-	if strings.HasPrefix(str, "^ ") {
-		str = str[2:]
-	}
-	if strings.HasSuffix(str, " ^") {
-		max := len(str)
-		str = str[:max-2]
-	}
-
-	// split into non-broken phrase segments or operator symbols
-	tmp := strings.Split(str, " ^ ")
-
-	return tmp
-}
-
-func MarkStopWords(str string) string {
-
-	if str == "" {
-		return ""
-	}
-
-	var chain []string
-
-	terms := strings.Fields(str)
-
-	// replace unwanted and stop words with plus sign
-	for _, item := range terms {
-
-		if item == "~" {
-			// allow tilde proximity indicator
-			chain = append(chain, item)
-			continue
-		}
-
-		if len(item) < 2 {
-			// skip a single character
-			chain = append(chain, "+")
-			continue
-		}
-
-		if IsAllDigitsOrPeriod(item) {
-			// skip terms that are all digits
-			chain = append(chain, "+")
-			continue
-		}
-
-		if DeStop && IsStopWord(item) {
-			// skip if stop word, breaking phrase chain
-			chain = append(chain, "+")
-			continue
-		}
-		if DoStem && !strings.HasSuffix(item, "*") {
-			// apply stemming algorithm
-			item = porter2.Stem(item)
-			item = strings.TrimSpace(item)
-		}
-
-		// record single term
-		chain = append(chain, item)
-	}
-
-	// rejoin into processed sentence
-	tmp := strings.Join(chain, " ")
-
-	tmp = strings.Replace(tmp, "+ +", "++", -1)
-	tmp = strings.Replace(tmp, "+ +", "++", -1)
-
-	tmp = CompressRunsOfSpaces(tmp)
-	tmp = strings.TrimSpace(tmp)
-
-	return tmp
-}
-
-func MarkClauses(clauses []string) []string {
-
-	var res []string
-
-	if clauses == nil {
-		return nil
-	}
-
-	for _, str := range clauses {
-
-		// pass control symbols or angle bracket content delimiters unchanged
-		if str == "(" || str == ")" || str == "&" || str == "|" || str == "!" || str == "~" || str == "<" || str == ">" {
-			res = append(res, str)
-			continue
-		}
-
-		// process clause, using plus sign to break runs of words
-		tmp := MarkStopWords(str)
-		res = append(res, tmp)
-	}
-
-	return res
-}
-
-// READ XML INPUT FILE INTO SET OF BLOCKS
-
-type XMLReader struct {
-	Reader    io.Reader
-	Buffer    []byte
-	Remainder string
-	Position  int64
-	Delta     int
-	Closed    bool
-}
-
-func NewXMLReader(in io.Reader) *XMLReader {
+func CreateReader(in io.Reader) <-chan string {
 
 	if in == nil {
 		return nil
 	}
 
-	rdr := &XMLReader{Reader: in}
-
-	// 65536 appears to be the maximum number of characters presented to io.Reader when input is piped from stdin
-	// increasing size of buffer when input is from a file does not improve program performance
-	// additional 16384 bytes are reserved for copying previous remainder to start of buffer before next read
-	const XMLBUFSIZE = 65536 + 16384
-
-	rdr.Buffer = make([]byte, XMLBUFSIZE)
-
-	return rdr
-}
-
-// NextBlock reads buffer, concatenates if necessary to place long element content into a single string
-// all result strings end in > character that is used as a sentinel in subsequent code
-func (rdr *XMLReader) NextBlock() string {
-
-	if rdr == nil {
-		return ""
+	out := make(chan string, ChanDepth)
+	if out == nil {
+		fmt.Fprintf(os.Stderr, "\nERROR: Unable to create block reader channel\n")
+		os.Exit(1)
 	}
 
-	// read one buffer, trim at last > and retain remainder for next call, signal if no > character
-	nextBuffer := func() (string, bool, bool) {
+	// xmlReader sends XML blocks through channel
+	xmlReader := func(in io.Reader, out chan<- string) {
 
-		if rdr.Closed {
-			return "", false, true
-		}
+		// close channel when all blocks have been processed
+		defer close(out)
 
-		// prepend previous remainder to beginning of buffer
-		m := copy(rdr.Buffer, rdr.Remainder)
-		rdr.Remainder = ""
-		if m > 16384 {
-			// previous remainder is larger than reserved section, write and signal need to continue reading
-			return string(rdr.Buffer[:m]), true, false
-		}
+		// 65536 appears to be the maximum number of characters presented to io.Reader when input is piped from stdin
+		// increasing size of buffer when input is from a file does not improve program performance
+		// additional 16384 bytes are reserved for copying previous remainder to start of buffer before next read
+		const XMLBUFSIZE = 65536 + 16384
 
-		// read next block, append behind copied remainder from previous read
-		n, err := rdr.Reader.Read(rdr.Buffer[m:])
-		// with data piped through stdin, read function may not always return the same number of bytes each time
-		if err != nil {
-			if err != io.EOF {
-				// real error
-				fmt.Fprintf(os.Stderr, "\nERROR: %s\n", err.Error())
-				// Ignore bytes - non-conforming implementations of io.Reader may returned mangled data on non-EOF errors
-				rdr.Closed = true
-				return "", false, true
+		Buffer := make([]byte, XMLBUFSIZE)
+		Remainder := ""
+		Position := int64(0)
+		Delta := 0
+		Closed := false
+
+		// read one buffer, trim at last > and retain remainder for next call, signal if no > character
+		nextBuffer := func() ([]byte, bool, bool) {
+
+			if Closed {
+				return nil, false, true
 			}
-			// end of file
-			rdr.Closed = true
-			if n == 0 {
-				// if EOF and no more data, do not send final remainder (not terminated by right angle bracket that is used as a sentinel)
-				return "", false, true
+
+			// prepend previous remainder to beginning of buffer
+			m := copy(Buffer, Remainder)
+			Remainder = ""
+			if m > 16384 {
+				// previous remainder is larger than reserved section, write and signal need to continue reading
+				return Buffer[:m], true, false
 			}
-		}
-		if n < 0 {
-			// Reality check - non-conforming implementations of io.Reader may return -1
-			fmt.Fprintf(os.Stderr, "\nERROR: io.Reader returned negative count %d\n", n)
-			// treat as n == 0 in order to update file offset and avoid losing previous remainder
-			n = 0
-		}
 
-		// keep track of file offset
-		rdr.Position += int64(rdr.Delta)
-		rdr.Delta = n
-
-		// slice of actual characters read
-		bufr := rdr.Buffer[:n+m]
-
-		// look for last > character
-		// safe to back up on UTF-8 rune array when looking for 7-bit ASCII character
-		pos := -1
-		for pos = len(bufr) - 1; pos >= 0; pos-- {
-			if bufr[pos] == '>' {
-				if AllowEmbed {
-					// optionally skip backwards past embedded i, b, u, sub, and sup HTML open, close, and empty tags, and MathML
-					if HTMLBehind(bufr, pos) {
-						continue
-					}
+			// read next block, append behind copied remainder from previous read
+			n, err := in.Read(Buffer[m:])
+			// with data piped through stdin, read function may not always return the same number of bytes each time
+			if err != nil {
+				if err != io.EOF {
+					// real error
+					fmt.Fprintf(os.Stderr, "\nERROR: %s\n", err.Error())
+					// Ignore bytes - non-conforming implementations of io.Reader may returned mangled data on non-EOF errors
+					Closed = true
+					return nil, false, true
 				}
-				// found end of XML tag, break
-				break
+				// end of file
+				Closed = true
+				if n == 0 {
+					// if EOF and no more data, do not send final remainder (not terminated by right angle bracket that is used as a sentinel)
+					return nil, false, true
+				}
 			}
+			if n < 0 {
+				// Reality check - non-conforming implementations of io.Reader may return -1
+				fmt.Fprintf(os.Stderr, "\nERROR: io.Reader returned negative count %d\n", n)
+				// treat as n == 0 in order to update file offset and avoid losing previous remainder
+				n = 0
+			}
+
+			// keep track of file offset
+			Position += int64(Delta)
+			Delta = n
+
+			// slice of actual characters read
+			bufr := Buffer[:n+m]
+
+			// look for last > character
+			// safe to back up on UTF-8 rune array when looking for 7-bit ASCII character
+			pos := -1
+			for pos = len(bufr) - 1; pos >= 0; pos-- {
+				if bufr[pos] == '>' {
+					if DoStrict {
+						// optionally skip backwards past embedded i, b, u, sub, and sup HTML open, close, and empty tags, and MathML
+						if HTMLBehind(bufr, pos, len(bufr)) {
+							continue
+						}
+					}
+					// found end of XML tag, break
+					break
+				}
+			}
+
+			// trim back to last > character, save remainder for next buffer
+			if pos > -1 {
+				pos++
+				Remainder = string(bufr[pos:])
+				return bufr[:pos], false, false
+			}
+
+			// no > found, signal need to continue reading long content
+			return bufr[:], true, false
 		}
 
-		// trim back to last > character, save remainder for next buffer
-		if pos > -1 {
-			pos++
-			rdr.Remainder = string(bufr[pos:])
-			return string(bufr[:pos]), false, false
-		}
+		// nextBlock reads buffer, concatenates if necessary to place long element content into a single string
+		// all result strings end in > character that is used as a sentinel in subsequent code
+		nextBlock := func() string {
 
-		// no > found, signal need to continue reading long content
-		return string(bufr[:]), true, false
-	}
+			// read next buffer
+			line, cont, closed := nextBuffer()
 
-	// read next buffer
-	line, cont, closed := nextBuffer()
-
-	if closed {
-		// no sentinel in remainder at end of file
-		return ""
-	}
-
-	// if buffer does not end with > character
-	if cont {
-		var buff strings.Builder
-
-		// keep reading long content blocks
-		for {
-			if line != "" {
-				buff.WriteString(line)
-			}
-			if !cont {
-				// last buffer ended with sentinel
-				break
-			}
-			line, cont, closed = nextBuffer()
 			if closed {
-				// no sentinel in multi-block buffer at end of file
+				// no sentinel in remainder at end of file
 				return ""
 			}
+
+			// if buffer does not end with > character
+			if cont {
+				var buff bytes.Buffer
+
+				// keep reading long content blocks
+				for {
+					if len(line) > 0 {
+						buff.Write(line)
+					}
+					if !cont {
+						// last buffer ended with sentinel
+						break
+					}
+					line, cont, closed = nextBuffer()
+					if closed {
+						// no sentinel in multi-block buffer at end of file
+						return ""
+					}
+				}
+
+				// concatenate blocks
+				return buff.String()
+			}
+
+			return string(line)
 		}
 
-		// concatenate blocks
-		line = buff.String()
+		// read XML and send blocks through channel
+		for {
+			str := nextBlock()
+
+			// trimming spaces here would throw off line tracking
+
+			// optionally compress/cleanup tags/attributes and contents (undocumented)
+			if DoCleanup {
+				if HasBadSpace(str) {
+					str = CleanupBadSpaces(str)
+				}
+				if HasAdjacentSpaces(str) {
+					str = CompressRunsOfSpaces(str)
+				}
+			}
+
+			out <- str
+
+			// bail after sending empty string sentinel
+			if str == "" {
+				return
+			}
+		}
 	}
 
-	// trimming spaces here would throw off line tracking
+	// launch single block reader goroutine
+	go xmlReader(in, out)
 
-	// optionally compress/cleanup tags/attributes and contents (undocumented)
-	if DoCleanup {
-		if HasBadSpace(line) {
-			line = CleanupBadSpaces(line)
-		}
-		if HasAdjacentSpaces(line) {
-			line = CompressRunsOfSpaces(line)
-		}
-	}
-
-	return line
+	return out
 }
 
 // PARSE XML BLOCK STREAM INTO STRINGS FROM <PATTERN> TO </PATTERN>
 
 // PartitionPattern splits XML input by pattern and sends individual records to a callback
-func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, string)) {
+func PartitionPattern(pat, star string, inp <-chan string, proc func(string)) {
 
-	if pat == "" || rdr == nil || proc == nil {
+	if pat == "" || inp == nil || proc == nil {
 		return
 	}
 
@@ -2445,7 +2665,7 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 	isAnElement := func(text string, lf, rt, mx int) bool {
 
 		if (lf >= 0 && text[lf] == '<') || (lf > 0 && text[lf] == '/' && text[lf-1] == '<') {
-			if (rt < mx && (text[rt] == '>' || text[rt] == ' ')) || (rt+1 < mx && text[rt] == '/' && text[rt+1] == '>') {
+			if (rt < mx && (text[rt] == '>' || text[rt] == ' ' || text[rt] == '\n')) || (rt+1 < mx && text[rt] == '/' && text[rt+1] == '>') {
 				return true
 			}
 		}
@@ -2509,10 +2729,10 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 	)
 
 	// find next element with pattern name
-	nextPattern := func(scr *Scanner, text string, pos int) (PatternType, int, int) {
+	nextPattern := func(scr *Scanner, text string, pos int) (PatternType, int, int, int) {
 
 		if scr == nil || text == "" {
-			return NOPATTERN, 0, 0
+			return NOPATTERN, 0, 0, 0
 		}
 
 		prev := pos
@@ -2520,17 +2740,17 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 		for {
 			next, start, stop := findNextMatch(scr, text, prev)
 			if next < 0 {
-				return NOPATTERN, 0, 0
+				return NOPATTERN, 0, 0, 0
 			}
 
 			prev = next + 1
 
 			if text[start+1] == '/' {
-				return STOPPATTERN, stop, prev
+				return STOPPATTERN, start, stop, prev
 			} else if text[stop-2] == '/' {
-				return SELFPATTERN, start, prev
+				return SELFPATTERN, start, stop, prev
 			} else {
-				return STARTPATTERN, start, prev
+				return STARTPATTERN, start, stop, prev
 			}
 		}
 	}
@@ -2549,12 +2769,9 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 		var accumulator strings.Builder
 
 		match := NOPATTERN
-		pos := 0
+		start := 0
+		stop := 0
 		next := 0
-
-		offset := int64(0)
-
-		rec := 0
 
 		scr := newScanner(pat)
 		if scr == nil {
@@ -2566,35 +2783,39 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 			begin = 0
 			next = 0
 
-			line = rdr.NextBlock()
+			line = <-inp
 			if line == "" {
 				return
 			}
 
 			for {
-				match, pos, next = nextPattern(scr, line, next)
+				match, start, stop, next = nextPattern(scr, line, next)
 				if match == STARTPATTERN {
 					if level == 0 {
 						inPattern = true
-						begin = pos
-						offset = rdr.Position + int64(pos)
+						begin = start
 					}
 					level++
 				} else if match == STOPPATTERN {
 					level--
 					if level == 0 {
 						inPattern = false
-						accumulator.WriteString(line[begin:pos])
+						accumulator.WriteString(line[begin:stop])
 						// read and process one -pattern object at a time
 						str := accumulator.String()
 						if str != "" {
-							rec++
-							proc(rec, offset, str[:])
+							proc(str[:])
 						}
 						// reset accumulator
 						accumulator.Reset()
 					}
 				} else if match == SELFPATTERN {
+					if level == 0 {
+						str := line[start:stop]
+						if str != "" {
+							proc(str[:])
+						}
+					}
 				} else {
 					if inPattern {
 						accumulator.WriteString(line[begin:])
@@ -2620,12 +2841,9 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 		var accumulator strings.Builder
 
 		match := NOPATTERN
-		pos := 0
+		start := 0
+		stop := 0
 		next := 0
-
-		offset := int64(0)
-
-		rec := 0
 
 		scr := newScanner(pat)
 		if scr == nil {
@@ -2639,12 +2857,12 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 
 			next = 0
 
-			line = rdr.NextBlock()
+			line = <-inp
 			if line == "" {
 				break
 			}
 
-			match, pos, next = nextPattern(scr, line, next)
+			match, start, stop, next = nextPattern(scr, line, next)
 			if match == STARTPATTERN {
 				break
 			}
@@ -2693,7 +2911,7 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 				begin = 0
 				next = 0
 
-				line = rdr.NextBlock()
+				line = <-inp
 				if line == "" {
 					break
 				}
@@ -2712,18 +2930,18 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 				}
 				last = pat
 				// confirm end </pattern> just found
-				match, pos, next = nextPattern(scr, line, next)
+				match, start, stop, next = nextPattern(scr, line, next)
 				if match != STOPPATTERN {
 					return
 				}
 				// now look for a new start <pattern> tag
 				for {
-					match, pos, next = nextPattern(scr, line, next)
+					match, start, stop, next = nextPattern(scr, line, next)
 					if match == STARTPATTERN {
 						break
 					}
 					next = 0
-					line = rdr.NextBlock()
+					line = <-inp
 					if line == "" {
 						break
 					}
@@ -2744,28 +2962,33 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 			}
 
 			for {
-				match, pos, next = nextPattern(scr, line, next)
+				match, start, stop, next = nextPattern(scr, line, next)
 				if match == STARTPATTERN {
 					if level == 0 {
 						inPattern = true
-						begin = pos
-						offset = rdr.Position + int64(pos)
+						begin = start
 					}
 					level++
 				} else if match == STOPPATTERN {
 					level--
 					if level == 0 {
 						inPattern = false
-						accumulator.WriteString(line[begin:pos])
+						accumulator.WriteString(line[begin:stop])
 						// read and process one -pattern/* object at a time
 						str := accumulator.String()
 						if str != "" {
-							rec++
-							proc(rec, offset, str[:])
+							proc(str[:])
 						}
 						// reset accumulator
 						accumulator.Reset()
 						break
+					}
+				} else if match == SELFPATTERN {
+					if level == 0 {
+						str := line[start:stop]
+						if str != "" {
+							proc(str[:])
+						}
 					}
 				} else {
 					if inPattern {
@@ -2775,7 +2998,7 @@ func PartitionPattern(pat, star string, rdr *XMLReader, proc func(int, int64, st
 					begin = 0
 					next = 0
 
-					line = rdr.NextBlock()
+					line = <-inp
 					if line == "" {
 						break
 					}
@@ -2805,8 +3028,15 @@ func ParseAttributes(attrb string) []string {
 
 	// count equal signs
 	num := 0
+	inQuote := false
+
 	for i := 0; i < attlen; i++ {
-		if attrb[i] == '=' {
+		ch := attrb[i]
+		if ch == '"' || ch == '\'' {
+			// "
+			inQuote = !inQuote
+		}
+		if ch == '=' && !inQuote {
 			num += 2
 		}
 	}
@@ -2823,29 +3053,51 @@ func ParseAttributes(attrb string) []string {
 	start := 0
 	idx := 0
 	itm := 0
+	inQuote = false
 
 	// place tag and value in successive array slots
 	for idx < attlen && itm < num {
 		ch := attrb[idx]
-		if ch == '=' {
+		if ch == '"' || ch == '\'' {
+			// "
+			inQuote = !inQuote
+		}
+		if ch == '=' && !inQuote {
+			inQuote = true
 			// skip past possible leading blanks
 			for start < attlen {
 				ch = attrb[start]
-				if ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r' || ch == '\f' {
+				if InBlank[ch] {
 					start++
 				} else {
 					break
 				}
 			}
 			// =
-			arry[itm] = attrb[start:idx]
+			arry[itm] = strings.TrimSpace(attrb[start:idx])
 			itm++
-			// skip past equal sign and leading double quote
-			idx += 2
+			// skip past equal sign
+			idx++
+			ch = attrb[idx]
+			if ch != '"' && ch != '\'' {
+				// "
+				// skip past unexpected blanks
+				for InBlank[ch] {
+					idx++
+					ch = attrb[idx]
+				}
+				if ch != '"' && ch != '\'' {
+					// "
+					fmt.Fprintf(os.Stderr, "\nAttribute in '%s' missing double quote\n", attrb)
+				}
+			}
+			// skip past leading double quote
+			idx++
 			start = idx
-		} else if ch == '"' {
+		} else if ch == '"' || ch == '\'' {
 			// "
-			arry[itm] = attrb[start:idx]
+			inQuote = false
+			arry[itm] = strings.TrimSpace(attrb[start:idx])
 			itm++
 			// skip past trailing double quote and (possible) space
 			idx += 2
@@ -2858,78 +3110,148 @@ func ParseAttributes(attrb string) []string {
 	return arry
 }
 
-// ParseXML calls XML parser on a partitioned string, optimized for maximum processing speed
-func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, string) {
+// ParseXML calls XML parser on a partitioned string, optimized for maximum processing speed,
+// or on an XML reader, sending tokens for CDATA and COMMENT sections, and optionally tracks line numbers
+func ParseXML(Text, parent string, inp <-chan string, tokens func(Token), find *Find, ids func(string)) (*Node, string) {
 
-	if Text == "" {
+	if Text == "" && (inp == nil || tokens == nil) {
 		return nil, ""
-	}
-
-	// node farm variables
-	FarmPos := 0
-	FarmMax := FarmSize
-	FarmItems := make([]Node, FarmMax)
-
-	// allocate multiple nodes in a large array for memory management efficiency
-	nextNode := func(strt, attr, prnt string) *Node {
-
-		// if farm array slots used up, allocate new array
-		if FarmPos >= FarmMax {
-			FarmItems = make([]Node, FarmMax)
-			FarmPos = 0
-		}
-
-		if FarmItems == nil {
-			return nil
-		}
-
-		// take node from next available slot in farm array
-		node := &FarmItems[FarmPos]
-
-		node.Name = strt[:]
-		node.Attributes = attr[:]
-		node.Parent = prnt[:]
-
-		FarmPos++
-
-		return node
 	}
 
 	// token parser variables
 	Txtlen := len(Text)
 	Idx := 0
 
+	// line tracking variables
+	Line := 1
+	Lag := 0
+
+	// variables to track COMMENT or CDATA sections that span reader blocks
+	Which := NOTAG
+	SkipTo := ""
+
+	updateLineCount := func(max int) {
+		// count lines
+		for i := Lag; i < max; i++ {
+			if Text[i] == '\n' {
+				Line++
+			}
+		}
+		Lag = Idx
+	}
+
+	// calculate for warning messages, do not update Line or Lag variables
+	currentLineCount := func(max int) int {
+		line := Line
+		for i := Lag; i < max; i++ {
+			if Text[i] == '\n' {
+				line++
+			}
+		}
+		return line
+	}
+
 	// get next XML token
 	nextToken := func(idx int) (TagType, ContentType, string, string, int) {
 
 		if Text == "" {
-			// signal end of XML data
-			return ISCLOSED, NONE, "", "", 0
+			// buffer is empty
+			if inp != nil {
+				// read next block if available
+				Text = <-inp
+				Txtlen = len(Text)
+				Idx = 0
+				idx = 0
+				Lag = 0
+			}
+
+			if Text == "" {
+				// signal end of XML data
+				return ISCLOSED, NONE, "", "", 0
+			}
+
+			if Which != NOTAG && SkipTo != "" {
+				// previous block ended inside CDATA object or COMMENT
+				text := Text[:]
+				txtlen := Txtlen
+				which := Which
+				start := idx
+				found := strings.Index(text[idx:], SkipTo)
+				if found < 0 {
+					// no stop signal found in next block
+					str := text[start:]
+					if HasFlankingSpace(str) {
+						str = strings.TrimSpace(str)
+					}
+
+					if CountLines {
+						updateLineCount(txtlen)
+					}
+
+					// signal end of current block
+					Text = ""
+
+					// leave Which and SkipTo values unchanged as another continuation signal
+					// send CDATA or COMMENT contents
+					return which, NONE, str[:], "", 0
+				}
+				// otherwise adjust position past end of skipTo string and return to normal processing
+				idx += found
+				str := text[start:idx]
+				if HasFlankingSpace(str) {
+					str = strings.TrimSpace(str)
+				}
+				idx += len(SkipTo)
+				// clear tracking variables
+				Which = NOTAG
+				SkipTo = ""
+				// send CDATA or COMMENT contents
+				return which, NONE, str[:], "", idx
+			}
 		}
 
 		text := Text[:]
 		txtlen := Txtlen
 
-		// XML string ends with > character, acts as sentinel to check if past end of text
+		// XML string, and all blocks, end with > character, acts as sentinel to check if past end of text
 		if idx >= txtlen {
+			if inp != nil {
+
+				if CountLines {
+					updateLineCount(txtlen)
+				}
+
+				// signal end of current block, will read next block on next call
+				Text = ""
+
+				return NOTAG, NONE, "", "", 0
+			}
+
 			// signal end of XML string
 			return ISCLOSED, NONE, "", "", 0
 		}
 
+		ctype := NONE
+
 		// skip past leading blanks
 		ch := text[idx]
-		for InBlank[ch] {
+		if InBlank[ch] {
+			ctype |= LFTSPACE
 			idx++
 			ch = text[idx]
+			for InBlank[ch] {
+				idx++
+				ch = text[idx]
+			}
 		}
 
 		start := idx
 
 		plainContent := true
 
-		if AllowEmbed && ch == '<' {
+		if DoStrict && ch == '<' {
 			// check to see if an HTML or MathML element is at the beginning of a content string
-			if HTMLAhead(text, idx) != 0 {
+			if HTMLAhead(text, idx, txtlen) != 0 {
 				plainContent = false
 			}
 		}
@@ -2955,27 +3277,43 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 
 				str := text[start:idx]
 
-				switch ch {
-				case '>':
+				if ch == '>' {
+
 					// end of element
 					idx++
 
 					return STARTTAG, NONE, str[:], "", idx
-				case '/':
+
+				} else if ch == '/' {
+
 					// self-closing element without attributes
 					idx++
 					ch = text[idx]
 					if ch != '>' {
-						fmt.Fprintf(os.Stderr, "\nSelf-closing element missing right angle bracket\n")
+						// skip past unexpected blanks
+						for InBlank[ch] {
+							idx++
+							ch = text[idx]
+						}
+						if ch != '>' {
+							fmt.Fprintf(os.Stderr, "\nSelf-closing element missing right angle bracket\n")
+						}
 					}
 					idx++
 
 					return SELFTAG, NONE, str[:], "", idx
-				case ' ', '\t', '\n', '\r', '\f':
+
+				} else if InBlank[ch] {
+
 					// attributes
 					idx++
-					start = idx
 					ch = text[idx]
+					// skip past unexpected blanks
+					for InBlank[ch] {
+						idx++
+						ch = text[idx]
+					}
+					start = idx
 					for ch != '<' && ch != '>' {
 						idx++
 						ch = text[idx]
@@ -2983,90 +3321,163 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 					if ch != '>' {
 						fmt.Fprintf(os.Stderr, "\nAttributes not followed by right angle bracket\n")
 					}
-					if text[idx-1] == '/' {
+					// walk back past trailing blanks
+					lst := idx - 1
+					ch = text[lst]
+					for InBlank[ch] && lst > start {
+						lst--
+						ch = text[lst]
+					}
+					if ch == '/' {
 						// self-closing
-						atr := text[start : idx-1]
+						atr := text[start:lst]
 						idx++
+
 						return SELFTAG, NONE, str[:], atr[:], idx
 					}
 					atr := text[start:idx]
 					idx++
+
 					return STARTTAG, NONE, str[:], atr[:], idx
-				default:
-					fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element\n", ch)
+
+				} else {
+
+					if CountLines {
+						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element, line %d\n", ch, currentLineCount(idx))
+					} else {
+						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element\n", ch)
+					}
+
 					return STARTTAG, NONE, str[:], "", idx
 				}
 
-			} else {
+				// other punctuation character immediately after first angle bracket
 
-				// punctuation character immediately after first angle bracket
-				switch ch {
-				case '/':
-					// at start of end tag
+			} else if ch == '/' {
+
+				// at start of end tag
+				idx++
+				start = idx
+				ch = text[idx]
+				// expect legal first character of element
+				if InFirst[ch] {
 					idx++
-					start = idx
 					ch = text[idx]
-					// expect legal first character of element
-					if InFirst[ch] {
+					for InElement[ch] {
 						idx++
 						ch = text[idx]
-						for InElement[ch] {
+					}
+					str := text[start:idx]
+					if ch != '>' {
+						// skip past unexpected blanks
+						for InBlank[ch] {
 							idx++
 							ch = text[idx]
 						}
-						str := text[start:idx]
 						if ch != '>' {
 							fmt.Fprintf(os.Stderr, "\nUnexpected characters after end element name\n")
 						}
-						idx++
+					}
+					idx++
 
-						return STOPTAG, NONE, str[:], "", idx
-					}
+					return STOPTAG, NONE, str[:], "", idx
+				}
+				// legal character not found after slash
+				if CountLines {
+					fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element, line %d\n", ch, currentLineCount(idx))
+				} else {
 					fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element\n", ch)
-				case '?':
-					// skip ?xml and ?processing instructions
-					idx++
-					ch = text[idx]
-					for ch != '>' {
-						idx++
-						ch = text[idx]
-					}
-					idx++
-				case '!':
-					// skip !DOCTYPE, !COMMENT, and ![CDATA[
-					idx++
-					start = idx
-					ch = text[idx]
-					which := NOTAG
-					skipTo := ""
-					if ch == '[' && strings.HasPrefix(text[idx:], "[CDATA[") {
-						which = CDATATAG
-						skipTo = "]]>"
-						start += 7
-					} else if ch == '-' && strings.HasPrefix(text[idx:], "--") {
-						which = COMMENTTAG
-						skipTo = "-->"
-						start += 2
-					}
-					if which != NOTAG && skipTo != "" {
-						// CDATA or COMMENT block may contain internal angle brackets
-						found := strings.Index(text[idx:], skipTo)
-						if found < 0 {
-							// string stops in middle of CDATA or COMMENT
-							return ISCLOSED, NONE, "", "", idx
+				}
+
+			} else if ch == '!' {
+
+				// skip !DOCTYPE, !COMMENT, and ![CDATA[
+				idx++
+				start = idx
+				ch = text[idx]
+				Which = NOTAG
+				SkipTo = ""
+				if ch == '[' && strings.HasPrefix(text[idx:], "[CDATA[") {
+					Which = CDATATAG
+					SkipTo = "]]>"
+					start += 7
+				} else if ch == '-' && strings.HasPrefix(text[idx:], "--") {
+					Which = COMMENTTAG
+					SkipTo = "-->"
+					start += 2
+				} else if ch == 'D' && strings.HasPrefix(text[idx:], "DOCTYPE") {
+					Which = DOCTYPETAG
+					SkipTo = ">"
+				}
+				if Which != NOTAG && SkipTo != "" {
+					which := Which
+					// CDATA or COMMENT block may contain internal angle brackets
+					found := strings.Index(text[idx:], SkipTo)
+					if found < 0 {
+						// string stops in middle of CDATA or COMMENT
+						if inp != nil {
+							str := text[start:]
+							if HasFlankingSpace(str) {
+								str = strings.TrimSpace(str)
+							}
+
+							if CountLines {
+								updateLineCount(txtlen)
+							}
+
+							// signal end of current block
+							Text = ""
+
+							// leave Which and SkipTo values unchanged as another continuation signal
+							// send CDATA or COMMENT contents
+							return which, NONE, str[:], "", 0
 						}
-						// adjust position past end of CDATA or COMMENT
-						idx += found + len(skipTo)
-					} else {
-						// otherwise just skip to next right angle bracket
-						for ch != '>' {
-							idx++
-							ch = text[idx]
-						}
-						idx++
+
+						return ISCLOSED, NONE, "", "", idx
 					}
+					// adjust position past end of CDATA or COMMENT
+					if inp != nil {
+						idx += found
+						str := text[start:idx]
+						if HasFlankingSpace(str) {
+							str = strings.TrimSpace(str)
+						}
+						idx += len(SkipTo)
+						// clear tracking variables
+						Which = NOTAG
+						SkipTo = ""
+						// send CDATA or COMMENT contents
+						return which, NONE, str[:], "", idx
+					}
+
+					idx += found + len(SkipTo)
 					return NOTAG, NONE, "", "", idx
-				default:
+				}
+				// otherwise just skip to next right angle bracket
+				for ch != '>' {
+					idx++
+					ch = text[idx]
+				}
+				idx++
+				return NOTAG, NONE, "", "", idx
+
+			} else if ch == '?' {
+
+				// skip ?xml and ?processing instructions
+				idx++
+				ch = text[idx]
+				for ch != '>' {
+					idx++
+					ch = text[idx]
+				}
+				idx++
+				return NOTAG, NONE, "", "", idx
+
+			} else {
+
+				if CountLines {
+					fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element, line %d\n", ch, currentLineCount(idx))
+				} else {
 					fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element\n", ch)
 				}
 			}
@@ -3112,18 +3523,21 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 						ch = text[idx]
 						continue
 					}
-					if ch == '<' {
+					if ch == '<' && DoStrict {
 						// optionally allow HTML text formatting elements and super/subscripts
-						advance := HTMLAhead(text, idx)
+						advance := HTMLAhead(text, idx, txtlen)
 						if advance > 0 {
 							idx += advance
-							ch = text[idx]
+							if idx < txtlen {
+								ch = text[idx]
+							}
 							plainContent = false
 							continue
 						}
 					}
 					break
 				}
+
 			} else {
 				for ch != '<' && ch != '>' {
 					idx++
@@ -3134,14 +3548,17 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 			// trim back past trailing blanks
 			lst := idx - 1
 			ch = text[lst]
-			for InBlank[ch] && lst > start {
+			if InBlank[ch] && lst > start {
+				ctype |= RGTSPACE
 				lst--
 				ch = text[lst]
+				for InBlank[ch] && lst > start {
+					lst--
+					ch = text[lst]
+				}
 			}
 
 			str := text[start : lst+1]
-
-			ctype := PLAIN
 
 			if AllowEmbed {
 				if !plainContent {
@@ -3161,14 +3578,45 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 		return BADTAG, NONE, "", "", idx
 	}
 
+	// node farm variables
+	FarmPos := 0
+	FarmMax := FarmSize
+	FarmItems := make([]Node, FarmMax)
+
+	// allocate multiple nodes in a large array for memory management efficiency
+	nextNode := func(strt, attr, prnt string) *Node {
+
+		// if farm array slots used up, allocate new array
+		if FarmPos >= FarmMax {
+			FarmItems = make([]Node, FarmMax)
+			FarmPos = 0
+		}
+
+		if FarmItems == nil {
+			return nil
+		}
+
+		// take node from next available slot in farm array
+		node := &FarmItems[FarmPos]
+
+		node.Name = strt[:]
+		node.Attributes = attr[:]
+		node.Parent = prnt[:]
+
+		FarmPos++
+
+		return node
+	}
+
 	// Parse tokens into tree structure for exploration
 
-	// parseLevel recursive definition
-	var parseLevel func(string, string, string) (*Node, bool)
+	// parseSpecial recursive definition
+	var parseSpecial func(string, string, string) (*Node, bool)
 
-	// parse XML tags into tree structure for searching
-	parseLevel = func(strt, attr, prnt string) (*Node, bool) {
+	// parse XML tags into tree structure for searching, no ContentMods flags set
+	parseSpecial = func(strt, attr, prnt string) (*Node, bool) {
 
+		var obj *Node
 		ok := true
 
 		// obtain next node from farm
@@ -3181,11 +3629,15 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 
 		status := START
 		for {
-			tag, ctype, name, attr, idx := nextToken(Idx)
+			tag, _, name, attr, idx := nextToken(Idx)
 			Idx = idx
 
 			if tag == BADTAG {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				if CountLines {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element, line %d\n", Line)
+				} else {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				}
 				break
 			}
 			if tag == ISCLOSED {
@@ -3195,14 +3647,10 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 			switch tag {
 			case STARTTAG:
 				if status == CHAR {
-					if AllowEmbed {
-						fmt.Fprintf(os.Stdout, "ERROR: UNRECOGNIZED MIXED CONTENT <%s> in <%s>\n", name, prnt)
-					} else {
-						fmt.Fprintf(os.Stdout, "ERROR: UNEXPECTED MIXED CONTENT <%s> in <%s>\n", name, prnt)
-					}
+					fmt.Fprintf(os.Stderr, "ERROR: UNEXPECTED MIXED CONTENT <%s> in <%s>\n", name, prnt)
 				}
 				// read sub tree
-				obj, ok := parseLevel(name, attr, node.Name)
+				obj, ok = parseSpecial(name, attr, node.Name)
 				if !ok {
 					break
 				}
@@ -3220,10 +3668,123 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 				// pop out of recursive call
 				return node, ok
 			case CONTENTTAG:
-				if ContentMods {
-					node.Contents = CleanupContents(name, (ctype&ASCII) != 0, (ctype&AMPER) != 0, (ctype&MIXED) != 0)
+				node.Contents = name
+				status = CHAR
+			case SELFTAG:
+				if attr == "" {
+					// ignore if self-closing tag has no attributes
+					continue
+				}
+
+				// self-closing tag has no contents, just create child node
+				obj = nextNode(name, attr, node.Name)
+
+				if node.Children == nil {
+					node.Children = obj
+				}
+				if lastNode != nil {
+					lastNode.Next = obj
+				}
+				lastNode = obj
+				status = OTHER
+				// continue on same level
+			default:
+				status = OTHER
+			}
+		}
+
+		return node, ok
+	}
+
+	// parseLevel recursive definition
+	var parseLevel func(string, string, string) (*Node, bool)
+
+	// parse XML tags into tree structure for searching, some ContentMods flags set
+	parseLevel = func(strt, attr, prnt string) (*Node, bool) {
+
+		var obj *Node
+		ok := true
+
+		// obtain next node from farm
+		node := nextNode(strt, attr, prnt)
+		if node == nil {
+			return nil, false
+		}
+
+		var lastNode *Node
+
+		status := START
+		for {
+			tag, ctype, name, attr, idx := nextToken(Idx)
+			Idx = idx
+
+			if CountLines && Idx > 0 {
+				updateLineCount(Idx)
+			}
+
+			if tag == BADTAG {
+				if CountLines {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element, line %d\n", Line)
 				} else {
-					node.Contents = name
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				}
+				break
+			}
+			if tag == ISCLOSED {
+				break
+			}
+
+			switch tag {
+			case STARTTAG:
+				if status == CHAR {
+					if DoStrict {
+						fmt.Fprintf(os.Stderr, "ERROR: UNRECOGNIZED MIXED CONTENT <%s> in <%s>\n", name, prnt)
+					} else if !DoMixed {
+						fmt.Fprintf(os.Stderr, "ERROR: UNEXPECTED MIXED CONTENT <%s> in <%s>\n", name, prnt)
+					}
+				}
+				// read sub tree
+				obj, ok = parseLevel(name, attr, node.Name)
+				if !ok {
+					break
+				}
+
+				// adding next child to end of linked list gives better performance than appending to slice of nodes
+				if node.Children == nil {
+					node.Children = obj
+				}
+				if lastNode != nil {
+					lastNode.Next = obj
+				}
+				lastNode = obj
+				status = STOP
+			case STOPTAG:
+				// pop out of recursive call
+				return node, ok
+			case CONTENTTAG:
+				if DoMixed {
+					// create unnamed child node for content string
+					con := nextNode("", "", "")
+					if con == nil {
+						break
+					}
+					txt := CleanupContents(name, (ctype&ASCII) != 0, (ctype&AMPER) != 0, (ctype&MIXED) != 0)
+					if (ctype & LFTSPACE) != 0 {
+						txt = " " + txt
+					}
+					if (ctype & RGTSPACE) != 0 {
+						txt += " "
+					}
+					con.Contents = txt
+					if node.Children == nil {
+						node.Children = con
+					}
+					if lastNode != nil {
+						lastNode.Next = con
+					}
+					lastNode = con
+				} else {
+					node.Contents = CleanupContents(name, (ctype&ASCII) != 0, (ctype&AMPER) != 0, (ctype&MIXED) != 0)
 				}
 				status = CHAR
 			case SELFTAG:
@@ -3233,7 +3794,7 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 				}
 
 				// self-closing tag has no contents, just create child node
-				obj := nextNode(name, attr, node.Name)
+				obj = nextNode(name, attr, node.Name)
 
 				if node.Children == nil {
 					node.Children = obj
@@ -3293,7 +3854,11 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 			Idx = idx
 
 			if tag == BADTAG {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				if CountLines {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element, line %d\n", Line)
+				} else {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				}
 				break
 			}
 			if tag == ISCLOSED {
@@ -3319,7 +3884,11 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 							name += "."
 							name += versn
 						}
-						return name
+						if ids != nil {
+							ids(name)
+						} else {
+							return name
+						}
 					}
 				}
 			default:
@@ -3338,15 +3907,20 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 			tag, ctype, name, attr, idx := nextToken(Idx)
 			Idx = idx
 
-			if tag == BADTAG {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
-				break
+			if CountLines && Idx > 0 {
+				updateLineCount(Idx)
 			}
-			if tag == ISCLOSED {
+
+			if tag == BADTAG {
+				if CountLines {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element, line %d\n", Line)
+				} else {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				}
 				break
 			}
 
-			tkn := Token{tag, ctype, name, attr, idx, 0}
+			tkn := Token{tag, ctype, name, attr, idx, Line}
 
 			tokens(tkn)
 
@@ -3370,7 +3944,11 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 			Idx = idx
 
 			if tag == BADTAG {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				if CountLines {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element, line %d\n", Line)
+				} else {
+					fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+				}
 				break
 			}
 			if tag == ISCLOSED {
@@ -3395,7 +3973,11 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 		Idx = idx
 
 		if tag == BADTAG {
-			fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+			if CountLines {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element, line %d\n", Line)
+			} else {
+				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
+			}
 			break
 		}
 		if tag == ISCLOSED {
@@ -3409,7 +3991,19 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 		tag, _, name, attr, idx = nextToken(Idx)
 	}
 
-	top, ok := parseLevel(name, attr, parent)
+	if ContentMods {
+		// slower parser also handles mixed content
+		top, ok := parseLevel(name, attr, parent)
+
+		if !ok {
+			return nil, ""
+		}
+
+		return top, ""
+	}
+
+	// fastest parsing with no ContentMods flags
+	top, ok := parseSpecial(name, attr, parent)
 
 	if !ok {
 		return nil, ""
@@ -3418,462 +4012,25 @@ func ParseXML(Text, parent string, tokens func(Token), find *Find) (*Node, strin
 	return top, ""
 }
 
-// StreamXML calls XML tokenizer parser on an XML reader, sends tokens for CDATA and COMMENT sections, and optionally tracks line numbers
-func StreamXML(in *XMLReader, tokens func(Token)) {
-
-	if in == nil || tokens == nil {
-		return
-	}
-
-	// token parser variables
-	Text := ""
-	Txtlen := len(Text)
-	Idx := 0
-
-	// line tracking variables
-	Line := 1
-	Lag := 0
-
-	// variables to track COMMENT or CDATA sections that span reader blocks
-	Which := NOTAG
-	SkipTo := ""
-
-	// get next XML token
-	nextToken := func(idx int) (TagType, ContentType, string, string, int, int) {
-
-		if Text == "" {
-			// buffer is empty, read next block if available
-			if in != nil {
-				Text = in.NextBlock()
-				Txtlen = len(Text)
-				Idx = 0
-				idx = 0
-				Lag = 0
-			}
-
-			if Text == "" {
-				// signal end of XML data
-				return ISCLOSED, NONE, "", "", 0, Line
-			}
-		}
-
-		text := Text[:]
-		txtlen := Txtlen
-
-		updateLineCount := func(max int) {
-			// count lines
-			for i := Lag; i < max; i++ {
-				if text[i] == '\n' {
-					Line++
-				}
-			}
-			Lag = idx
-		}
-
-		if Which != NOTAG && SkipTo != "" {
-			which := Which
-			// previous block ended inside CDATA object or COMMENT
-			start := idx
-			found := strings.Index(text[:], SkipTo)
-			if found < 0 {
-				// no stop signal found in next block
-				str := text[:]
-				if HasFlankingSpace(str) {
-					str = strings.TrimSpace(str)
-				}
-				// signal end of current block
-				Text = ""
-
-				if CountLines {
-					updateLineCount(txtlen)
-				}
-
-				// leave Which and SkipTo values unchanged as another continuation signal
-				// send CDATA or COMMENT contents
-				return which, NONE, str[:], "", 0, Line
-			}
-			// otherwise adjust position past end of skipTo string and return to normal processing
-			idx += found
-			str := text[start:idx]
-			if HasFlankingSpace(str) {
-				str = strings.TrimSpace(str)
-			}
-			idx += len(SkipTo)
-			// clear tracking variables
-			Which = NOTAG
-			SkipTo = ""
-			// send CDATA or COMMENT contents
-			return which, NONE, str[:], "", idx, Line
-		}
-
-		// XML string, and all blocks, end with > character, acts as sentinel to check if past end of text
-		if idx >= txtlen {
-			// signal end of XML string or current block, will read next block on next call
-			Text = ""
-
-			if CountLines {
-				updateLineCount(txtlen)
-			}
-
-			return NOTAG, NONE, "", "", 0, Line
-		}
-
-		// skip past leading blanks
-		ch := text[idx]
-		for InBlank[ch] {
-			idx++
-			ch = text[idx]
-		}
-
-		start := idx
-
-		plainContent := true
-
-		if AllowEmbed && ch == '<' {
-			// check to see if an HTML or MathML element is at the beginning of a content string
-			if HTMLAhead(text, idx) != 0 {
-				plainContent = false
-			}
-		}
-
-		if plainContent && ch == '<' {
-
-			// at start of element
-			idx++
-			ch = text[idx]
-
-			// check for legal first character of element
-			if InFirst[ch] {
-
-				// read element name
-				start = idx
-				idx++
-
-				ch = text[idx]
-				for InElement[ch] {
-					idx++
-					ch = text[idx]
-				}
-
-				str := text[start:idx]
-
-				switch ch {
-				case '>':
-					// end of element
-					idx++
-
-					if CountLines {
-						updateLineCount(idx)
-					}
-
-					return STARTTAG, NONE, str[:], "", idx, Line
-				case '/':
-					// self-closing element without attributes
-					idx++
-					ch = text[idx]
-					if ch != '>' {
-						fmt.Fprintf(os.Stderr, "\nSelf-closing element missing right angle bracket\n")
-					}
-					idx++
-
-					if CountLines {
-						updateLineCount(idx)
-					}
-
-					return SELFTAG, NONE, str[:], "", idx, Line
-				case ' ', '\t', '\n', '\r', '\f':
-					// attributes
-					idx++
-					start = idx
-					ch = text[idx]
-					for ch != '<' && ch != '>' {
-						idx++
-						ch = text[idx]
-					}
-					if ch != '>' {
-						fmt.Fprintf(os.Stderr, "\nAttributes not followed by right angle bracket\n")
-					}
-					if text[idx-1] == '/' {
-						// self-closing
-						atr := text[start : idx-1]
-						idx++
-
-						if CountLines {
-							updateLineCount(idx)
-						}
-
-						return SELFTAG, NONE, str[:], atr[:], idx, Line
-					}
-					atr := text[start:idx]
-					idx++
-
-					if CountLines {
-						updateLineCount(idx)
-					}
-
-					return STARTTAG, NONE, str[:], atr[:], idx, Line
-				default:
-					if CountLines {
-						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element, line %d\n", ch, Line)
-					} else {
-						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element\n", ch)
-					}
-
-					if CountLines {
-						updateLineCount(idx)
-					}
-
-					return STARTTAG, NONE, str[:], "", idx, Line
-				}
-
-			} else {
-
-				// punctuation character immediately after first angle bracket
-				switch ch {
-				case '/':
-					// at start of end tag
-					idx++
-					start = idx
-					ch = text[idx]
-					// expect legal first character of element
-					if InFirst[ch] {
-						idx++
-						ch = text[idx]
-						for InElement[ch] {
-							idx++
-							ch = text[idx]
-						}
-						str := text[start:idx]
-						if ch != '>' {
-							fmt.Fprintf(os.Stderr, "\nUnexpected characters after end element name\n")
-						}
-						idx++
-
-						if CountLines {
-							updateLineCount(idx)
-						}
-
-						return STOPTAG, NONE, str[:], "", idx, Line
-					}
-					if CountLines {
-						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element, line %d\n", ch, Line)
-					} else {
-						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element\n", ch)
-					}
-				case '?':
-					// skip ?xml and ?processing instructions
-					idx++
-					ch = text[idx]
-					for ch != '>' {
-						idx++
-						ch = text[idx]
-					}
-					idx++
-					return NOTAG, NONE, "", "", idx, Line
-				case '!':
-					// skip !DOCTYPE, !COMMENT, and ![CDATA[
-					idx++
-					start = idx
-					ch = text[idx]
-					Which = NOTAG
-					SkipTo = ""
-					if ch == '[' && strings.HasPrefix(text[idx:], "[CDATA[") {
-						Which = CDATATAG
-						SkipTo = "]]>"
-						start += 7
-					} else if ch == '-' && strings.HasPrefix(text[idx:], "--") {
-						Which = COMMENTTAG
-						SkipTo = "-->"
-						start += 2
-					} else if ch == 'D' && strings.HasPrefix(text[idx:], "DOCTYPE") {
-						Which = DOCTYPETAG
-						SkipTo = ">"
-					}
-					if Which != NOTAG && SkipTo != "" {
-						which := Which
-						// CDATA or COMMENT block may contain internal angle brackets
-						found := strings.Index(text[idx:], SkipTo)
-						if found < 0 {
-							// string stops in middle of CDATA or COMMENT
-							str := text[start:]
-							if HasFlankingSpace(str) {
-								str = strings.TrimSpace(str)
-							}
-							// signal end of current block
-							Text = ""
-
-							if CountLines {
-								updateLineCount(txtlen)
-							}
-
-							// leave Which and SkipTo values unchanged as another continuation signal
-							// send CDATA or COMMENT contents
-							return which, NONE, str[:], "", 0, Line
-						}
-						// adjust position past end of CDATA or COMMENT
-						idx += found
-						str := text[start:idx]
-						if HasFlankingSpace(str) {
-							str = strings.TrimSpace(str)
-						}
-						idx += len(SkipTo)
-						// clear tracking variables
-						Which = NOTAG
-						SkipTo = ""
-						// send CDATA or COMMENT contents
-						return which, NONE, str[:], "", idx, Line
-					}
-					// otherwise just skip to next right angle bracket
-					for ch != '>' {
-						idx++
-						ch = text[idx]
-					}
-					idx++
-					return NOTAG, NONE, "", "", idx, Line
-				default:
-					if CountLines {
-						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element, line %d\n", ch, Line)
-					} else {
-						fmt.Fprintf(os.Stderr, "\nUnexpected punctuation '%c' in XML element\n", ch)
-					}
-				}
-			}
-
-		} else if ch != '>' {
-
-			// at start of contents
-			start = idx
-
-			hasMarkup := false
-			hasNonASCII := false
-
-			// find end of contents
-			if AllowEmbed {
-
-				for {
-					for InContent[ch] {
-						idx++
-						ch = text[idx]
-					}
-					// set flags to speed up conditional content processing
-					if ch == '&' {
-						idx++
-						ch = text[idx]
-						if ch == 'a' {
-							if strings.HasPrefix(text[idx:], "amp;") {
-								hasMarkup = true
-							}
-						} else if ch == 'g' {
-							if strings.HasPrefix(text[idx:], "gt;") {
-								hasMarkup = true
-							}
-						} else if ch == 'l' {
-							if strings.HasPrefix(text[idx:], "lt;") {
-								hasMarkup = true
-							}
-						}
-						continue
-					}
-					if ch > 127 {
-						hasNonASCII = true
-						idx++
-						ch = text[idx]
-						continue
-					}
-					if ch == '<' {
-						// optionally allow HTML text formatting elements and super/subscripts
-						advance := HTMLAhead(text, idx)
-						if advance > 0 {
-							idx += advance
-							ch = text[idx]
-							plainContent = false
-							continue
-						}
-					}
-					break
-				}
-			} else {
-				for ch != '<' && ch != '>' {
-					idx++
-					ch = text[idx]
-				}
-			}
-
-			// trim back past trailing blanks
-			lst := idx - 1
-			ch = text[lst]
-			for InBlank[ch] && lst > start {
-				lst--
-				ch = text[lst]
-			}
-
-			str := text[start : lst+1]
-
-			ctype := PLAIN
-
-			if AllowEmbed {
-				if !plainContent {
-					ctype |= MIXED
-				}
-				if hasMarkup {
-					ctype |= AMPER
-				}
-				if hasNonASCII {
-					ctype |= ASCII
-				}
-			}
-
-			if CountLines {
-				updateLineCount(idx)
-			}
-
-			return CONTENTTAG, ctype, str[:], "", idx, Line
-		}
-
-		return BADTAG, NONE, "", "", idx, Line
-	}
-
-	// StreamXML
-
-	// stream all tokens through callback
-
-	for {
-		tag, ctype, name, attr, idx, line := nextToken(Idx)
-		Idx = idx
-
-		if tag == BADTAG {
-			if CountLines {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element, line %d\n", line)
-			} else {
-				fmt.Fprintf(os.Stderr, "\nERROR: Unparsable XML element\n")
-			}
-			break
-		}
-
-		tkn := Token{tag, ctype, name, attr, idx, line}
-
-		tokens(tkn)
-
-		if tag == ISCLOSED {
-			break
-		}
-	}
-}
-
-// specialized public ParseXML / StreamXML shortcuts
+// specialized public ParseXML shortcuts
 
 func ParseRecord(Text, parent string) *Node {
 
-	pat, _ := ParseXML(Text, parent, nil, nil)
+	pat, _ := ParseXML(Text, parent, nil, nil, nil, nil)
 
 	return pat
 }
 
 func FindIdentifier(Text, parent string, find *Find) string {
 
-	_, id := ParseXML(Text, parent, nil, find)
+	_, id := ParseXML(Text, parent, nil, nil, find, nil)
 
 	return id
+}
+
+func FindIdentifiers(Text, parent string, find *Find, ids func(string)) {
+
+	ParseXML(Text, parent, nil, nil, find, ids)
 }
 
 func StreamValues(Text, parent string, stream func(string, string, string)) {
@@ -3894,12 +4051,12 @@ func StreamValues(Text, parent string, stream func(string, string, string)) {
 		}
 	}
 
-	ParseXML(Text, parent, streamer, nil)
+	ParseXML(Text, parent, nil, streamer, nil, nil)
 }
 
-func CreateTokenizer(in *XMLReader) <-chan Token {
+func CreateTokenizer(inp <-chan string) <-chan Token {
 
-	if in == nil {
+	if inp == nil {
 		return nil
 	}
 
@@ -3910,17 +4067,17 @@ func CreateTokenizer(in *XMLReader) <-chan Token {
 	}
 
 	// xmlTokenizer sends XML tokens through channel
-	xmlTokenizer := func(rdr *XMLReader, out chan<- Token) {
+	xmlTokenizer := func(inp <-chan string, out chan<- Token) {
 
 		// close channel when all records have been processed
 		defer close(out)
 
 		// parse XML and send tokens through channel
-		StreamXML(rdr, func(tkn Token) { out <- tkn })
+		ParseXML("", "", inp, func(tkn Token) { out <- tkn }, nil, nil)
 	}
 
 	// launch single tokenizer goroutine
-	go xmlTokenizer(in, out)
+	go xmlTokenizer(inp, out)
 
 	return out
 }
@@ -3957,7 +4114,7 @@ func (h *ExtractHeap) Pop() interface{} {
 	return x
 }
 
-func CreateProducer(pat, star string, rdr *XMLReader) <-chan Extract {
+func CreateProducer(pat, star string, rdr <-chan string) <-chan Extract {
 
 	if rdr == nil {
 		return nil
@@ -3970,14 +4127,17 @@ func CreateProducer(pat, star string, rdr *XMLReader) <-chan Extract {
 	}
 
 	// xmlProducer sends partitioned XML strings through channel
-	xmlProducer := func(pat, star string, rdr *XMLReader, out chan<- Extract) {
+	xmlProducer := func(pat, star string, rdr <-chan string, out chan<- Extract) {
 
 		// close channel when all records have been processed
 		defer close(out)
 
+		rec := 0
+
 		// partition all input by pattern and send XML substring to available consumer through channel
 		PartitionPattern(pat, star, rdr,
-			func(rec int, ofs int64, str string) {
+			func(str string) {
+				rec++
 				out <- Extract{rec, "", str, nil}
 			})
 	}
@@ -4068,6 +4228,50 @@ func CreateUnshuffler(inp <-chan Extract) <-chan Extract {
 	return out
 }
 
+// PrintDuration prints processing rate and program duration
+func PrintDuration(name string, recordCount, byteCount int) {
+
+	stopTime := time.Now()
+	duration := stopTime.Sub(StartTime)
+	seconds := float64(duration.Nanoseconds()) / 1e9
+
+	prec := 3
+	if seconds >= 100 {
+		prec = 1
+	} else if seconds >= 10 {
+		prec = 2
+	}
+
+	if recordCount >= 1000000 {
+		throughput := float64(recordCount/100000) / 10.0
+		fmt.Fprintf(os.Stderr, "\nXtract processed %.1f million %s in %.*f seconds", throughput, name, prec, seconds)
+	} else {
+		fmt.Fprintf(os.Stderr, "\nXtract processed %d %s in %.*f seconds", recordCount, name, prec, seconds)
+	}
+
+	if seconds >= 0.001 && recordCount > 0 {
+		rate := int(float64(recordCount) / seconds)
+		if rate >= 1000000 {
+			fmt.Fprintf(os.Stderr, " (%d million %s/second", rate/1000000, name)
+		} else {
+			fmt.Fprintf(os.Stderr, " (%d %s/second", rate, name)
+		}
+		if byteCount > 0 {
+			rate := int(float64(byteCount) / seconds)
+			if rate >= 1000000 {
+				fmt.Fprintf(os.Stderr, ", %d megabytes/second", rate/1000000)
+			} else if rate >= 1000 {
+				fmt.Fprintf(os.Stderr, ", %d kilobytes/second", rate/1000)
+			} else {
+				fmt.Fprintf(os.Stderr, ", %d bytes/second", rate)
+			}
+		}
+		fmt.Fprintf(os.Stderr, ")")
+	}
+
+	fmt.Fprintf(os.Stderr, "\n\n")
+}
+
 // CREATE COMMON DRIVER TABLES
 
 // InitTables creates lookup tables to simplify the tokenizer
@@ -4093,6 +4297,11 @@ func InitTables() {
 		InFirst[ch] = true
 	}
 	InFirst['_'] = true
+	// extend legal initial letter with at sign and digits to handle biological data converted from JSON
+	InFirst['@'] = true
+	for ch := '0'; ch <= '9'; ch++ {
+		InFirst[ch] = true
+	}
 
 	// remaining characters also includes colon for namespace
 	for i := range InElement {
@@ -4137,10 +4346,26 @@ func InitTables() {
 	InContent['<'] = false
 	InContent['>'] = false
 	InContent['&'] = false
+
+	IdxFields = append(IdxFields,
+		"CHEM",
+		"CODE",
+		"CONV",
+		"DISZ",
+		"GENE",
+		"NORM",
+		"PATH",
+		"PIPE",
+		"STEM",
+		"THME",
+		"TREE",
+		"YEAR")
 }
 
 // GO AUTOMATIC INITIALIZER
 
 func init() {
+	StartTime = time.Now()
+
 	InitTables()
 }

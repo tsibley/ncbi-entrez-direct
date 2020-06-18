@@ -1,3 +1,3 @@
 package Alien::NCBI::Entrez::Direct;
-our $VERSION = "8.70";
+our $VERSION = "13.7";
 1;

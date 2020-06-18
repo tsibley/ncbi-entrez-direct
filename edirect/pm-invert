@@ -10,44 +10,19 @@ target="$1"
 
 target=${target%/}
 
-n=1
-for (( mst = 0; mst < 30000000; mst += 1000000 ))
+find "$target" -name "*.inv" -delete
+find "$target" -name "*.inv.gz" -delete
+
+for fl in *.e2x.gz
 do
-  for (( lst = 0; lst < 1000000; lst += 200000 ))
-  do
-    outbase=$(printf pubmed%03d $n)
-    n=$((n+1))
-    echo "$outbase XML"
-    fr=$((mst+lst))
-    to=$((fr+200000))
-    for (( uid = $fr; uid < $to; uid += 1 ))
-    do
-      echo "$uid"
-    done |
-    stream-pubmed > "$target/$outbase.xml.gz"
-    sleep 1
-    fsize=$(wc -c <"$target/$outbase.xml.gz")
-    if [ $fsize -le 300 ]
-    then
-      rm "$target/$outbase.xml.gz"
-      exit 0
-    fi
-    sleep 1
-    echo "$outbase IDX"
-    gunzip -c "$target/$outbase.xml.gz" | xtract -mixed -e2index > "$target/$outbase.e2x"
-    sleep 1
-    echo "$outbase INV"
-    rchive -invert NORM "$target/$outbase.e2x" > "$target/$outbase.inv"
-    sleep 1
-    echo "$outbase ZIP"
-    if [ -f "$target/$outbase.inv.gz" ]
-    then
-      rm -f "$target/$outbase.inv.gz"
-    fi
-    cat "$target/$outbase.inv" | gzip -1 > "$target/$outbase.inv.gz"
-    rm "$target/$outbase.xml.gz"
-    rm "$target/$outbase.e2x"
-    rm "$target/$outbase.inv"
-    sleep 1
-  done
+  base=${fl%.e2x.gz}
+  echo "$base.inv"
+  seconds_start=$(date "+%s")
+  gunzip -c "$fl" |
+  rchive -invert |
+  gzip -1 > "$target/$base.inv.gz"
+  seconds_end=$(date "+%s")
+  seconds=$((seconds_end - seconds_start))
+  echo "$seconds seconds"
+  sleep 1
 done
